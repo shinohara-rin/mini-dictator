@@ -8,7 +8,22 @@ uncertainty estimation by Monte Carlo over the encoder output, and an LLM rewrit
 
 ## Status
 
-The platform-independent core (`crates/core`) and a test CLI (`crates/cli`). The tray shells are next.
+- `crates/core`: the platform-independent core.
+- `crates/cli`: runs the core on a WAV file.
+- `crates/macos`: the macOS menu bar app.
+
+## macOS
+
+```sh
+scripts/fetch-models.sh      # English zipformer and Silero VAD into ~/Library/Application Support/Mini Dictator/models
+scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime inside
+open "target/release/Mini Dictator.app"
+```
+
+Press ⌥Space to start and again to stop, or hold it while you speak. The first run asks for
+microphone and accessibility permission; accessibility is needed both to read names from the
+focused window and to paste. Settings live in `~/Library/Application Support/Mini Dictator/config.toml`
+(the menu opens it): the model, the hotkey, the uncertainty samples, and the rewrite endpoint.
 
 ## Try the core on a WAV file
 
