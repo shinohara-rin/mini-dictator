@@ -1,18 +1,20 @@
-//! Transducer speech recognition.
+//! Speech recognition.
 //!
-//! The core runs the transducer search itself instead of calling a packaged recognizer, because two
-//! features need the parts of the model:
+//! The pipeline drives any [`Asr`]: it encodes a segment once, then decodes the encoder output, and
+//! uncertainty decodes noisy copies of it. Two backends implement it:
 //!
-//! - Hotword biasing scores partial matches inside the beam search ([`ContextGraph`]).
-//! - Uncertainty decodes the same encoder output many times with noise, so it needs the encoder
-//!   output on its own ([`crate::uncertainty`]).
-//!
-//! A [`TransducerModel`] has the three networks of a sherpa-onnx transducer: the encoder, the
-//! stateless decoder (prediction network), and the joiner.
+//! - [`Recognizer`] runs a transducer. The core runs its search itself instead of calling a packaged
+//!   recognizer, so hotwords can score partial matches inside the beam search ([`ContextGraph`]). A
+//!   [`TransducerModel`] has the three networks of a sherpa-onnx transducer: the encoder, the
+//!   stateless decoder (prediction network), and the joiner.
+//! - [`qwen::QwenAsr`] runs Qwen3-ASR, an audio encoder in front of an LLM that reads hotwords in its
+//!   prompt. It covers about 30 languages.
 
 mod context_graph;
 #[cfg(feature = "onnx")]
 pub mod onnx;
+#[cfg(feature = "onnx")]
+pub mod qwen;
 mod search;
 mod tokens;
 
@@ -21,6 +23,7 @@ pub use search::{greedy_search, modified_beam_search, modified_beam_search_batch
 pub use tokens::{SymbolTable, Tokenizer};
 
 use crate::features::{Fbank, FbankConfig, Features};
+use crate::uncertainty::MonteCarloConfig;
 use crate::Result;
 
 /// Encoder frames of one utterance, in row-major order.
@@ -63,11 +66,9 @@ pub trait TransducerModel: Send + Sync {
 pub struct TimedToken {
     pub id: u32,
     pub text: String,
-    /// Encoder frame that emitted the token.
-    pub frame: usize,
-    /// Seconds from the start of the utterance.
-    pub time: f32,
-    /// Log probability of the token at its frame.
+    /// Seconds from the start of the utterance. `None` when the model gives no token times.
+    pub time: Option<f32>,
+    /// Log probability of the token.
     pub log_prob: f32,
 }
 
@@ -83,12 +84,132 @@ impl Hypothesis {
     }
 }
 
+/// Hotwords prepared for one dictation. Each backend uses the form it supports: a transducer
+/// biases its beam search with the graph, and an LLM decoder reads the phrases in its prompt.
+#[derive(Debug, Clone, Default)]
+pub struct Bias {
+    pub phrases: Vec<String>,
+    pub graph: Option<ContextGraph>,
+}
+
+/// A speech recognizer that the pipeline drives.
+///
+/// Encoding and decoding are separate calls, because uncertainty decodes noisy copies of one
+/// encoder output.
+pub trait Asr: Send + Sync {
+    fn bias(&self, phrases: &[String]) -> Bias;
+    fn encode(&self, samples: &[f32]) -> Result<EncoderOutput>;
+    /// Decodes each encoder output with the same bias, batching the model calls where it can.
+    fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>>;
+    /// Seconds of audio per encoder frame.
+    fn frame_seconds(&self) -> f32;
+
+    /// Uncertainty settings that suit this model's decoding cost and encoder output.
+    fn monte_carlo(&self) -> MonteCarloConfig {
+        MonteCarloConfig::default()
+    }
+
+    fn decode_one(&self, encoder: &EncoderOutput, bias: &Bias) -> Result<Hypothesis> {
+        let mut decoded = self.decode(std::slice::from_ref(encoder), bias)?;
+        Ok(decoded.pop().unwrap_or_default())
+    }
+}
+
+/// Loads the recognizer in a sherpa-onnx model directory: Qwen3-ASR when the directory has its
+/// files, otherwise a transducer searched with `search`. ONNX Runtime must be initialized first.
+#[cfg(feature = "onnx")]
+pub fn load(dir: &std::path::Path, threads: usize, search: SearchConfig) -> Result<Box<dyn Asr>> {
+    if qwen::QwenFiles::is_qwen(dir) {
+        let files = qwen::QwenFiles::discover(dir)?;
+        let model = qwen::QwenAsr::load(&files, threads, qwen::QwenConfig::default())?;
+        Ok(Box::new(model))
+    } else {
+        let files = onnx::TransducerFiles::discover(dir, true)?;
+        let (model, symbols) = onnx::OnnxTransducer::load(&files, threads)?;
+        Ok(Box::new(Recognizer::new(model, symbols, search)))
+    }
+}
+
 /// Joins model tokens into text. The BPE word marker `▁` becomes a space, and CJK characters join
 /// without spaces.
 pub fn join_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> String {
     let joined: String = tokens.into_iter().collect();
     let spaced = joined.replace('▁', " ");
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Byte ranges of the words of `text`. Whitespace before a word belongs to it. A CJK character is a
+/// word of its own, and so is a punctuation mark, except an apostrophe or hyphen inside a word.
+pub fn split_words(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut words = Vec::new();
+    let mut start = 0;
+    let mut inside = false;
+    for (index, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if inside {
+                words.push(start..index);
+                start = index;
+                inside = false;
+            }
+            continue;
+        }
+        let joins = matches!(c, '\'' | '’' | '-') && inside;
+        if is_cjk(c) || (is_punctuation(c) && !joins) {
+            if inside {
+                words.push(start..index);
+                start = index;
+            }
+            words.push(start..index + c.len_utf8());
+            start = index + c.len_utf8();
+            inside = false;
+            continue;
+        }
+        inside = true;
+    }
+    if inside {
+        words.push(start..text.len());
+    }
+    words
+}
+
+/// Han, kana, and Hangul, which are written without spaces between words.
+pub fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+pub fn is_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || matches!(
+            c,
+            '，' | '。'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '、'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '《'
+                | '》'
+                | '（'
+                | '）'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '…'
+                | '—'
+                | '–'
+                | '¿'
+                | '¡'
+                | '«'
+                | '»'
+                | '・'
+                | '؟'
+                | '،'
+        )
 }
 
 /// Raw search output before token ids become text.
@@ -176,12 +297,56 @@ impl<M: TransducerModel> Recognizer<M> {
                 .map(|&(id, frame, log_prob)| TimedToken {
                     id,
                     text: self.symbols.text(id).to_owned(),
-                    frame,
-                    time: frame as f32 * frame_seconds,
+                    time: Some(frame as f32 * frame_seconds),
                     log_prob,
                 })
                 .collect(),
         }
+    }
+}
+
+impl<M: TransducerModel> Asr for Recognizer<M> {
+    fn bias(&self, phrases: &[String]) -> Bias {
+        let graph = self.context_graph(phrases, self.search.hotword_boost);
+        Bias {
+            phrases: phrases.to_vec(),
+            graph: (!graph.is_empty()).then_some(graph),
+        }
+    }
+
+    fn encode(&self, samples: &[f32]) -> Result<EncoderOutput> {
+        Recognizer::encode(self, samples)
+    }
+
+    fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>> {
+        match encoders {
+            [single] => Ok(vec![self.search(single, bias.graph.as_ref())?]),
+            _ => self.search_batch(encoders, bias.graph.as_ref()),
+        }
+    }
+
+    fn frame_seconds(&self) -> f32 {
+        self.model.frame_seconds()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn words(text: &str) -> Vec<&str> {
+        split_words(text).into_iter().map(|r| &text[r]).collect()
+    }
+
+    #[test]
+    fn splits_words_punctuation_and_cjk() {
+        assert_eq!(
+            words("Okay, Charles. I'm Rap-Tourium!"),
+            vec!["Okay", ",", " Charles", ".", " I'm", " Rap-Tourium", "!"]
+        );
+        assert_eq!(words("我流氓了。"), vec!["我", "流", "氓", "了", "。"]);
+        assert_eq!(words(" 3.14 "), vec![" 3", ".", "14"]);
+        assert!(words("  ").is_empty());
     }
 }
 

@@ -5,15 +5,17 @@
 //! disagree are where the recognizer is unsure, and the rewrite model reads them as
 //! `[unclear: ...]` markers with the other readings.
 //!
-//! Noise on the encoder output costs only decoder and joiner calls, which are small next to the
-//! encoder, and it keeps every frame at its time, so decodes compare by frame. AIRI's probe adds
-//! noise to the audio instead and decodes each copy from scratch.
+//! For a transducer, noise on the encoder output costs only decoder and joiner calls, which are small
+//! next to the encoder, and it keeps every frame at its time, so decodes compare by frame. For
+//! Qwen3-ASR it goes on the audio features the LLM reads, and each noisy decode reruns the LLM, so
+//! that backend takes fewer samples. AIRI's probe adds noise to the audio instead and decodes each
+//! copy from scratch.
 
 pub mod analysis;
 
 pub use analysis::{analyze, format_for_llm, Analysis, AnalysisOptions, SpanKind, UncertainSpan};
 
-use crate::asr::{ContextGraph, EncoderOutput, Hypothesis, Recognizer, TransducerModel};
+use crate::asr::{Asr, Bias, EncoderOutput, Hypothesis};
 use crate::rng::SplitMix64;
 use crate::Result;
 
@@ -113,19 +115,19 @@ fn agrees(
         && analyze(reference, samples, duration, options)
             .tokens
             .iter()
-            .all(|t| t.by_time == 1.0)
+            .all(|t| t.by_time.unwrap_or(t.by_text) == 1.0)
 }
 
-/// Decodes noisy copies of `encoder` with the recognizer's search and the same hotwords as the
-/// reference, so a hotword cannot look unstable just because the samples lack its boost.
-pub fn estimate<M: TransducerModel>(
-    recognizer: &Recognizer<M>,
+/// Decodes noisy copies of `encoder` with the same hotwords as the reference, so a hotword cannot
+/// look unstable just because the samples lack its boost.
+pub fn estimate<A: Asr + ?Sized>(
+    asr: &A,
     encoder: &EncoderOutput,
     reference: &Hypothesis,
-    graph: Option<&ContextGraph>,
+    bias: &Bias,
     config: &MonteCarloConfig,
 ) -> Result<Uncertainty> {
-    let duration = encoder.frames as f32 * recognizer.model().frame_seconds();
+    let duration = encoder.frames as f32 * asr.frame_seconds();
     if config.samples == 0 {
         return Ok(Uncertainty {
             samples: Vec::new(),
@@ -139,7 +141,7 @@ pub fn estimate<M: TransducerModel>(
         let noisy: Vec<EncoderOutput> = (0..count)
             .map(|_| perturb(encoder, &scale, config.relative_sigma, &mut rng))
             .collect();
-        samples.extend(recognizer.search_batch(&noisy, graph)?);
+        samples.extend(asr.decode(&noisy, bias)?);
         Ok(())
     };
 
@@ -169,7 +171,7 @@ pub fn estimate<M: TransducerModel>(
 mod tests {
     use super::*;
     use crate::asr::testing::{symbols, ScriptedModel};
-    use crate::asr::SearchConfig;
+    use crate::asr::{Recognizer, SearchConfig};
 
     fn recognizer() -> Recognizer<ScriptedModel> {
         Recognizer::new(
@@ -191,7 +193,7 @@ mod tests {
             &recognizer,
             &encoder,
             &reference,
-            None,
+            &Bias::default(),
             &MonteCarloConfig {
                 relative_sigma: 0.3,
                 ..MonteCarloConfig::default()
@@ -215,7 +217,7 @@ mod tests {
             &recognizer,
             &encoder,
             &reference,
-            None,
+            &Bias::default(),
             &MonteCarloConfig {
                 samples: 40,
                 relative_sigma: 0.3,

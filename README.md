@@ -2,9 +2,9 @@
 
 A minimal AI dictation app: a tray icon, a hotkey, and your words in the focused app.
 
-The core does VAD gating, transducer speech recognition biased toward the terms on your screen,
-uncertainty estimation by Monte Carlo over the encoder output, and an LLM rewrite. See
-[docs/architecture.md](docs/architecture.md).
+The core does VAD gating, speech recognition biased toward the terms on your screen (Qwen3-ASR 0.6B
+by default, about 30 languages; sherpa-onnx transducers also work), uncertainty estimation by Monte
+Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](docs/architecture.md).
 
 ## Status
 
@@ -15,7 +15,7 @@ uncertainty estimation by Monte Carlo over the encoder output, and an LLM rewrit
 ## macOS
 
 ```sh
-scripts/fetch-models.sh      # English zipformer and Silero VAD into ~/Library/Application Support/Mini Dictator/models
+scripts/fetch-models.sh      # Qwen3-ASR 0.6B (about 1 GB) and Silero VAD into ~/Library/Application Support/Mini Dictator/models
 scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime inside
 open "target/release/Mini Dictator.app"
 ```
@@ -28,18 +28,19 @@ focused window and to paste. Settings live in `~/Library/Application Support/Min
 ## Try the core on a WAV file
 
 ```sh
-# A sherpa-onnx offline transducer, Silero VAD, and ONNX Runtime 1.31
-curl -L https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-en-2023-06-26.tar.bz2 | tar xj -C models
-curl -L -o models/silero_vad.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+# Qwen3-ASR (or any sherpa-onnx offline transducer), Silero VAD, and ONNX Runtime 1.31
+scripts/fetch-models.sh models
 # ONNX Runtime: https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0
 
 cargo run --release -p mini-dictator-cli -- \
   --ort path/to/libonnxruntime.so \
-  --model models/sherpa-onnx-zipformer-en-2023-06-26 \
+  --model models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 \
   --vad models/silero_vad.onnx \
-  --wav models/sherpa-onnx-zipformer-en-2023-06-26/test_wavs/1.wav \
-  --hotword dishonoured --hotword "for ever"
+  --wav models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ru1.wav
 ```
+
+The `--model` directory decides the backend. With a transducer such as
+`sherpa-onnx-zipformer-en-2023-06-26`, `--beam` and `--boost` tune the hotword search.
 
 Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run
 the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at

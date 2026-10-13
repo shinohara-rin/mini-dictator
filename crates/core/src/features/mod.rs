@@ -1,9 +1,16 @@
-//! Kaldi-compatible log mel filterbank features, as icefall and sherpa-onnx compute them for
+//! Log mel features for the recognizers.
+//!
+//! [`Fbank`] computes Kaldi-compatible filterbank features, as icefall and sherpa-onnx compute them for
 //! zipformer transducers: 25 ms Povey windows every 10 ms, 80 mel bins, no dither, no snipped edges.
+//! [`WhisperMel`] computes the log mel spectrogram of Whisper, which Qwen3-ASR reads too.
+
+mod whisper;
 
 use std::f32::consts::PI;
 
 use crate::audio::SAMPLE_RATE;
+
+pub use whisper::WhisperMel;
 
 #[derive(Debug, Clone)]
 pub struct FbankConfig {

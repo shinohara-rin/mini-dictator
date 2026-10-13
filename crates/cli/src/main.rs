@@ -1,22 +1,25 @@
 //! `md`: runs the dictation core on a WAV file and prints each step.
 //!
 //! ```text
-//! md --model <dir> --wav <file> [--vad silero_vad.onnx] [--ort libonnxruntime.so]
+//! md --model <dir> --wav <file> [--vad silero_vad.onnx] [--ort libonnxruntime.so] [--threads 4]
 //!    [--hotword <phrase>]... [--screen <text file>] [--beam 4] [--boost 1.5]
-//!    [--samples 12] [--sigma 0.5] [--no-early-stop]
+//!    [--samples N] [--sigma X] [--no-early-stop] [--seed N]   (defaults depend on the model)
 //!    [--rewrite-url <base url> --rewrite-model <name>]   (API key from MD_API_KEY)
 //! ```
+//!
+//! The model directory holds a Qwen3-ASR export or a transducer; `--beam` and `--boost` apply to
+//! transducers.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mini_dictator_core::asr::onnx::{init_runtime, OnnxTransducer, TransducerFiles};
-use mini_dictator_core::asr::{Recognizer, SearchConfig};
+use mini_dictator_core::asr::onnx::init_runtime;
+use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::audio::{AudioChunk, Resampler};
 use mini_dictator_core::context::{rank_terms, ContextSource, Region, ScreenContext, TextBlock};
 use mini_dictator_core::pipeline::{Engine, EngineConfig, SessionContext, Transcript};
 use mini_dictator_core::rewrite::{OpenAiCompatible, PassThrough, Rewriter};
-use mini_dictator_core::uncertainty::{self, MonteCarloConfig};
+use mini_dictator_core::uncertainty;
 use mini_dictator_core::vad::{
     EnergyVad, Segmenter, SileroVad, SpeechSegment, VoiceActivityDetector,
 };
@@ -26,10 +29,14 @@ struct Args {
     wav: PathBuf,
     vad: Option<PathBuf>,
     ort: Option<PathBuf>,
+    threads: usize,
     hotwords: Vec<String>,
     screen: Option<PathBuf>,
     search: SearchConfig,
-    monte_carlo: MonteCarloConfig,
+    samples: Option<usize>,
+    sigma: Option<f32>,
+    early_stop: bool,
+    seed: Option<u64>,
     rewrite_url: Option<String>,
     rewrite_model: Option<String>,
 }
@@ -39,8 +46,9 @@ fn parse() -> Result<Args, String> {
     let (mut model, mut wav, mut vad, mut ort, mut screen, mut rewrite_url, mut rewrite_model) =
         (None, None, None, None, None, None, None);
     let mut hotwords = Vec::new();
+    let mut threads = 4;
     let mut search = SearchConfig::default();
-    let mut monte_carlo = MonteCarloConfig::default();
+    let (mut samples, mut sigma, mut seed, mut early_stop) = (None, None, None, true);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<f32>().map_err(|e| format!("{flag}: {e}"));
@@ -49,15 +57,16 @@ fn parse() -> Result<Args, String> {
             "--wav" => wav = Some(PathBuf::from(value()?)),
             "--vad" => vad = Some(PathBuf::from(value()?)),
             "--ort" => ort = Some(PathBuf::from(value()?)),
+            "--threads" => threads = number(value()?)? as usize,
             "--screen" => screen = Some(PathBuf::from(value()?)),
             "--hotword" => hotwords.push(value()?),
             "--beam" => search.beam = number(value()?)? as usize,
             "--boost" => search.hotword_boost = number(value()?)?,
             "--blank-penalty" => search.blank_penalty = number(value()?)?,
-            "--samples" => monte_carlo.samples = number(value()?)? as usize,
-            "--sigma" => monte_carlo.relative_sigma = number(value()?)?,
-            "--seed" => monte_carlo.seed = number(value()?)? as u64,
-            "--no-early-stop" => monte_carlo.first_samples = 0,
+            "--samples" => samples = Some(number(value()?)? as usize),
+            "--sigma" => sigma = Some(number(value()?)?),
+            "--seed" => seed = Some(number(value()?)? as u64),
+            "--no-early-stop" => early_stop = false,
             "--rewrite-url" => rewrite_url = Some(value()?),
             "--rewrite-model" => rewrite_model = Some(value()?),
             other => return Err(format!("unknown flag {other}")),
@@ -68,10 +77,14 @@ fn parse() -> Result<Args, String> {
         wav: wav.ok_or("--wav is required")?,
         vad,
         ort,
+        threads,
         hotwords,
         screen,
         search,
-        monte_carlo,
+        samples,
+        sigma,
+        early_stop,
+        seed,
         rewrite_url,
         rewrite_model,
     })
@@ -123,7 +136,7 @@ fn main() {
     let args = match parse() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx>] [--ort <lib>] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
+            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx>] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
             std::process::exit(2);
         }
     };
@@ -135,12 +148,11 @@ fn main() {
 
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     init_runtime(args.ort.as_deref())?;
-    let files = TransducerFiles::discover(&args.model, true)?;
     let started = Instant::now();
-    let (model, symbols) = OnnxTransducer::load(&files, 2)?;
+    let recognizer = asr::load(&args.model, args.threads, args.search.clone())?;
     eprintln!(
         "loaded {} in {}",
-        files.encoder.display(),
+        args.model.display(),
         ms(started.elapsed())
     );
 
@@ -153,12 +165,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }),
         _ => Box::new(PassThrough),
     };
+    let mut monte_carlo = recognizer.monte_carlo();
+    monte_carlo.samples = args.samples.unwrap_or(monte_carlo.samples);
+    monte_carlo.relative_sigma = args.sigma.unwrap_or(monte_carlo.relative_sigma);
+    monte_carlo.seed = args.seed.unwrap_or(monte_carlo.seed);
+    if !args.early_stop {
+        monte_carlo.first_samples = 0;
+    }
     let config = EngineConfig {
-        monte_carlo: args.monte_carlo.clone(),
+        monte_carlo,
         ..EngineConfig::default()
     };
     let engine = Engine {
-        recognizer: Recognizer::new(model, symbols, args.search.clone()),
+        asr: recognizer,
         context: Box::new(mini_dictator_core::context::NoContext),
         rewriter,
         config,
@@ -192,16 +211,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|t| t.phrase)
         .collect();
-    let graph = engine
-        .recognizer
-        .context_graph(&hotwords, engine.recognizer.search.hotword_boost);
+    let bias = engine.asr.bias(&hotwords);
     if !hotwords.is_empty() {
-        println!("hotwords: {}", hotwords.join(", "));
+        println!("hotwords: {}", bias.phrases.join(", "));
     }
     let mut session = SessionContext {
         screen,
         hotwords,
-        graph: (!graph.is_empty()).then_some(graph),
+        bias,
         inserted: String::new(),
     };
 
@@ -213,21 +230,21 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     for segment in &found {
         let started = Instant::now();
-        let encoder = engine.recognizer.encode(&segment.samples)?;
+        let encoder = engine.asr.encode(&segment.samples)?;
         let encoded = started.elapsed();
-        let reference = engine.recognizer.search(&encoder, session.graph.as_ref())?;
+        let reference = engine.asr.decode_one(&encoder, &session.bias)?;
         let searched = started.elapsed();
         let uncertainty = uncertainty::estimate(
-            &engine.recognizer,
+            engine.asr.as_ref(),
             &encoder,
             &reference,
-            session.graph.as_ref(),
+            &session.bias,
             &engine.config.monte_carlo,
         )?;
         let total = started.elapsed();
         let marked = uncertainty::format_for_llm(&reference, &uncertainty.analysis.spans);
         println!(
-            "\n[{:.2}s +{:.2}s] {} encoder frames: encode {}, search {}, {} noisy decodes {}{}",
+            "\n[{:.2}s +{:.2}s] {} encoder frames: encode {}, decode {}, {} noisy decodes {}{}",
             segment.start_sample as f32 / 16_000.0,
             segment.duration_seconds(),
             encoder.frames,

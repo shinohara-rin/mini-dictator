@@ -3,8 +3,11 @@
 //! Ported from the ASR uncertainty probe of AIRI (`stage-ui/libs/voice/asr-uncertainty/analysis.ts`).
 //! There the perturbations change the audio, so token times are mapped back to the clip clock. Here
 //! the noise goes on the encoder output, whose frames never move, so times compare directly.
+//!
+//! A model without token times, such as an LLM decoder, compares by text alignment alone: tokens
+//! match where the alignment matches them, and dropped speech is where samples insert tokens.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::asr::{join_tokens, Hypothesis, TimedToken};
 
@@ -12,8 +15,8 @@ use crate::asr::{join_tokens, Hypothesis, TimedToken};
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenAgreement {
     /// Fraction of samples that emit the same token near the same time, or match it in the alignment
-    /// within [`AnalysisOptions::aligned_tolerance_seconds`].
-    pub by_time: f32,
+    /// within [`AnalysisOptions::aligned_tolerance_seconds`]. `None` when the model gives no token times.
+    pub by_time: Option<f32>,
     /// Fraction of samples whose edit-distance alignment matches this token. An early insertion
     /// can shift it for the rest of the utterance, so spans use [`Self::by_time`].
     pub by_text: f32,
@@ -46,8 +49,9 @@ pub struct Variant {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UncertainSpan {
     pub kind: SpanKind,
-    pub start: f32,
-    pub end: f32,
+    /// Seconds of the utterance. `None` when the model gives no token times.
+    pub start: Option<f32>,
+    pub end: Option<f32>,
     /// Reference token range `[token_start, token_end)`. A dropped span covers no token, so both
     /// values are its insert position.
     pub token_start: usize,
@@ -213,18 +217,23 @@ fn correspondences(
             continue;
         }
         for (si, st) in sample.tokens.iter().enumerate() {
-            if (st.time - rt.time).abs() <= options.tolerance_seconds
-                && normalize_token(&st.text) == key
-            {
+            let near = matches!(
+                (st.time, rt.time),
+                (Some(a), Some(b)) if (a - b).abs() <= options.tolerance_seconds
+            );
+            if near && normalize_token(&st.text) == key {
                 result.push((ri, si));
             }
         }
     }
     for pair in pairs {
         if let (true, Some(ri), Some(si)) = (pair.matched, pair.reference, pair.sample) {
-            if (reference.tokens[ri].time - sample.tokens[si].time).abs()
-                <= options.aligned_tolerance_seconds
-            {
+            // Without times the alignment alone decides.
+            let near = match (reference.tokens[ri].time, sample.tokens[si].time) {
+                (Some(a), Some(b)) => (a - b).abs() <= options.aligned_tolerance_seconds,
+                _ => true,
+            };
+            if near {
                 result.push((ri, si));
             }
         }
@@ -243,7 +252,7 @@ fn extra_tokens<'a>(
         .tokens
         .iter()
         .filter(|t| has_text(t))
-        .map(|t| t.time)
+        .filter_map(|t| t.time)
         .collect();
     sample
         .tokens
@@ -252,9 +261,11 @@ fn extra_tokens<'a>(
         .filter(|(i, t)| {
             has_text(t)
                 && !matched.contains(i)
-                && reference_times
-                    .iter()
-                    .all(|time| (time - t.time).abs() > tolerance)
+                && t.time.is_some_and(|own| {
+                    reference_times
+                        .iter()
+                        .all(|time| (time - own).abs() > tolerance)
+                })
         })
         .map(|(_, t)| t)
         .collect()
@@ -278,7 +289,7 @@ pub fn insert_position(reference: &Hypothesis, seconds: f32) -> usize {
     reference
         .tokens
         .iter()
-        .position(|t| t.time >= seconds)
+        .position(|t| t.time.is_some_and(|time| time >= seconds))
         .unwrap_or(reference.tokens.len())
 }
 
@@ -288,6 +299,11 @@ pub fn analyze(
     duration_seconds: f32,
     options: &AnalysisOptions,
 ) -> Analysis {
+    let timed = reference
+        .tokens
+        .iter()
+        .chain(samples.iter().flat_map(|s| &s.tokens))
+        .all(|t| t.time.is_some());
     let alignments: Vec<Vec<Pair>> = samples.iter().map(|s| align(reference, s)).collect();
     let matches: Vec<Vec<(usize, usize)>> = samples
         .iter()
@@ -318,27 +334,32 @@ pub fn analyze(
     };
     let tokens: Vec<TokenAgreement> = (0..reference.tokens.len())
         .map(|i| TokenAgreement {
-            by_time: fraction(time_matches[i]),
+            by_time: timed.then(|| fraction(time_matches[i])),
             by_text: fraction(text_matches[i]),
         })
         .collect();
 
-    let extras: Vec<Vec<&TimedToken>> = samples
-        .iter()
-        .zip(&matches)
-        .map(|(s, found)| {
-            extra_tokens(
-                reference,
-                s,
-                &found.iter().map(|m| m.1).collect(),
-                options.tolerance_seconds,
-            )
-        })
-        .collect();
-    let timeline = measure_timeline(reference, samples, &extras, duration_seconds, options);
-
     let mut spans = unstable_spans(reference, &tokens, samples, &alignments, options);
-    spans.extend(dropped_spans(reference, &timeline, &extras, options));
+    let mut timeline = Vec::new();
+    if timed {
+        let extras: Vec<Vec<&TimedToken>> = samples
+            .iter()
+            .zip(&matches)
+            .map(|(s, found)| {
+                extra_tokens(
+                    reference,
+                    s,
+                    &found.iter().map(|m| m.1).collect(),
+                    options.tolerance_seconds,
+                )
+            })
+            .collect();
+        timeline = measure_timeline(reference, samples, &extras, duration_seconds, options);
+        spans.extend(dropped_spans(reference, &timeline, &extras, options));
+    } else {
+        let dropped = inserted_spans(reference, samples, &alignments, &spans, options);
+        spans.extend(dropped);
+    }
     Analysis {
         tokens,
         timeline,
@@ -357,7 +378,11 @@ fn measure_timeline(
     let keys_near = |h: &Hypothesis, center: f32| -> Vec<String> {
         h.tokens
             .iter()
-            .filter(|t| (t.time - center).abs() <= tolerance && has_text(t))
+            .filter(|t| {
+                t.time
+                    .is_some_and(|time| (time - center).abs() <= tolerance)
+                    && has_text(t)
+            })
             .map(|t| normalize_token(&t.text))
             .collect()
     };
@@ -378,9 +403,10 @@ fn measure_timeline(
         let emitting = extras
             .iter()
             .filter(|tokens| {
-                tokens
-                    .iter()
-                    .any(|t| (t.time - center).abs() <= tolerance / 2.0)
+                tokens.iter().any(|t| {
+                    t.time
+                        .is_some_and(|time| (time - center).abs() <= tolerance / 2.0)
+                })
             })
             .count();
         let n = samples.len().max(1) as f32;
@@ -427,7 +453,7 @@ fn unstable_spans(
         if !has_text(&reference.tokens[index]) {
             continue;
         }
-        if agreement.by_time < options.agreement_threshold {
+        if agreement.by_time.unwrap_or(agreement.by_text) < options.agreement_threshold {
             match runs.last_mut() {
                 Some(last) if previous_with_text == Some(last.1 - 1) => last.1 = index + 1,
                 _ => runs.push((index, index + 1)),
@@ -450,23 +476,28 @@ fn unstable_spans(
                     .iter()
                     .position(|p| p.reference.is_some_and(|r| r >= token_end))
                     .unwrap_or(pairs.len());
-                join_tokens(
-                    pairs[first..after]
-                        .iter()
-                        .filter_map(|p| p.sample)
-                        .map(|i| sample.tokens[i].text.as_str()),
-                )
+                // From the first to the last word heard here, with the punctuation between them.
+                let mut heard = pairs[first..after].iter().filter_map(|p| p.sample);
+                match (heard.next(), heard.next_back()) {
+                    (Some(from), to) => join_tokens(
+                        sample.tokens[from..=to.unwrap_or(from)]
+                            .iter()
+                            .map(|t| t.text.as_str()),
+                    ),
+                    (None, _) => String::new(),
+                }
             });
-            let times: Vec<f32> = reference.tokens[token_start..token_end]
+            let times = reference.tokens[token_start..token_end]
                 .iter()
-                .map(|t| t.time)
-                .collect();
-            let min = times.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = times.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                .filter_map(|t| t.time);
+            let half = options.tolerance_seconds / 2.0;
             UncertainSpan {
                 kind: SpanKind::Unstable,
-                start: (min - options.tolerance_seconds / 2.0).max(0.0),
-                end: max + options.tolerance_seconds / 2.0,
+                start: times
+                    .clone()
+                    .reduce(f32::min)
+                    .map(|min| (min - half).max(0.0)),
+                end: times.reduce(f32::max).map(|max| max + half),
                 token_start,
                 token_end,
                 variants: count_variants(heard),
@@ -475,14 +506,20 @@ fn unstable_spans(
         .collect()
 }
 
-/// True when the token starts a word: it carries the BPE word marker, or it or the token before it
-/// is CJK, where every character is its own unit.
+/// True when the token starts a word: it carries the BPE word marker or a space, it is punctuation,
+/// or it or the token before it is CJK, where every character is its own unit.
 fn starts_word(tokens: &[TimedToken], index: usize) -> bool {
     let cjk = |t: &TimedToken| {
         t.text.chars().any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF))
     };
+    let opens = |c: char| {
+        c == '▁'
+            || c.is_whitespace()
+            || (c.is_ascii_punctuation() && c != '\'' && c != '-')
+            || is_cjk_punctuation(c)
+    };
     index == 0
-        || tokens[index].text.starts_with('▁')
+        || tokens[index].text.starts_with(opens)
         || cjk(&tokens[index])
         || cjk(&tokens[index - 1])
 }
@@ -537,19 +574,72 @@ fn dropped_spans(
                     join_tokens(
                         tokens
                             .iter()
-                            .filter(|t| t.time >= start - half && t.time <= end + half)
+                            .filter(|t| {
+                                t.time
+                                    .is_some_and(|time| time >= start - half && time <= end + half)
+                            })
                             .map(|t| t.text.as_str()),
                     )
                 })
                 .filter(|text| !text.is_empty());
             UncertainSpan {
                 kind: SpanKind::Dropped,
-                start,
-                end,
+                start: Some(start),
+                end: Some(end),
                 token_start: position,
                 token_end: position,
                 variants: count_variants(heard),
             }
+        })
+        .collect()
+}
+
+/// Dropped spans without token times: places where enough samples insert tokens between the same
+/// two reference tokens. Insertions inside an unstable span are already among its variants.
+fn inserted_spans(
+    reference: &Hypothesis,
+    samples: &[Hypothesis],
+    alignments: &[Vec<Pair>],
+    unstable: &[UncertainSpan],
+    options: &AnalysisOptions,
+) -> Vec<UncertainSpan> {
+    // What each sample inserts, by the index of the reference token it comes before.
+    let mut inserted: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (pairs, sample) in alignments.iter().zip(samples) {
+        let mut next = reference.tokens.len();
+        // The first and last inserted sample token at each position.
+        let mut runs: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for pair in pairs.iter().rev() {
+            match (pair.reference, pair.sample) {
+                (Some(r), _) => next = r,
+                (None, Some(s)) => {
+                    let run = runs.entry(next).or_insert((s, s));
+                    run.0 = s;
+                }
+                (None, None) => {}
+            }
+        }
+        for (position, (from, to)) in runs {
+            let text = join_tokens(sample.tokens[from..=to].iter().map(|t| t.text.as_str()));
+            inserted.entry(position).or_default().push(text);
+        }
+    }
+    let n = samples.len().max(1) as f32;
+    inserted
+        .into_iter()
+        .filter(|(position, texts)| {
+            texts.len() as f32 / n >= options.extra_emission_threshold
+                && !unstable
+                    .iter()
+                    .any(|s| s.token_start < *position && *position <= s.token_end)
+        })
+        .map(|(position, texts)| UncertainSpan {
+            kind: SpanKind::Dropped,
+            start: None,
+            end: None,
+            token_start: position,
+            token_end: position,
+            variants: count_variants(texts),
         })
         .collect()
 }
@@ -603,7 +693,19 @@ pub fn format_for_llm(reference: &Hypothesis, spans: &[UncertainSpan]) -> String
         }
     }
     flush(&mut pending, &mut parts);
-    parts.join(" ")
+    // Closing punctuation stays on the marker before it.
+    let mut text = String::new();
+    for part in parts {
+        let closes = part
+            .chars()
+            .next()
+            .is_some_and(|c| ".,!?;:)]}。，、！？；：）」』》…".contains(c));
+        if !text.is_empty() && !closes {
+            text.push(' ');
+        }
+        text.push_str(&part);
+    }
+    text
 }
 
 fn describe(span: &UncertainSpan, reference_text: &str) -> String {
@@ -621,9 +723,10 @@ fn describe(span: &UncertainSpan, reference_text: &str) -> String {
             "[unclear: \"{reference_text}\", also heard {}]",
             others.join(", ")
         ),
-        SpanKind::Dropped if others.is_empty() => {
-            format!("[possibly missed speech ~{:.1}s]", span.end - span.start)
-        }
+        SpanKind::Dropped if others.is_empty() => match (span.start, span.end) {
+            (Some(start), Some(end)) => format!("[possibly missed speech ~{:.1}s]", end - start),
+            _ => "[possibly missed speech]".to_owned(),
+        },
         SpanKind::Dropped => format!("[possibly missed speech: {}]", others.join(" or ")),
     }
 }
@@ -639,8 +742,7 @@ mod tests {
                 .map(|(text, time)| TimedToken {
                     id: 0,
                     text: (*text).to_owned(),
-                    frame: (*time / 0.04) as usize,
-                    time: *time,
+                    time: Some(*time),
                     log_prob: 0.0,
                 })
                 .collect(),
@@ -657,7 +759,7 @@ mod tests {
             &AnalysisOptions::default(),
         );
         assert!(analysis.spans.is_empty());
-        assert!(analysis.tokens.iter().all(|t| t.by_time == 1.0));
+        assert!(analysis.tokens.iter().all(|t| t.by_time == Some(1.0)));
     }
 
     #[test]
@@ -695,7 +797,7 @@ mod tests {
             1.2,
             &AnalysisOptions::default(),
         );
-        assert!(analysis.tokens.iter().all(|t| t.by_time == 1.0));
+        assert!(analysis.tokens.iter().all(|t| t.by_time == Some(1.0)));
     }
 
     #[test]
@@ -753,5 +855,46 @@ mod tests {
             format_for_llm(&reference, &analysis.spans),
             "I [possibly missed speech: \"DO\"] AGREE"
         );
+    }
+
+    fn untimed(words: &[&str]) -> Hypothesis {
+        Hypothesis {
+            tokens: words
+                .iter()
+                .map(|text| TimedToken {
+                    id: 0,
+                    text: (*text).to_owned(),
+                    time: None,
+                    log_prob: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn untimed_decodes_compare_by_alignment() {
+        let reference = untimed(&["The", " cat", " sat", " down", "."]);
+        let other = untimed(&["The", " hat", " sat", " right", " down", "."]);
+        let samples = vec![other.clone(), other, reference.clone()];
+        let analysis = analyze(&reference, &samples, 1.0, &AnalysisOptions::default());
+        assert!(analysis.tokens.iter().all(|t| t.by_time.is_none()));
+        assert!(analysis.timeline.is_empty());
+        assert_eq!(
+            format_for_llm(&reference, &analysis.spans),
+            "The [unclear: \"cat\", also heard \"hat\"] sat [possibly missed speech: \"right\"] down."
+        );
+        let last = untimed(&["The", " cat", " sat", " down", "."]);
+        let heard = untimed(&["The", " cat", " sat", " town", "."]);
+        let analysis = analyze(
+            &last,
+            &[heard.clone(), heard],
+            1.0,
+            &AnalysisOptions::default(),
+        );
+        assert_eq!(
+            format_for_llm(&last, &analysis.spans),
+            "The cat sat [unclear: \"down\", also heard \"town\"]."
+        );
+        assert!(analysis.spans.iter().all(|s| s.start.is_none()));
     }
 }

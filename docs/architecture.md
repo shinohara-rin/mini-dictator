@@ -10,16 +10,16 @@ and the contract that each platform shell fills.
 hotkey down
   │
   ├─ context ── ContextProvider::snapshot()      accessibility tree, OCR as fallback
-  │               └─ rank_terms() ─► hotwords ─► ContextGraph (token trie)
+  │               └─ rank_terms() ─► hotwords ─► Asr::bias()   prompt text or token trie
   │
   ├─ audio ──── AudioChunk ─► Resampler ─► Segmenter<VoiceActivityDetector>
   │                                            │ SpeechSegment per utterance
   │                                            ▼
-  ├─ asr ────── Fbank ─► TransducerModel::encode ─► EncoderOutput
+  ├─ asr ────── Asr::encode() ─► EncoderOutput   Qwen3-ASR audio features, or transducer encoder output
   │                                            │
-  │                       modified beam search + ContextGraph ─► reference Hypothesis
+  │             Asr::decode() with the bias ─► reference Hypothesis
   │                                            │
-  ├─ uncertainty  EncoderOutput + N(0, σ·std_d) × K ─► batched search ─► K Hypotheses
+  ├─ uncertainty  EncoderOutput + N(0, σ·std_d) × K ─► batched decode ─► K Hypotheses
   │               analyze() ─► unstable / dropped spans ─► format_for_llm()
   │                                            │  `the [unclear: "B", also heard "D"] ...`
   ├─ rewrite ── Rewriter::rewrite(marked transcript, screen terms, text before cursor)
@@ -38,8 +38,8 @@ so a slow accessibility read costs no audio: blocks wait in the channel.
 |---|---|---|
 | `audio` | Mono 16 kHz conversion | `AudioChunk`, `Resampler` |
 | `vad` | Speech gating with hysteresis, pre-roll, hangover, max length | `VoiceActivityDetector`, `Segmenter`, `SpeechSegment`, `SileroVad` (v4 and v5), `EnergyVad` |
-| `features` | Kaldi-compatible 80-bin log mel fbank (no dither, no snipped edges) | `Fbank`, `Features` |
-| `asr` | Transducer search that the core owns | `TransducerModel`, `Recognizer`, `ContextGraph`, `SymbolTable`, `Tokenizer`, `OnnxTransducer` |
+| `features` | Kaldi-compatible 80-bin fbank for transducers, Whisper's 128-bin log mel for Qwen3-ASR | `Fbank`, `WhisperMel`, `Features` |
+| `asr` | The recognizer interface and its two backends | `Asr`, `Bias`, `load`; `QwenAsr`, `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer` |
 | `uncertainty` | Monte Carlo over encoder output, span analysis | `MonteCarloConfig`, `estimate`, `analyze`, `format_for_llm` |
 | `context` | Screen text model and hotword ranking | `ContextProvider`, `ScreenContext`, `TextBlock`, `Region`, `FallbackProvider`, `rank_terms` |
 | `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `PassThrough` |
@@ -47,6 +47,34 @@ so a slow accessibility read costs no audio: blocks wait in the channel.
 
 Default features need no native code, so `cargo test` runs anywhere. `onnx` adds ONNX Runtime
 (loaded at run time from a bundled shared library). `http` adds the rewrite client.
+
+### Two recognizers
+
+The pipeline drives an `Asr`: `encode` once per segment, then `decode` a batch of encoder outputs
+with a `Bias` built from the screen terms. `asr::load` picks the backend from the model directory.
+
+**Qwen3-ASR 0.6B** is the default. It is an audio encoder in front of a Qwen3 LLM and covers about 30
+languages and Chinese dialects, with punctuation and casing. The core runs the sherpa-onnx export
+(`conv_frontend.onnx`, `encoder.int8.onnx`, `decoder.int8.onnx`) itself:
+
+- Whisper features (`WhisperMel`, within 3e-5 of Hugging Face's extractor), the 8x conv frontend in
+  100-frame chunks, and the encoder with a mask of the valid audio tokens (12.5 per second).
+- A chat prompt with hotwords in the system turn and one `<|audio_pad|>` per audio token. The decoder
+  replaces those with the audio features and returns the key/value entries of the tokens it read; the
+  core keeps the cache and decodes greedily, stopping at `<|im_end|>` or a repetition loop, and strips
+  the `language X<asr_text>` header.
+- `BpeTokenizer` is Qwen2's byte-level BPE (NFC, the Qwen2 split pattern, merges by rank), matching
+  Hugging Face on the test strings. Chat tokens go into the prompt by id and are never parsed from
+  text, so screen text cannot open a chat turn.
+- Hotwords are joined in rank order up to 96 tokens: every prompt token costs a decoder pass in every
+  noisy decode.
+- The decoder gives no token times, so a hypothesis is a list of words (CJK characters and
+  punctuation on their own), which keeps uncertainty from comparing BPE pieces.
+
+The int8 decoder quantizes activations per call, so a row's result depends slightly on the other rows
+of its batch. The clean decode therefore runs alone, and noisy decodes batch among themselves.
+
+**Transducers** (sherpa-onnx zipformers) remain as a small, fast fallback for one language.
 
 ### Why the core runs its own transducer search
 
@@ -74,11 +102,31 @@ mapping clocks. The span analysis is a port of AIRI's: per-token agreement by ti
 reference does not. Spans then widen to whole words, because a BPE model is often unsure of one piece
 (`THEL` in `BROTHELS`), and the rewrite model needs the word.
 
-Defaults: `K = 12`, `σ = 1.0`, early stop after 4 samples when all agree. On the model's clean test
-clips σ = 1.0 marks nothing; on the same clip at 3 dB SNR it marks the misheard words. For example,
-with Silero VAD the reference `LAMPS OF LIGHT UP` comes out as
-`LAMPS [unclear: "OF", also heard "WOULD", "DID", "SHOULD"] LIGHT UP`, and the truth is `WOULD`.
-On a 4-core container, 12 noisy decodes of a 6 s utterance take about 0.35 s after a 0.2 s encode.
+Each backend sets its defaults (`Asr::monte_carlo`), and `config.toml` can override them.
+
+**Transducer:** `K = 12`, `σ = 1.0`, early stop after 4 samples when all agree. On the model's clean
+test clips σ = 1.0 marks at most a spelling variant (`DISHONORED`, also heard `DISHONOURED`); on a clip
+at 3 dB SNR it marks the misheard words. For example, with Silero VAD the reference
+`LAMPS OF LIGHT UP` comes out as `LAMPS [unclear: "OF", also heard "WOULD", "DID", "SHOULD"] LIGHT UP`,
+and the truth is `WOULD`. On a 4-core container, 12 noisy decodes of a 6 s utterance take about 0.35 s
+after a 0.2 s encode.
+
+**Qwen3-ASR:** noise goes on the audio features that the LLM reads, `K = 4`, `σ = 0.5`, early stop
+after 2. Without token times, tokens match by text alignment alone, and dropped speech is where enough
+samples insert words between the same two reference words. On the export's test clips with Silero VAD:
+
+- French, correct: nothing marked.
+- Russian, four words wrong (truth: `Барсук, живущий в киевском зоопарке, совершил побег из своего
+  вольера`): `[unclear: "борцы, живущие", also heard "Борсук живущий", ...] в Киевском
+  [unclear: "запарке, совершили", ...] побег [unclear: "от", also heard "из"] своего
+  [unclear: "валиера", also heard "вольера"].` Every wrong word is marked, most with the right reading.
+- Code-switched English, French, Italian, Spanish: the English part is clean and the misheard rest
+  is one span.
+
+This costs much more than for a transducer, because each noisy decode reruns the whole LLM. On the
+4-core container, a 6 s utterance takes about 0.5 s to encode and 3 to 4 s to decode (a 1.4 s prompt
+pass, then about 80 ms per token), and 4 noisy decodes take 10 to 14 s. Apple silicon should be
+several times faster; measure there before tuning, and set `samples = 0` to turn the check off.
 
 ### Active context
 
@@ -130,8 +178,9 @@ A shell provides:
 ## Next steps
 
 1. **Shells.** A macOS shell first (AX + Vision + paste), then Windows, then Linux.
-2. **Model choice.** A bilingual zh/en transducer (for example a sherpa-onnx zipformer zh-en), and
-   int8 by default. The search assumes a stateless decoder, which every sherpa-onnx transducer has.
+2. **Cheaper uncertainty for the LLM.** Feed the clean transcript to each noisy decode in one pass
+   (teacher forcing) and only decode freely where a sample disagrees, which removes most decoder steps.
+   The CoreML execution provider may also speed up the prompt pass.
 3. **Streaming.** Decode while the user speaks with a streaming zipformer, and run the noisy decodes
    as parallel streams, as AIRI's live probe does. Offline decoding per VAD segment is the first step
    because the rewrite needs the whole utterance anyway.

@@ -4,7 +4,8 @@
 //!
 //! 1. [`context`] reads the screen around the cursor before speech starts and turns it into hotwords.
 //! 2. [`vad`] gates microphone audio into speech segments.
-//! 3. [`features`] and [`asr`] decode each segment with a transducer, biased toward the hotwords.
+//! 3. [`features`] and [`asr`] decode each segment with Qwen3-ASR or a transducer, biased toward the
+//!    hotwords.
 //! 4. [`uncertainty`] decodes the same encoder output again with Gaussian noise and marks the spans
 //!    where the decodes disagree.
 //! 5. [`rewrite`] asks an LLM for the final text, with the marked transcript and the screen context.

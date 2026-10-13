@@ -13,11 +13,10 @@ use std::time::{Duration, Instant};
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use mini_dictator_core::asr::onnx::{init_runtime, OnnxTransducer, TransducerFiles};
-use mini_dictator_core::asr::{Recognizer, SearchConfig};
+use mini_dictator_core::asr::onnx::init_runtime;
+use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::pipeline::{run_dictation, Engine, EngineConfig, Event as CoreEvent};
 use mini_dictator_core::rewrite::{OpenAiCompatible, Rewriter};
-use mini_dictator_core::uncertainty::MonteCarloConfig;
 use mini_dictator_core::vad::{EnergyVad, SileroVad};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -34,12 +33,10 @@ use crate::switches::Switchable;
 /// A press longer than this is push-to-talk: releasing the key stops the dictation.
 const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
 
-type Model = OnnxTransducer;
-
 enum AppEvent {
     Menu(MenuEvent),
     HotKey(GlobalHotKeyEvent),
-    Loaded(Result<(Arc<Engine<Model>>, Switches), String>),
+    Loaded(Result<(Arc<Engine>, Switches), String>),
     Core(CoreEvent),
     /// The worker finished, with an error if the dictation failed.
     Done(Option<String>),
@@ -50,11 +47,20 @@ struct Switches {
     screen: Arc<AtomicBool>,
 }
 
-fn load_engine(config: &Config) -> Result<(Engine<Model>, Switches), String> {
+fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
     init_runtime(config.onnxruntime_path().as_deref()).map_err(|e| format!("ONNX Runtime: {e}"))?;
-    let files = TransducerFiles::discover(&Config::resolve(&config.model_dir), true)
-        .map_err(|e| e.to_string())?;
-    let (model, symbols) = OnnxTransducer::load(&files, 2).map_err(|e| e.to_string())?;
+    let recognizer = asr::load(
+        &Config::resolve(&config.model_dir),
+        performance_cores(),
+        SearchConfig::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut monte_carlo = recognizer.monte_carlo();
+    monte_carlo.samples = config.uncertainty.samples.unwrap_or(monte_carlo.samples);
+    monte_carlo.relative_sigma = config
+        .uncertainty
+        .sigma
+        .unwrap_or(monte_carlo.relative_sigma);
 
     let rewriter: Option<Box<dyn Rewriter>> = (!config.rewrite.model.is_empty()).then(|| {
         Box::new(OpenAiCompatible {
@@ -72,20 +78,38 @@ fn load_engine(config: &Config) -> Result<(Engine<Model>, Switches), String> {
     };
 
     let engine = Engine {
-        recognizer: Recognizer::new(model, symbols, SearchConfig::default()),
+        asr: recognizer,
         context: Box::new(screen),
         rewriter: Box::new(rewriter),
         config: EngineConfig {
-            monte_carlo: MonteCarloConfig {
-                samples: config.uncertainty.samples,
-                relative_sigma: config.uncertainty.sigma,
-                ..MonteCarloConfig::default()
-            },
+            monte_carlo,
             share_screen_text: config.share_screen_text,
             ..EngineConfig::default()
         },
     };
     Ok((engine, switches))
+}
+
+/// Performance cores on Apple silicon. ONNX Runtime splits work evenly across its threads, so a
+/// thread on an efficiency core holds up the others.
+fn performance_cores() -> usize {
+    let mut cores: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and the output buffer is a c_int of the given size.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&mut cores as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status == 0 && cores > 0 {
+        cores as usize
+    } else {
+        std::thread::available_parallelism().map_or(4, |n| n.get())
+    }
 }
 
 struct Dictation {
@@ -213,7 +237,7 @@ pub fn run() {
         .map(Config::resolve)
         .filter(|p| p.exists());
     let mut ui: Option<Ui> = None;
-    let mut engine: Option<Arc<Engine<Model>>> = None;
+    let mut engine: Option<Arc<Engine>> = None;
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
@@ -343,7 +367,7 @@ pub fn run() {
 }
 
 fn start(
-    engine: Arc<Engine<Model>>,
+    engine: Arc<Engine>,
     vad_path: Option<PathBuf>,
     proxy: EventLoopProxy<AppEvent>,
     ui: &Ui,

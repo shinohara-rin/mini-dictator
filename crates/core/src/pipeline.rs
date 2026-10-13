@@ -7,7 +7,7 @@
 
 use std::sync::mpsc::Receiver;
 
-use crate::asr::{ContextGraph, Hypothesis, Recognizer, TransducerModel};
+use crate::asr::{Asr, Bias, Hypothesis};
 use crate::audio::{AudioChunk, Resampler};
 use crate::context::{rank_terms, ContextProvider, ScreenContext};
 use crate::rewrite::{RewriteRequest, Rewriter};
@@ -69,7 +69,7 @@ impl Default for EngineConfig {
 pub struct SessionContext {
     pub screen: ScreenContext,
     pub hotwords: Vec<String>,
-    pub graph: Option<ContextGraph>,
+    pub bias: Bias,
     /// Text inserted so far in this dictation.
     pub inserted: String,
 }
@@ -82,15 +82,15 @@ pub struct Transcript {
     pub marked: String,
 }
 
-pub struct Engine<M> {
-    pub recognizer: Recognizer<M>,
+pub struct Engine {
+    pub asr: Box<dyn Asr>,
     pub context: Box<dyn ContextProvider>,
     pub rewriter: Box<dyn Rewriter>,
     pub config: EngineConfig,
 }
 
-impl<M: TransducerModel> Engine<M> {
-    /// Reads the screen and builds the hotword graph. A failed read gives an empty context.
+impl Engine {
+    /// Reads the screen and prepares its terms as hotwords. A failed read gives an empty context.
     pub fn prepare(&self, warn: &mut dyn FnMut(Event)) -> SessionContext {
         let screen = self.context.snapshot().unwrap_or_else(|error| {
             warn(Event::Warning(error.to_string()));
@@ -100,13 +100,11 @@ impl<M: TransducerModel> Engine<M> {
             .into_iter()
             .map(|t| t.phrase)
             .collect();
-        let graph = self
-            .recognizer
-            .context_graph(&hotwords, self.recognizer.search.hotword_boost);
+        let bias = self.asr.bias(&hotwords);
         SessionContext {
             screen,
             hotwords,
-            graph: (!graph.is_empty()).then_some(graph),
+            bias,
             inserted: String::new(),
         }
     }
@@ -116,13 +114,13 @@ impl<M: TransducerModel> Engine<M> {
         segment: &SpeechSegment,
         session: &SessionContext,
     ) -> Result<Transcript> {
-        let encoder = self.recognizer.encode(&segment.samples)?;
-        let reference = self.recognizer.search(&encoder, session.graph.as_ref())?;
+        let encoder = self.asr.encode(&segment.samples)?;
+        let reference = self.asr.decode_one(&encoder, &session.bias)?;
         let uncertainty = uncertainty::estimate(
-            &self.recognizer,
+            self.asr.as_ref(),
             &encoder,
             &reference,
-            session.graph.as_ref(),
+            &session.bias,
             &self.config.monte_carlo,
         )?;
         let marked = format_for_llm(&reference, &uncertainty.analysis.spans);
@@ -205,8 +203,8 @@ fn is_cjk(c: char) -> bool {
 }
 
 /// Runs one dictation until `audio` closes. Returns all inserted text.
-pub fn run_dictation<M: TransducerModel, V: VoiceActivityDetector>(
-    engine: &Engine<M>,
+pub fn run_dictation<V: VoiceActivityDetector>(
+    engine: &Engine,
     vad: V,
     audio: Receiver<AudioChunk>,
     sink: &mut dyn TextSink,
@@ -234,7 +232,7 @@ pub fn run_dictation<M: TransducerModel, V: VoiceActivityDetector>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asr::{EncoderOutput, SearchConfig, SymbolTable};
+    use crate::asr::{EncoderOutput, Recognizer, SearchConfig, SymbolTable, TransducerModel};
     use crate::context::{ContextSource, Region, TextBlock};
     use crate::features::Features;
     use crate::rewrite::PassThrough;
@@ -302,14 +300,14 @@ mod tests {
         let symbols =
             SymbolTable::from_lines(["<blk> 0", "▁HELLO 1", "▁KITTY 2"].map(String::from));
         let engine = Engine {
-            recognizer: Recognizer::new(
+            asr: Box::new(Recognizer::new(
                 LoudnessModel,
                 symbols,
                 SearchConfig {
                     beam: 2,
                     ..SearchConfig::default()
                 },
-            ),
+            )),
             context: Box::new(Screen),
             rewriter: Box::new(PassThrough),
             config: EngineConfig::default(),

@@ -9,7 +9,8 @@ pub const APP_NAME: &str = "Mini Dictator";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// A sherpa-onnx offline transducer directory. Relative paths start at the support directory.
+    /// A sherpa-onnx Qwen3-ASR export or offline transducer directory. Relative paths start at the
+    /// support directory.
     pub model_dir: PathBuf,
     /// Silero VAD. Without it, a loudness detector gates the audio.
     pub vad_model: Option<PathBuf>,
@@ -25,11 +26,13 @@ pub struct Config {
     pub rewrite: Rewrite,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Uncertainty {
-    pub samples: usize,
-    pub sigma: f32,
+    /// Noisy decodes per segment. 0 turns the check off. Empty means the model's default.
+    pub samples: Option<usize>,
+    /// Noise as a fraction of each encoder dimension's spread. Empty means the model's default.
+    pub sigma: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,7 +51,7 @@ pub struct Rewrite {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_dir: PathBuf::from("models/sherpa-onnx-zipformer-en-2023-06-26"),
+            model_dir: PathBuf::from("models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"),
             vad_model: Some(PathBuf::from("models/silero_vad.onnx")),
             onnxruntime: None,
             hotkey: "Alt+Space".into(),
@@ -56,15 +59,6 @@ impl Default for Config {
             share_screen_text: true,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
-        }
-    }
-}
-
-impl Default for Uncertainty {
-    fn default() -> Self {
-        Self {
-            samples: 12,
-            sigma: 1.0,
         }
     }
 }
