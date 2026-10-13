@@ -1,7 +1,7 @@
 //! `md`: runs the dictation core on a WAV file and prints each step.
 //!
 //! ```text
-//! md --model <dir> --wav <file> [--vad silero_vad.onnx] [--ort libonnxruntime.so] [--threads 4]
+//! md --model <dir> --wav <file> [--vad silero_vad.onnx | --whole] [--ort libonnxruntime.so] [--threads 4]
 //!    [--hotword <phrase>]... [--screen <text file>] [--beam 4] [--boost 1.5]
 //!    [--samples N] [--sigma X] [--no-early-stop] [--seed N]   (defaults depend on the model)
 //!    [--rewrite-url <base url> --rewrite-model <name>]   (API key from MD_API_KEY)
@@ -37,6 +37,8 @@ struct Args {
     sigma: Option<f32>,
     early_stop: bool,
     seed: Option<u64>,
+    /// Decode the file as one segment, without VAD.
+    whole: bool,
     rewrite_url: Option<String>,
     rewrite_model: Option<String>,
 }
@@ -49,6 +51,7 @@ fn parse() -> Result<Args, String> {
     let mut threads = 4;
     let mut search = SearchConfig::default();
     let (mut samples, mut sigma, mut seed, mut early_stop) = (None, None, None, true);
+    let mut whole = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<f32>().map_err(|e| format!("{flag}: {e}"));
@@ -67,6 +70,7 @@ fn parse() -> Result<Args, String> {
             "--sigma" => sigma = Some(number(value()?)?),
             "--seed" => seed = Some(number(value()?)? as u64),
             "--no-early-stop" => early_stop = false,
+            "--whole" => whole = true,
             "--rewrite-url" => rewrite_url = Some(value()?),
             "--rewrite-model" => rewrite_model = Some(value()?),
             other => return Err(format!("unknown flag {other}")),
@@ -85,6 +89,7 @@ fn parse() -> Result<Args, String> {
         sigma,
         early_stop,
         seed,
+        whole,
         rewrite_url,
         rewrite_model,
     })
@@ -136,7 +141,7 @@ fn main() {
     let args = match parse() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx>] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
+            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
             std::process::exit(2);
         }
     };
@@ -224,6 +229,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let audio = read_wav(&args.wav)?.to_model_input(&mut Resampler::default());
     let found = match &args.vad {
+        _ if args.whole => vec![SpeechSegment {
+            samples: audio,
+            start_sample: 0,
+            truncated: false,
+        }],
         Some(path) => segments(SileroVad::load(path)?, &engine.config, &audio),
         None => segments(EnergyVad::default(), &engine.config, &audio),
     };
