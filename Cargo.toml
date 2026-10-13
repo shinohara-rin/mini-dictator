@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+
+[workspace.dependencies]
+mini-dictator-core = { path = "crates/core" }
+thiserror = "2"
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic"] }
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3"

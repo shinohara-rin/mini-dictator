@@ -1,0 +1,16 @@
+[package]
+name = "mini-dictator-cli"
+version = "0.1.0"
+description = "Runs the dictation core on WAV files, for tuning without a platform shell"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "md"
+path = "src/main.rs"
+
+[dependencies]
+mini-dictator-core = { workspace = true, features = ["onnx", "http"] }
+hound.workspace = true
