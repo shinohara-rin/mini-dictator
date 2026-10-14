@@ -133,9 +133,14 @@ impl Hotkey {
         })
     }
 
-    /// Whether a modifier outside the hotkey is down.
+    /// Whether a modifier outside the hotkey is down, counting the other side of a sided one.
     fn has_extra(&self, held: Held) -> bool {
-        (0..4).any(|i| self.modifiers[i].is_none() && held.side(i).is_some())
+        (0..4).any(|i| match self.modifiers[i] {
+            None => held.side(i).is_some(),
+            Some(Side::Either) => false,
+            Some(Side::Left) => held.right[i],
+            Some(Side::Right) => held.left[i],
+        })
     }
 }
 
@@ -345,6 +350,8 @@ pub struct Recorder {
     keys: HashSet<u16>,
     /// The last named key pressed, while it is still down.
     last_key: Option<u16>,
+    /// Every modifier held since `last_key` went down.
+    key_held: Held,
     pressed_key: bool,
     combination: Option<Hotkey>,
 }
@@ -362,6 +369,7 @@ impl Recorder {
         // A key with no name here, such as Fn, leaves the combination as it was.
         key_name(code)?;
         self.last_key = Some(code);
+        self.key_held = self.held;
         if self.held.is_empty() && !is_function_key(code) {
             self.combination = None;
             return Some(Outcome::NeedsModifier);
@@ -381,9 +389,13 @@ impl Recorder {
     pub fn modifiers_changed(&mut self, held: Held) -> Option<Outcome> {
         self.held = held;
         self.peak = self.peak.union(held);
-        // A modifier added to a key already held, as the menu asks after a bare letter.
-        if let (None, Some(code), false) = (self.combination, self.last_key, held.is_empty()) {
-            self.combination = Some(Hotkey::recorded(held, Some(code)));
+        // Modifiers added to a key already held, as the menu asks after a bare letter, join it.
+        // Letting go of some before the key keeps them.
+        if let Some(code) = self.last_key {
+            self.key_held = self.key_held.union(held);
+            if !self.key_held.is_empty() {
+                self.combination = Some(Hotkey::recorded(self.key_held, Some(code)));
+            }
         }
         self.finish()
     }
@@ -757,6 +769,33 @@ mod tests {
             recorder.modifiers_changed(Held::default()),
             Some(Outcome::Recorded(hotkey("RightCmd+D")))
         );
+    }
+
+    #[test]
+    fn modifiers_added_to_a_held_letter_all_count() {
+        let mut recorder = Recorder::default();
+        recorder.key_down(KEY_D, false);
+        recorder.modifiers_changed(held(&[CONTROL], &[]));
+        recorder.modifiers_changed(held(&[CONTROL, SHIFT], &[]));
+        // Letting go of Shift before D keeps it.
+        recorder.modifiers_changed(held(&[CONTROL], &[]));
+        recorder.key_up(KEY_D);
+        assert_eq!(
+            recorder.modifiers_changed(Held::default()),
+            Some(Outcome::Recorded(hotkey("Ctrl+Shift+D")))
+        );
+    }
+
+    #[test]
+    fn the_other_side_interrupts_a_sided_lone_modifier() {
+        let mut matcher = Matcher::new(hotkey("RightCmd"), Held::default());
+        matcher.modifiers_changed(held(&[], &[COMMAND]));
+        assert_eq!(
+            matcher.modifiers_changed(held(&[COMMAND], &[COMMAND])),
+            Some(Signal::Interrupted)
+        );
+        assert_eq!(matcher.modifiers_changed(held(&[], &[COMMAND])), None);
+        assert_eq!(matcher.modifiers_changed(Held::default()), None);
     }
 
     #[test]
