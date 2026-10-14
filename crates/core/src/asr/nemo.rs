@@ -189,13 +189,16 @@ impl NemoTransducer {
         NemoStream {
             model: self,
             samples: Vec::new(),
+            dropped_samples: 0,
             features: Vec::new(),
+            dropped_features: 0,
             feature_frames: 0,
             processed: 0,
             channel_cache: vec![0.0; c1 * c2 * c3],
             time_cache: vec![0.0; t1 * t2 * t3],
             channel_cache_len: 0,
             frames: Vec::new(),
+            dropped_frames: 0,
             finished: false,
             taken: 0,
         }
@@ -649,19 +652,24 @@ struct BeamHyp {
     symbols: usize,
 }
 
-/// Encodes one stream of audio as it arrives.
+/// Encodes one stream of audio as it arrives. It keeps only the audio, features and encoder frames
+/// that later work can still read, so a long dictation does not grow it; the `dropped_*` counts
+/// keep indices absolute.
 pub struct NemoStream<'a> {
     model: &'a NemoTransducer,
     samples: Vec<f32>,
+    dropped_samples: usize,
     features: Vec<f32>,
+    dropped_features: usize,
     feature_frames: usize,
     /// Feature frames the encoder has moved past.
     processed: usize,
     channel_cache: Vec<f32>,
     time_cache: Vec<f32>,
     channel_cache_len: i64,
-    /// Encoder frames so far, row-major.
+    /// Encoder frames not yet taken, row-major.
     frames: Vec<f32>,
+    dropped_frames: usize,
     finished: bool,
     /// Where the frames of the last segment taken end, in samples.
     taken: u64,
@@ -672,19 +680,27 @@ impl NemoStream<'_> {
         self.model.meta.channel_cache[2]
     }
 
+    /// Encoder frames so far, counting the dropped ones.
     fn encoder_frames(&self) -> usize {
-        self.frames.len() / self.encoder_dim()
+        self.dropped_frames + self.frames.len() / self.encoder_dim()
+    }
+
+    fn sample_count(&self) -> usize {
+        self.dropped_samples + self.samples.len()
     }
 
     /// Computes the features that the audio so far allows, `limit` frames at most, and runs the
     /// encoder on every full window.
     fn advance(&mut self, limit: usize) -> Result<()> {
         let fbank = &self.model.fbank;
-        let ready = fbank.complete_frames(self.samples.len()).min(limit);
+        let shift = FEATURE_SHIFT;
+        let ready = fbank.complete_frames(self.sample_count()).min(limit);
         if ready > self.feature_frames {
+            // The kept audio starts a whole number of frames in, and at least one frame before the
+            // first new one, so frames count from it as from the start and none reflects there.
             let features = fbank.compute_range(
                 &self.samples,
-                self.feature_frames,
+                self.feature_frames - self.dropped_samples / shift,
                 ready - self.feature_frames,
             );
             self.features.extend_from_slice(&features.data);
@@ -693,13 +709,20 @@ impl NemoStream<'_> {
         let meta = self.model.meta.clone();
         let dim = meta.feature_dim;
         while self.processed + meta.window <= self.feature_frames {
-            let window =
-                self.features[self.processed * dim..(self.processed + meta.window) * dim].to_vec();
+            let first = self.processed - self.dropped_features;
+            let window = self.features[first * dim..(first + meta.window) * dim].to_vec();
             let model = self.model;
             let encoded = model.encode_window(&window, self)?;
             self.frames.extend_from_slice(&encoded);
             self.processed += meta.shift;
         }
+
+        let features = self.processed - self.dropped_features;
+        self.features.drain(..features * dim);
+        self.dropped_features = self.processed;
+        let samples = self.feature_frames.saturating_sub(1) * shift - self.dropped_samples;
+        self.samples.drain(..samples);
+        self.dropped_samples += samples;
         Ok(())
     }
 
@@ -713,6 +736,7 @@ impl NemoStream<'_> {
         let (dim, count) = (self.encoder_dim(), self.encoder_frames());
         let frame_samples = self.model.meta.frame_samples() as u64;
         let first = (0..count)
+            .skip(self.dropped_frames)
             .find(|&i| self.frame_start(i) + frame_samples > start)
             .unwrap_or(count);
         let last = (first..count)
@@ -722,7 +746,9 @@ impl NemoStream<'_> {
         EncoderOutput {
             frames: last - first,
             dim,
-            data: self.frames[first * dim..last * dim].to_vec(),
+            data: self.frames
+                [(first - self.dropped_frames) * dim..(last - self.dropped_frames) * dim]
+                .to_vec(),
         }
     }
 
@@ -750,7 +776,7 @@ impl EncoderStream for NemoStream<'_> {
         // Pad with silence so that the last window covers every frame of the audio, and drop the
         // windows that would hold only padding.
         let meta = self.model.meta.clone();
-        let real = self.model.fbank.frame_count(self.samples.len());
+        let real = self.model.fbank.frame_count(self.sample_count());
         let last_window = real.saturating_sub(meta.window).div_ceil(meta.shift) * meta.shift;
         self.samples.resize(
             self.samples.len() + (meta.window + meta.shift) * FEATURE_SHIFT,
@@ -769,6 +795,13 @@ impl EncoderStream for NemoStream<'_> {
         }
         let frames = self.slice(start.max(self.taken), end);
         self.taken = end;
+        // Later segments start at `taken` or after it.
+        let (dim, frame_samples) = (self.encoder_dim(), self.model.meta.frame_samples() as u64);
+        let done = (self.dropped_frames..self.encoder_frames())
+            .take_while(|&i| self.frame_start(i) + frame_samples <= self.taken)
+            .count();
+        self.frames.drain(..done * dim);
+        self.dropped_frames += done;
         Some(frames)
     }
 }
