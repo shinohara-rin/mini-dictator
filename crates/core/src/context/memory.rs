@@ -47,6 +47,8 @@ struct Entry {
 struct State {
     entries: HashMap<String, Entry>,
     last_sample: Option<Instant>,
+    /// Screen reading is off: nothing is kept and nothing is added.
+    off: bool,
 }
 
 /// Recent screen terms with screen-time weights. Shared between the sampler and dictations.
@@ -72,6 +74,9 @@ impl TermMemory {
     /// screen without a break settles near 1.44 times its rank score (1 / ln 2).
     pub fn observe(&self, terms: &[Term], now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.off {
+            return;
+        }
         let gap = state
             .last_sample
             .map_or(Duration::ZERO, |last| now.saturating_duration_since(last))
@@ -136,9 +141,19 @@ impl TermMemory {
         terms
     }
 
-    /// Forgets everything, for when the user turns screen reading off.
-    pub fn clear(&self) {
-        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::default();
+    /// Follows the screen reading switch. Off forgets everything and ignores later observations
+    /// until it is on again. The switch and the memory change under one lock, so a snapshot read
+    /// before the switch went off cannot land after the memory was cleared.
+    pub fn set_enabled(&self, enabled: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        *state = State {
+            off: !enabled,
+            ..if enabled {
+                std::mem::take(&mut *state)
+            } else {
+                State::default()
+            }
+        };
     }
 }
 
@@ -240,8 +255,18 @@ mod tests {
             start + Duration::from_secs(10),
         );
         assert_eq!(memory.recall(start + Duration::from_secs(10)).len(), 2);
-        memory.clear();
+        memory.set_enabled(false);
         assert!(memory.recall(start + Duration::from_secs(5)).is_empty());
+        // A snapshot read before the switch went off lands after it: still nothing.
+        memory.observe(&[term("A1", 1.0)], start + Duration::from_secs(10));
+        assert!(memory.recall(start + Duration::from_secs(10)).is_empty());
+        memory.set_enabled(true);
+        memory.observe(&[term("A1", 1.0)], start + Duration::from_secs(15));
+        memory.observe(&[term("A1", 1.0)], start + Duration::from_secs(20));
+        assert_eq!(
+            phrases(&memory.recall(start + Duration::from_secs(20))),
+            vec!["A1"]
+        );
     }
 
     #[test]

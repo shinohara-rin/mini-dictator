@@ -91,21 +91,24 @@ fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switc
         screen: screen.enabled.clone(),
     };
 
+    let memory = TermMemory::new(if config.screen_memory_seconds > 0 {
+        MemoryConfig {
+            half_life: Duration::from_secs(config.screen_memory_seconds),
+            max_gap: MEMORY_SAMPLE * 2,
+            ..MemoryConfig::default()
+        }
+    } else {
+        MemoryConfig {
+            max_terms: 0,
+            ..MemoryConfig::default()
+        }
+    });
+    memory.set_enabled(config.read_screen);
+
     let engine = Engine {
         asr: recognizer,
         context: Box::new(screen),
-        memory: Arc::new(TermMemory::new(if config.screen_memory_seconds > 0 {
-            MemoryConfig {
-                half_life: Duration::from_secs(config.screen_memory_seconds),
-                max_gap: MEMORY_SAMPLE * 2,
-                ..MemoryConfig::default()
-            }
-        } else {
-            MemoryConfig {
-                max_terms: 0,
-                ..MemoryConfig::default()
-            }
-        })),
+        memory: Arc::new(memory),
         rewriter: Box::new(rewriter),
         config: EngineConfig {
             monte_carlo,
@@ -382,10 +385,10 @@ pub fn run() {
                     }
                 } else if event.id == ui.screen.id() {
                     if let Some(s) = &switches {
-                        s.screen.store(ui.screen.is_checked(), Ordering::SeqCst);
+                        s.screen.store(ui.screen.is_checked(), Ordering::Relaxed);
                     }
-                    if let Some(engine) = engine.as_ref().filter(|_| !ui.screen.is_checked()) {
-                        engine.memory.clear();
+                    if let Some(engine) = &engine {
+                        engine.memory.set_enabled(ui.screen.is_checked());
                     }
                 } else if event.id == ui.debug.id() {
                     debug_log::set_enabled(ui.debug.is_checked());
@@ -496,12 +499,8 @@ fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc
                 };
                 last = Some((window, Instant::now()));
             }
+            // Ignored if the switch went off during the read.
             engine.memory.observe(&terms, Instant::now());
-            // The menu stores the switch, then clears the memory. If it went off around this
-            // write, the clear may have come first, so clear again.
-            if !screen_on.load(Ordering::SeqCst) {
-                engine.memory.clear();
-            }
         }
     });
 }
