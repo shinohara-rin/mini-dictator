@@ -6,24 +6,26 @@ use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAud
 
 use crate::context::is_trusted;
 
-/// False only when the microphone was refused or is blocked. Before the first recording asks,
-/// the status is undetermined, and macOS shows its prompt then.
-fn microphone() -> bool {
+/// The microphone's authorization. AVMediaTypeAudio is always set on macOS; without it, there is
+/// nothing to check.
+fn microphone() -> AVAuthorizationStatus {
     // SAFETY: AVMediaTypeAudio is a constant string, and audio is a media type the method accepts.
-    let status = unsafe {
+    unsafe {
         match AVMediaTypeAudio {
             Some(audio) => AVCaptureDevice::authorizationStatusForMediaType(audio),
-            None => return true,
+            None => AVAuthorizationStatus::Authorized,
         }
-    };
-    status != AVAuthorizationStatus::Denied && status != AVAuthorizationStatus::Restricted
+    }
 }
 
-/// The names of the permissions the app lacks.
+/// The names of the permissions the app lacks. macOS asks for the microphone on the first
+/// recording, so until then it is listed as not asked rather than as refused.
 pub fn missing() -> Vec<&'static str> {
     let mut missing = Vec::new();
-    if !microphone() {
-        missing.push("Microphone");
+    match microphone() {
+        AVAuthorizationStatus::Authorized => {}
+        AVAuthorizationStatus::NotDetermined => missing.push("Microphone (asked on first use)"),
+        _ => missing.push("Microphone"),
     }
     if !is_trusted(false) {
         missing.push("Accessibility");
