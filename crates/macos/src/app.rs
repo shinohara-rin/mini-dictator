@@ -12,8 +12,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::pipeline::{run_dictation, Engine, EngineConfig, Event as CoreEvent};
@@ -28,10 +26,11 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use crate::config::{debug_log_path, support_dir, Config, APP_NAME};
 use crate::context::{is_trusted, AccessibilityReader};
 use crate::debug_log;
+use crate::hotkey::{Hotkey, Outcome, Signal};
 use crate::icons::{icon, State};
+use crate::keyboard::{self, Capture, Listener};
 use crate::paste::PasteSink;
 use crate::permissions;
-use crate::recorder::{self, Capture, Outcome};
 use crate::sound::{self, Cue};
 use crate::switches::Switchable;
 
@@ -43,7 +42,7 @@ const PERMISSION_POLL: Duration = Duration::from_secs(2);
 
 enum AppEvent {
     Menu(MenuEvent),
-    HotKey(GlobalHotKeyEvent),
+    HotKey(Signal),
     Loaded(Result<(Arc<Engine>, Switches), String>),
     Core(CoreEvent),
     /// The worker finished, with an error if the dictation failed.
@@ -233,6 +232,9 @@ impl Ui {
     }
 }
 
+const RECORDING_LABEL: &str = "Press the New Hotkey (Esc to Cancel)…";
+const NEEDS_MODIFIER_LABEL: &str = "Add ⌃, ⌥, ⇧ or ⌘ to That Key (Esc to Cancel)…";
+
 fn start_label(hotkey: &str) -> String {
     format!("Start Dictation ({hotkey})")
 }
@@ -275,19 +277,24 @@ pub fn run() {
             let _ = proxy.send_event(AppEvent::Menu(event));
         }));
     }
-    {
-        let proxy = proxy.clone();
-        GlobalHotKeyEvent::set_event_handler(Some(move |event| {
-            let _ = proxy.send_event(AppEvent::HotKey(event));
-        }));
-    }
-
-    let hotkeys = GlobalHotKeyManager::new().expect("hotkey manager");
-    let mut hotkey = HotKey::from_str(&config.hotkey).unwrap_or_else(|error| {
-        eprintln!("hotkey {}: {error}; using Alt+Space", config.hotkey);
+    let mut hotkey = Hotkey::from_str(&config.hotkey).unwrap_or_else(|error| {
+        eprintln!("hotkey: {error}; using Alt+Space");
         config.hotkey = "Alt+Space".into();
-        HotKey::from_str(&config.hotkey).expect("default hotkey")
+        Hotkey::from_str(&config.hotkey).expect("default hotkey")
     });
+    // The listener needs Accessibility, so without it the permission poll tries again.
+    let listen = {
+        let proxy = proxy.clone();
+        move |hotkey: Hotkey| -> Option<Listener> {
+            let proxy = proxy.clone();
+            keyboard::listen(hotkey, move |signal| {
+                let _ = proxy.send_event(AppEvent::HotKey(signal));
+            })
+        }
+    };
+    let mut listener: Option<Listener> = None;
+    // Whether the hotkey press still held down started the dictation.
+    let mut started_by_press = false;
 
     let vad_path = config
         .vad_model
@@ -308,9 +315,7 @@ pub fn run() {
             // The status item must be created after the app finishes launching.
             Event::NewEvents(StartCause::Init) => {
                 ui = Some(Ui::new(&config));
-                if let Err(error) = hotkeys.register(hotkey) {
-                    eprintln!("hotkey: {error}");
-                }
+                listener = listen(hotkey);
                 // Prompts for the permission that both reading the screen and pasting need.
                 is_trusted(true);
                 {
@@ -351,21 +356,26 @@ pub fn run() {
                     }
                 }
             }
-            Event::UserEvent(AppEvent::HotKey(event)) if event.id == hotkey.id() => {
+            // While recording a new hotkey, the current one does nothing.
+            Event::UserEvent(AppEvent::HotKey(signal)) if capture.is_none() => {
                 let Some(ui) = &ui else { return };
-                match (event.state, &dictation) {
-                    (HotKeyState::Pressed, None) if !busy => {
+                let by_press = std::mem::take(&mut started_by_press);
+                match (signal, &dictation) {
+                    (Signal::Pressed, None) if !busy => {
                         if let Some(engine) = &engine {
                             dictation = start(engine.clone(), vad_path.clone(), proxy.clone(), ui);
                             busy = dictation.is_some();
+                            started_by_press = busy;
                         }
                     }
-                    (HotKeyState::Pressed, Some(_)) => stop(&mut dictation, ui),
-                    (HotKeyState::Released, Some(current))
+                    (Signal::Pressed, Some(_)) => stop(&mut dictation, ui),
+                    (Signal::Released, Some(current))
                         if current.pressed_at.elapsed() >= HOLD_THRESHOLD =>
                     {
                         stop(&mut dictation, ui)
                     }
+                    // A lone-modifier hotkey turned out to be part of another shortcut.
+                    (Signal::Interrupted, Some(_)) if by_press => stop(&mut dictation, ui),
                     _ => {}
                 }
             }
@@ -391,23 +401,18 @@ pub fn run() {
                 } else if event.id == ui.change_hotkey.id() {
                     if capture.take().is_some() {
                         // Clicked again while recording: keep the current hotkey.
-                        let _ = hotkeys.register(hotkey);
                         ui.change_hotkey.set_text(change_label(&ui.hotkey));
                         return;
                     }
-                    // Unregistered while recording, so pressing it records it instead of dictating.
-                    let _ = hotkeys.unregister(hotkey);
                     let proxy = proxy.clone();
                     recording += 1;
                     let current = recording;
-                    capture = recorder::start(move |outcome| {
+                    capture = keyboard::record(move |outcome| {
                         let _ = proxy.send_event(AppEvent::HotKeyRecorded(current, outcome));
                     });
                     if capture.is_some() {
-                        ui.change_hotkey
-                            .set_text("Press the New Hotkey (Esc to Cancel)…");
+                        ui.change_hotkey.set_text(RECORDING_LABEL);
                     } else {
-                        let _ = hotkeys.register(hotkey);
                         ui.status.set_text("Allow Accessibility to record a hotkey");
                         is_trusted(true);
                     }
@@ -459,6 +464,9 @@ pub fn run() {
             }
             Event::UserEvent(AppEvent::CheckPermissions) => {
                 let Some(ui) = &ui else { return };
+                if listener.is_none() {
+                    listener = listen(hotkey);
+                }
                 let summary = permissions::summary(&permissions::missing());
                 if ui.permissions.text() != summary {
                     ui.permissions.set_text(summary);
@@ -466,35 +474,27 @@ pub fn run() {
             }
             Event::UserEvent(AppEvent::HotKeyRecorded(number, outcome)) => {
                 let Some(ui) = &mut ui else { return };
-                if number != recording || capture.take().is_none() {
+                if number != recording || capture.is_none() {
                     return;
                 }
-                let recorded = match outcome {
-                    Outcome::Recorded(text) => text,
+                let new = match outcome {
+                    Outcome::Recorded(new) => new,
+                    Outcome::NeedsModifier => {
+                        ui.change_hotkey.set_text(NEEDS_MODIFIER_LABEL);
+                        return;
+                    }
                     Outcome::Cancelled => {
-                        let _ = hotkeys.register(hotkey);
+                        capture = None;
                         ui.change_hotkey.set_text(change_label(&ui.hotkey));
                         return;
                     }
                 };
-                let new = match HotKey::from_str(&recorded) {
-                    Ok(new) => new,
-                    Err(error) => {
-                        let _ = hotkeys.register(hotkey);
-                        ui.change_hotkey.set_text(change_label(&ui.hotkey));
-                        ui.status.set_text(shorten(&format!("Hotkey: {error}"), 60));
-                        return;
-                    }
-                };
-                if let Err(error) = hotkeys.register(new) {
-                    eprintln!("hotkey {recorded}: {error}");
-                    let _ = hotkeys.register(hotkey);
-                    ui.change_hotkey.set_text(change_label(&ui.hotkey));
-                    ui.status
-                        .set_text(shorten(&format!("Cannot use {recorded}: {error}"), 60));
-                    return;
-                }
+                capture = None;
                 hotkey = new;
+                if let Some(listener) = &listener {
+                    listener.set_hotkey(new);
+                }
+                let recorded = new.to_string();
                 ui.set_hotkey(&recorded);
                 if let Err(error) = Config::save_hotkey(&recorded) {
                     eprintln!("config: {error}");

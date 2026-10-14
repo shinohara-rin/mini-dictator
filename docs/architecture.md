@@ -168,7 +168,7 @@ A shell provides:
 | Need | Core interface | macOS | Windows | Linux |
 |---|---|---|---|---|
 | Tray menu | none (`Event` drives the icon) | `tray-icon` | `tray-icon` | `tray-icon` (AppIndicator) |
-| Global hotkey | calls `run_dictation` | `global-hotkey` | `global-hotkey` | `global-hotkey` (X11), portal on Wayland |
+| Global hotkey | calls `run_dictation` | CGEvent tap (for lone modifiers and left/right sides) | `global-hotkey` | `global-hotkey` (X11), portal on Wayland |
 | Microphone | sends `AudioChunk` | `cpal` | `cpal` | `cpal` |
 | Screen text | `ContextProvider` | AX API | UI Automation | AT-SPI |
 | OCR fallback | `ContextProvider` | Vision | `Windows.Media.Ocr` | Tesseract or a small ONNX OCR |
@@ -177,7 +177,7 @@ A shell provides:
 ## Language and runtime: Rust
 
 - A tray app runs all day, so idle memory and start time matter. A Rust binary with
-  `tray-icon`, `global-hotkey`, and `cpal` idles at a few MB. An Electron or Tauri webview would hold a
+  `tray-icon` and `cpal` idles at a few MB. An Electron or Tauri webview would hold a
   renderer for a UI that does not exist.
 - The core needs the encoder output and the search loop, not a packaged recognizer. `ort` exposes ONNX
   sessions directly and loads ONNX Runtime at run time (`load-dynamic`), so one bundled shared library

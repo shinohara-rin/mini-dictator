@@ -16,7 +16,8 @@ pub struct Config {
     pub vad_model: Option<PathBuf>,
     /// ONNX Runtime. Empty means `ORT_DYLIB_PATH`, then `Contents/Frameworks` of the app bundle.
     pub onnxruntime: Option<PathBuf>,
-    /// For example `Alt+Space` or `Ctrl+Shift+D`. Tap to toggle, hold to talk.
+    /// For example `Alt+Space`, `Ctrl+Shift+D`, `F13`, or a modifier alone such as `RightCmd`.
+    /// `LeftAlt` and `RightAlt` (or `Cmd`, `Ctrl`, `Shift`) name a side. Tap to toggle, hold to talk.
     pub hotkey: String,
     /// Read the focused window for hotwords.
     pub read_screen: bool,
