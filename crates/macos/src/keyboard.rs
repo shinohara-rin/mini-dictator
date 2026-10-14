@@ -192,7 +192,8 @@ fn held_now() -> Held {
 /// Whether any mouse button is down right now. Asked rather than tracked, since a missed button-up
 /// would otherwise keep the hotkey from firing.
 fn button_down() -> bool {
-    (0..3).any(|button| {
+    // CoreGraphics numbers up to 32 buttons, side buttons included.
+    (0..32).any(|button| {
         CGEventSource::button_state(
             CGEventSourceStateID::CombinedSessionState,
             CGMouseButton(button),
