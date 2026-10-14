@@ -648,9 +648,7 @@ impl QwenAsr {
             for part in indices.chunks(rows_per_call) {
                 let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
                 let generated = match reference {
-                    Some(ids) if ids.iter().any(|id| !self.template.stops.contains(id)) => {
-                        self.generate_noisy(&prompt, &rows, ids)?
-                    }
+                    Some(ids) => self.generate_noisy(&prompt, &rows, ids)?,
                     _ => self.generate(&prompt, &rows, max_new)?,
                 };
                 for (index, generated) in part.iter().zip(generated) {
@@ -1036,14 +1034,17 @@ impl Asr for QwenAsr {
     }
 
     /// Scores the reference under every noisy copy in one call, and decodes on only from where a
-    /// copy's pick differs (see [`QwenAsr::generate_noisy`]).
+    /// copy's pick differs (see [`QwenAsr::generate_noisy`]). An empty reference, such as a
+    /// `language None` decode of what the model took for silence, gets full noisy decodes: its
+    /// header would hold every copy to the same reading.
     fn decode_noisy(
         &self,
         encoders: &[EncoderOutput],
         bias: &Bias,
         reference: &Hypothesis,
     ) -> Result<Vec<Hypothesis>> {
-        self.decode_rows(encoders, bias, Some(&reference.ids))
+        let ids = (!reference.tokens.is_empty()).then_some(reference.ids.as_slice());
+        self.decode_rows(encoders, bias, ids)
     }
 
     fn frame_seconds(&self) -> f32 {
