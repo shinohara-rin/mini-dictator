@@ -797,7 +797,17 @@ fn stretch_end(
     let room = ids.len() < LOCAL_TOKENS;
     // Punctuation where the reference has a word: the tokens after it show whether the row puts
     // it in front of that word, an insertion, once they make the whole word.
-    let marks = if reference.get(start).is_some_and(|r| !punctuation(&[*r])) {
+    // The reference's first character from `start`, which can take several tokens.
+    let head: Vec<u8> = reference[start.min(reference.len())..]
+        .iter()
+        .take(4)
+        .flat_map(|id| tokenizer.bytes(*id).iter().copied())
+        .collect();
+    let word_here = valid_prefix(&head)
+        .chars()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|c| !is_punctuation(c));
+    let marks = if word_here {
         (1..=ids.len())
             .rev()
             .find(|k| punctuation(&ids[..*k]))
@@ -1291,6 +1301,13 @@ mod tests {
         assert_eq!(
             stretch_end(&t, &stops, &mut inserted, &long_word, 1),
             Some(Some(1))
+        );
+        // Punctuation where the reference has punctuation split over tokens replaces it.
+        let split_mark = [256, wide[0], wide[1], wide[2], 258];
+        let mut swapped = row(&[comma, comma]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut swapped, &split_mark, 1),
+            Some(Some(4))
         );
         // A word inserted before the reference's word.
         let mut inserted = row(&[258, 257]);
