@@ -137,7 +137,8 @@ impl Engine {
         });
         let read = started.elapsed();
         let now = Instant::now();
-        let current = rank_terms(&screen, self.config.max_hotwords);
+        // Every current term, so a remembered weight can lift one above the cut.
+        let current = rank_terms(&screen, usize::MAX);
         // Recalled before this snapshot goes in, so the current screen does not count twice.
         let recalled = self.memory.recall(now);
         self.memory.observe(&current, now);
