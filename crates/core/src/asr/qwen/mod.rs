@@ -865,12 +865,14 @@ fn stretch_end(
                 || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
     });
     // It rejoins where a whole character of the reference ends, so a shared first byte is not
-    // taken for the reference's character.
+    // taken for the reference's character. Out of room part way through one, it does not rejoin.
     if let Some(j) = matched {
-        if whole(row) || !room {
+        if whole(row) {
             return Some(Some(j + 1));
         }
-        return None;
+        if room {
+            return None;
+        }
     }
     // The word ended when the next one begins: the row's word stands for the reference's. A
     // character split over tokens shows whether it begins a word only once its last byte is in,
@@ -1359,6 +1361,12 @@ mod tests {
         assert_eq!(
             stretch_end(&t, &stops, &mut rejoined, &split_later, 1),
             Some(Some(5))
+        );
+        // Out of room part way through it, the row's word stands for the reference's instead.
+        let mut capped = row(&[y, x, y, x, y, x, han[0], han[1]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut capped, &split_later, 1),
+            Some(Some(2))
         );
         let mut ended = row(&[comma, 300]);
         assert_eq!(
