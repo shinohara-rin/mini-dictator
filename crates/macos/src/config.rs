@@ -92,6 +92,41 @@ pub fn config_path() -> PathBuf {
     support_dir().join("config.toml")
 }
 
+/// Writes the config file, readable by the user only since it can hold an API key.
+fn write(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = config_path();
+    std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(text.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// The config text with `hotkey` set, its comments and layout untouched. A file that does not
+/// parse is an error rather than something to overwrite.
+fn with_hotkey(text: &str, hotkey: &str) -> Result<String, String> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    match document
+        .get_mut("hotkey")
+        .and_then(|item| item.as_value_mut())
+    {
+        Some(value) => {
+            let decor = value.decor().clone();
+            *value = hotkey.into();
+            *value.decor_mut() = decor;
+        }
+        None => document["hotkey"] = toml_edit::value(hotkey),
+    }
+    Ok(document.to_string())
+}
+
 impl Config {
     /// Loads the config, writing the defaults first if there is none.
     pub fn load_or_create() -> Result<Self, String> {
@@ -107,20 +142,18 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        write(&toml::to_string_pretty(self).map_err(|e| e.to_string())?)
+    }
 
+    /// Writes only the hotkey into the config file, keeping the rest as the user wrote it.
+    pub fn save_hotkey(hotkey: &str) -> Result<(), String> {
         let path = config_path();
-        std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
-        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        file.write_all(text.as_bytes()).map_err(|e| e.to_string())
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        write(&with_hotkey(&text, hotkey).map_err(|e| format!("{}: {e}", path.display()))?)
     }
 
     /// Expands `~` and resolves relative paths against the support directory.
@@ -155,5 +188,34 @@ impl Config {
                 .parent()?
                 .join("Frameworks/libonnxruntime.dylib"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_the_hotkey_keeps_the_rest_of_the_file() {
+        let text = "# mine\nhotkey = \"Alt+Space\" # tap or hold\nbeep = false\n\n[rewrite]\nmodel = \"x\"\n";
+        assert_eq!(
+            with_hotkey(text, "Ctrl+Shift+D").unwrap(),
+            "# mine\nhotkey = \"Ctrl+Shift+D\" # tap or hold\nbeep = false\n\n[rewrite]\nmodel = \"x\"\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_hotkey_goes_before_the_tables() {
+        let text = "beep = false\n\n[rewrite]\nmodel = \"x\"\n";
+        let updated = with_hotkey(text, "F5").unwrap();
+        let config: Config = toml::from_str(&updated).unwrap();
+        assert_eq!(config.hotkey, "F5");
+        assert_eq!(config.rewrite.model, "x");
+        assert!(!config.beep);
+    }
+
+    #[test]
+    fn a_broken_file_is_left_alone() {
+        assert!(with_hotkey("hotkey = ", "F5").is_err());
     }
 }

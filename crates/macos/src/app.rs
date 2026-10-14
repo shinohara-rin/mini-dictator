@@ -1,6 +1,7 @@
 //! The event loop: tray menu, hotkey, and one dictation at a time.
 //!
-//! Tap the hotkey to start and tap again to stop, or hold it while speaking. Each dictation runs
+//! Tap the hotkey to start and tap again to stop, or hold it while speaking. Change Hotkey records
+//! a new one from the keyboard and writes it to the config file. Each dictation runs
 //! `pipeline::run_dictation` on a worker thread. The microphone stream stays on the main thread,
 //! and dropping it closes the audio channel, which ends the dictation.
 
@@ -24,10 +25,11 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::config::{config_path, support_dir, Config, APP_NAME};
+use crate::config::{support_dir, Config, APP_NAME};
 use crate::context::{is_trusted, AccessibilityReader};
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
+use crate::recorder::{self, Capture, Outcome};
 use crate::sound::{self, Cue};
 use crate::switches::Switchable;
 
@@ -41,6 +43,7 @@ enum AppEvent {
     Core(CoreEvent),
     /// The worker finished, with an error if the dictation failed.
     Done(Option<String>),
+    HotKeyRecorded(Outcome),
 }
 
 struct Switches {
@@ -130,16 +133,18 @@ struct Ui {
     last: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
+    change_hotkey: MenuItem,
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
     beep: bool,
+    hotkey: String,
 }
 
 impl Ui {
     fn new(config: &Config) -> Ui {
         let status = MenuItem::new("Loading the model…", false, None);
-        let toggle = MenuItem::new(format!("Start Dictation ({})", config.hotkey), false, None);
+        let toggle = MenuItem::new(start_label(&config.hotkey), false, None);
         let last = MenuItem::new("Nothing dictated yet", false, None);
         let rewrite = CheckMenuItem::new(
             "Rewrite with LLM",
@@ -148,7 +153,8 @@ impl Ui {
             None,
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
-        let open_config = MenuItem::new("Open Settings File…", true, None);
+        let change_hotkey = MenuItem::new(change_label(&config.hotkey), true, None);
+        let open_config = MenuItem::new("Open Settings Folder…", true, None);
         let open_folder = MenuItem::new("Open Models Folder…", true, None);
         let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, None);
         let menu = Menu::new();
@@ -160,6 +166,7 @@ impl Ui {
             &separator,
             &rewrite,
             &screen,
+            &change_hotkey,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_folder,
@@ -180,10 +187,12 @@ impl Ui {
             last,
             rewrite,
             screen,
+            change_hotkey,
             open_config,
             open_folder,
             quit,
             beep: config.beep,
+            hotkey: config.hotkey.clone(),
         }
     }
 
@@ -192,11 +201,27 @@ impl Ui {
         self.status.set_text(status);
     }
 
+    fn set_hotkey(&mut self, hotkey: &str) {
+        hotkey.clone_into(&mut self.hotkey);
+        self.change_hotkey.set_text(change_label(hotkey));
+        if self.toggle.text().starts_with("Start") {
+            self.toggle.set_text(start_label(hotkey));
+        }
+    }
+
     fn cue(&self, cue: Cue) {
         if self.beep {
             sound::play(cue);
         }
     }
+}
+
+fn start_label(hotkey: &str) -> String {
+    format!("Start Dictation ({hotkey})")
+}
+
+fn change_label(hotkey: &str) -> String {
+    format!("Change Hotkey ({hotkey})…")
 }
 
 fn shorten(text: &str, max: usize) -> String {
@@ -213,7 +238,7 @@ fn open(path: &std::path::Path) {
 }
 
 pub fn run() {
-    let config = match Config::load_or_create() {
+    let mut config = match Config::load_or_create() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("config: {error}; using defaults");
@@ -239,9 +264,10 @@ pub fn run() {
     }
 
     let hotkeys = GlobalHotKeyManager::new().expect("hotkey manager");
-    let hotkey = HotKey::from_str(&config.hotkey).unwrap_or_else(|error| {
+    let mut hotkey = HotKey::from_str(&config.hotkey).unwrap_or_else(|error| {
         eprintln!("hotkey {}: {error}; using Alt+Space", config.hotkey);
-        HotKey::from_str("Alt+Space").expect("default hotkey")
+        config.hotkey = "Alt+Space".into();
+        HotKey::from_str(&config.hotkey).expect("default hotkey")
     });
 
     let vad_path = config
@@ -254,6 +280,7 @@ pub fn run() {
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
+    let mut capture: Option<Capture> = None;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -326,8 +353,29 @@ pub fn run() {
                     if let Some(s) = &switches {
                         s.screen.store(ui.screen.is_checked(), Ordering::Relaxed);
                     }
+                } else if event.id == ui.change_hotkey.id() {
+                    if capture.take().is_some() {
+                        // Clicked again while recording: keep the current hotkey.
+                        let _ = hotkeys.register(hotkey);
+                        ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                        return;
+                    }
+                    // Unregistered while recording, so pressing it records it instead of dictating.
+                    let _ = hotkeys.unregister(hotkey);
+                    let proxy = proxy.clone();
+                    capture = recorder::start(move |outcome| {
+                        let _ = proxy.send_event(AppEvent::HotKeyRecorded(outcome));
+                    });
+                    if capture.is_some() {
+                        ui.change_hotkey
+                            .set_text("Press the New Hotkey (Esc to Cancel)…");
+                    } else {
+                        let _ = hotkeys.register(hotkey);
+                        ui.status.set_text("Allow Accessibility to record a hotkey");
+                        is_trusted(true);
+                    }
                 } else if event.id == ui.open_config.id() {
-                    open(&config_path());
+                    open(&support_dir());
                 } else if event.id == ui.open_folder.id() {
                     open(&support_dir().join("models"));
                 } else if event.id == ui.quit.id() {
@@ -368,12 +416,48 @@ pub fn run() {
                     CoreEvent::Finished => {}
                 }
             }
+            Event::UserEvent(AppEvent::HotKeyRecorded(outcome)) => {
+                let Some(ui) = &mut ui else { return };
+                capture = None;
+                let recorded = match outcome {
+                    Outcome::Recorded(text) => text,
+                    Outcome::Cancelled => {
+                        let _ = hotkeys.register(hotkey);
+                        ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                        return;
+                    }
+                };
+                let new = match HotKey::from_str(&recorded) {
+                    Ok(new) => new,
+                    Err(error) => {
+                        let _ = hotkeys.register(hotkey);
+                        ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                        ui.status.set_text(shorten(&format!("Hotkey: {error}"), 60));
+                        return;
+                    }
+                };
+                if let Err(error) = hotkeys.register(new) {
+                    eprintln!("hotkey {recorded}: {error}");
+                    let _ = hotkeys.register(hotkey);
+                    ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                    ui.status
+                        .set_text(shorten(&format!("Cannot use {recorded}: {error}"), 60));
+                    return;
+                }
+                hotkey = new;
+                ui.set_hotkey(&recorded);
+                if let Err(error) = Config::save_hotkey(&recorded) {
+                    eprintln!("config: {error}");
+                    ui.status
+                        .set_text(shorten(&format!("Hotkey not saved: {error}"), 60));
+                }
+            }
             Event::UserEvent(AppEvent::Done(error)) => {
                 busy = false;
                 let Some(ui) = &ui else { return };
                 // The dictation failed while the microphone was on: stop recording.
                 if dictation.take().is_some() {
-                    ui.toggle.set_text("Start Dictation");
+                    ui.toggle.set_text(start_label(&ui.hotkey));
                     ui.cue(Cue::Stop);
                 }
                 match error {
@@ -447,7 +531,7 @@ fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
     if let Some(mut current) = dictation.take() {
         current.stream.take();
         ui.cue(Cue::Stop);
-        ui.toggle.set_text("Start Dictation");
+        ui.toggle.set_text(start_label(&ui.hotkey));
         ui.show(State::Working, "Finishing…");
     }
 }
