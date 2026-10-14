@@ -25,9 +25,12 @@ microphone opens and a pop when it closes. The first run asks for microphone and
 permission; accessibility is needed to see the hotkey, to read names from the focused window, and
 to paste. To pick another hotkey, choose Change Hotkey in the menu, press the new combination, and
 let go; Esc cancels. A hotkey can be a key with modifiers (`Ctrl+Shift+D`), a function key alone
-(`F13`), or modifiers alone (`RightCmd`), and Option and Command can name a side (`RightAlt`). Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu
-opens its folder): the model, the hotkey, the sounds (`beep`), the uncertainty samples, and the
-rewrite endpoint. Edits to the file apply on the next launch.
+(`F13`), or modifiers alone (`RightCmd`), and Option and Command can name a side (`RightAlt`).
+Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens its
+folder): the model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite
+endpoint. Edits to the file apply on the next launch. Names seen on screen in the last few minutes
+count as well as the current window's; `screen_memory_seconds` sets how fast they fade (0 turns
+the memory off).
 
 To see what a dictation did, check Write Debug Log in the menu, or set `debug = true` to have it on
 from launch. It writes `debug.log` next to `config.toml`: the screen text and hotwords, each decode
