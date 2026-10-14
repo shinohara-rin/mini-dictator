@@ -38,6 +38,10 @@ const CLICKS: CGEventMask = (1 << CGEventType::LeftMouseDown.0)
     | (1 << CGEventType::OtherMouseDown.0)
     | (1 << CGEventType::ScrollWheel.0);
 
+/// Marks the app's own key events, such as the paste, in their user-data field so the taps let
+/// them through untouched.
+pub const OWN_EVENT: i64 = 0x6d64_6963;
+
 /// Returns whether to keep the event from other apps.
 type Handler = Box<dyn FnMut(Key) -> bool>;
 
@@ -130,6 +134,9 @@ unsafe extern "C-unwind" fn on_event(
     }
     // SAFETY: CoreGraphics passes a valid event for the duration of the call.
     let event_ref = Some(unsafe { event.as_ref() });
+    if CGEvent::integer_value_field(event_ref, CGEventField::EventSourceUserData) == OWN_EVENT {
+        return event.as_ptr();
+    }
     let code = CGEvent::integer_value_field(event_ref, CGEventField::KeyboardEventKeycode) as u16;
     let key = match kind {
         CGEventType::KeyDown => Key::Down {
