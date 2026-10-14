@@ -17,6 +17,7 @@ use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::audio::{AudioChunk, Resampler};
 use mini_dictator_core::context::{rank_terms, ContextSource, Region, ScreenContext, TextBlock};
+use mini_dictator_core::join::{Joiner, Piece};
 use mini_dictator_core::pipeline::{Engine, EngineConfig, SessionContext, Timings, Transcript};
 use mini_dictator_core::rewrite::{OpenAiCompatible, PassThrough, Rewriter};
 use mini_dictator_core::uncertainty;
@@ -227,6 +228,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         hotwords,
         bias,
         inserted: String::new(),
+        joiner: Joiner::default(),
     };
 
     let audio = read_wav(&args.wav)?.to_model_input(&mut Resampler::default());
@@ -235,6 +237,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             samples: audio,
             start_sample: 0,
             truncated: false,
+            pre_roll: 0,
+            post_roll: 0,
         }],
         Some(path) => segments(SileroVad::load(path)?, &engine.config, &audio),
         None => segments(EnergyVad::default(), &engine.config, &audio),
@@ -282,18 +286,37 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  plain:  {}", transcript.reference.text());
         println!("  marked: {}", transcript.marked);
+        let pause_seconds = session.joiner.pause_before(segment);
+        let mut text = transcript.reference.text();
+        let mut rewritten = false;
         if args.rewrite_url.is_some() {
-            let request = engine.rewrite_request(&transcript, &session);
+            let request = engine.rewrite_request(&transcript, &session, pause_seconds);
             let started = Instant::now();
             match engine.rewriter.rewrite(&request) {
-                Ok(text) => {
-                    println!("  rewrite ({}): {text}", ms(started.elapsed()));
-                    session.inserted.push_str(&text);
-                    session.inserted.push(' ');
+                Ok(Some(reply)) => {
+                    println!("  rewrite ({}): {reply}", ms(started.elapsed()));
+                    text = reply;
+                    rewritten = true;
                 }
+                Ok(None) => {}
                 Err(error) => println!("  rewrite failed: {error}"),
             }
         }
+        if !text.trim().is_empty() {
+            let piece = Piece {
+                rewritten,
+                text: &text,
+                pause_seconds,
+                names: &session.hotwords,
+            };
+            let joined = session
+                .joiner
+                .join(&session.inserted, &piece, &engine.config.join);
+            session.joiner.typed(segment);
+            session.inserted.push_str(&joined);
+        }
     }
+    session.inserted += &session.joiner.finish();
+    println!("\ntext: {}", session.inserted);
     Ok(())
 }
