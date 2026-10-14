@@ -8,8 +8,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use mini_dictator_core::audio::AudioChunk;
 
+use crate::sound::Playback;
+
 /// Opens the default input device and sends its blocks until the returned stream is dropped.
-pub fn start(sender: Sender<AudioChunk>) -> Result<Stream, String> {
+/// Blocks recorded while the app plays a sound are marked as such.
+pub fn start(sender: Sender<AudioChunk>, playback: Playback) -> Result<Stream, String> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or("no microphone")?;
     let supported = device.default_input_config().map_err(|e| e.to_string())?;
@@ -27,6 +30,7 @@ pub fn start(sender: Sender<AudioChunk>) -> Result<Stream, String> {
                     sample_rate,
                     channels,
                     captured: Instant::now(),
+                    sound_playing: playback.is_playing(),
                 });
             },
             error,
@@ -41,6 +45,7 @@ pub fn start(sender: Sender<AudioChunk>) -> Result<Stream, String> {
                     sample_rate,
                     channels,
                     captured: Instant::now(),
+                    sound_playing: playback.is_playing(),
                 });
             },
             error,

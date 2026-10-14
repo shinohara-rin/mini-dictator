@@ -473,6 +473,7 @@ pub fn run_dictation<V: VoiceActivityDetector>(
         for chunk in audio {
             let samples = chunk.to_model_input(&mut resampler);
             clock = (clock.0 + samples.len() as u64, chunk.captured);
+            segmenter.set_sound_playing(chunk.sound_playing);
             for segment in segmenter.push(&samples) {
                 engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
             }
@@ -619,10 +620,48 @@ mod tests {
                     sample_rate: 48_000,
                     channels: 1,
                     captured,
+                    sound_playing: false,
                 })
                 .unwrap();
         }
         receiver
+    }
+
+    #[test]
+    fn a_sound_the_shell_played_is_not_dictated() {
+        let engine = engine();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for (samples, sound_playing) in [
+            (vec![0.0; 24_000], false),
+            (tone(1.0), true),
+            (vec![0.0; 48_000], false),
+        ] {
+            sender
+                .send(AudioChunk {
+                    samples,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    captured: Instant::now(),
+                    sound_playing,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        let mut sink = Collect(Vec::new());
+        let mut events = Vec::new();
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            receiver,
+            &mut sink,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        assert!(sink.0.is_empty());
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Heard { .. })),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -759,6 +798,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 captured: Instant::now(),
+                sound_playing: false,
             }
             .to_model_input(&mut Resampler::default()),
             start_sample: 0,

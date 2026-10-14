@@ -111,6 +111,8 @@ enum State {
 pub struct Segmenter<V> {
     vad: V,
     config: SegmenterConfig,
+    /// See [`Segmenter::set_sound_playing`].
+    sound_playing: bool,
     pending: Vec<f32>,
     pre_roll: VecDeque<f32>,
     processed: u64,
@@ -122,6 +124,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
         Self {
             vad,
             config,
+            sound_playing: false,
             pending: Vec::new(),
             pre_roll: VecDeque::new(),
             processed: 0,
@@ -135,6 +138,14 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
 
     fn samples_for(ms: u32) -> usize {
         ms as usize * SAMPLE_RATE as usize / 1000
+    }
+
+    /// While on, the samples pushed may hold a sound the app played, such as a cue that sounds a
+    /// little like a voice. Their frames cannot start an utterance or count as speech, but keep
+    /// one in progress going. The pre-roll grows over them, so speech that starts during the sound
+    /// keeps its first word once the sound ends.
+    pub fn set_sound_playing(&mut self, on: bool) {
+        self.sound_playing = on;
     }
 
     /// Takes the next 16 kHz samples and returns the utterances that ended in them.
@@ -189,7 +200,12 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
     }
 
     fn step(&mut self, frame: &[f32]) -> Option<SpeechSegment> {
-        let probability = self.vad.probability(frame);
+        let mut probability = self.vad.probability(frame);
+        if self.sound_playing {
+            // Between the thresholds: neither speech nor a new pause.
+            probability =
+                probability.min((self.config.threshold + self.config.release_threshold) / 2.0);
+        }
         let frame_start = self.processed;
         self.processed += frame.len() as u64;
         let min_silence = self.frames_for(self.config.min_silence_ms);
@@ -213,7 +229,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 } else {
                     self.pre_roll.extend(frame);
                     let keep = Self::samples_for(self.config.pre_roll_ms);
-                    while self.pre_roll.len() > keep {
+                    while !self.sound_playing && self.pre_roll.len() > keep {
                         self.pre_roll.pop_front();
                     }
                 }
@@ -450,5 +466,41 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[1].start_sample, 50 * 160);
         assert!(!segments[1].truncated);
+    }
+
+    #[test]
+    fn a_sound_the_app_plays_cannot_start_an_utterance() {
+        let mut segmenter = Segmenter::new(Scripted, config());
+        segmenter.set_sound_playing(true);
+        assert!(segmenter.push(&audio(&[(0.0, 2), (1.0, 20)])).is_empty());
+        segmenter.set_sound_playing(false);
+        assert!(segmenter.push(&audio(&[(0.0, 20)])).is_empty());
+        assert!(segmenter.finish().is_none());
+    }
+
+    #[test]
+    fn speech_under_a_sound_goes_on_and_keeps_its_start() {
+        // Speech already going on when the sound starts carries through it.
+        let mut segmenter = Segmenter::new(Scripted, config());
+        assert!(segmenter.push(&audio(&[(0.0, 2), (1.0, 5)])).is_empty());
+        segmenter.set_sound_playing(true);
+        assert!(segmenter.push(&audio(&[(1.0, 15)])).is_empty());
+        segmenter.set_sound_playing(false);
+        let segments = segmenter.push(&audio(&[(1.0, 5), (0.0, 20)]));
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].speech_start(), 2 * 160);
+
+        // Speech that starts while the sound plays begins once it ends, with the sound's frames
+        // as pre-roll, so its first word is kept.
+        let mut segmenter = Segmenter::new(Scripted, config());
+        assert!(segmenter.push(&audio(&[(0.0, 10)])).is_empty());
+        segmenter.set_sound_playing(true);
+        assert!(segmenter.push(&audio(&[(0.0, 3), (1.0, 6)])).is_empty());
+        segmenter.set_sound_playing(false);
+        let segments = segmenter.push(&audio(&[(1.0, 5), (0.0, 20)]));
+        assert_eq!(segments.len(), 1);
+        // The configured pre-roll before the sound, then all of it.
+        assert_eq!(segments[0].start_sample, (10 - 2) * 160);
+        assert_eq!(segments[0].speech_start(), 19 * 160);
     }
 }

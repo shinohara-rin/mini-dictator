@@ -679,7 +679,7 @@ fn start(
     ui: &Ui,
 ) -> Option<Dictation> {
     let (sender, receiver) = mpsc::channel();
-    let stream = match crate::audio::start(sender) {
+    let stream = match crate::audio::start(sender, ui.sounds.playback()) {
         Ok(stream) => stream,
         Err(error) => {
             ui.show(State::Error, &shorten(&format!("Microphone: {error}"), 60));

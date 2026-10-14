@@ -2,7 +2,9 @@
 //! `verbose` adds a cue for each step of the pipeline, drawn by [`crate::synth`].
 
 use std::cell::{Cell, RefCell};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::AllocAnyThread;
@@ -34,11 +36,44 @@ const VOLUME: f32 = 0.5;
 /// The verbose cues are frequent, so they sit a little below the microphone cues.
 const JINGLE_VOLUME: f32 = 0.35;
 
+/// How long after a sound ends the microphone may still hear it: output latency, the room, and the
+/// voice detector's memory of the last frames.
+const ECHO_MARGIN: Duration = Duration::from_millis(250);
+
+/// When the sounds the app started stop reaching the microphone. The microphone callback reads it
+/// to mark the audio recorded meanwhile, so a cue that sounds a little like a voice cannot start a
+/// segment of its own, which would play another cue.
+#[derive(Clone)]
+pub struct Playback {
+    base: Instant,
+    until_ms: Arc<AtomicU64>,
+}
+
+impl Playback {
+    fn new() -> Self {
+        Playback {
+            base: Instant::now(),
+            until_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn started(&self, seconds: f64) {
+        let end = Instant::now() + Duration::from_secs_f64(seconds.max(0.0)) + ECHO_MARGIN;
+        let end = end.duration_since(self.base).as_millis() as u64;
+        self.until_ms.fetch_max(end, Ordering::Relaxed);
+    }
+
+    pub fn is_playing(&self) -> bool {
+        (self.base.elapsed().as_millis() as u64) < self.until_ms.load(Ordering::Relaxed)
+    }
+}
+
 /// Lives on the main thread, which plays every sound. Playing never waits for a sound to finish.
 pub struct Sounds {
     level: Cell<Level>,
     jingles: Vec<(Jingle, Retained<NSSound>)>,
     limiter: RefCell<Limiter>,
+    playback: Playback,
 }
 
 impl Sounds {
@@ -56,7 +91,12 @@ impl Sounds {
             level: Cell::new(level),
             jingles,
             limiter: RefCell::new(Limiter::new()),
+            playback: Playback::new(),
         }
+    }
+
+    pub fn playback(&self) -> Playback {
+        self.playback.clone()
     }
 
     pub fn set_level(&self, level: Level) {
@@ -74,6 +114,7 @@ impl Sounds {
         if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
             sound.setVolume(VOLUME);
             sound.play();
+            self.playback.started(sound.duration());
         }
     }
 
@@ -88,6 +129,7 @@ impl Sounds {
             // A sound still playing ignores `play`; start it over instead.
             sound.stop();
             sound.play();
+            self.playback.started(sound.duration());
         }
     }
 }
