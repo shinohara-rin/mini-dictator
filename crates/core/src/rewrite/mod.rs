@@ -85,15 +85,16 @@ pub fn user_prompt(request: &RewriteRequest) -> String {
 /// `<transcript>` wrapping, or quotes. A reasoning block that never closes leaves nothing.
 pub fn clean_reply(reply: &str) -> String {
     let mut text = reply.trim();
-    if let Some(rest) = text.strip_prefix("<|im_start|>") {
-        // The role line.
-        text = rest
-            .split_once('\n')
-            .map_or("", |(_, answer)| answer)
-            .trim_start();
-    }
-    if let Some(rest) = text.strip_prefix("<think>") {
-        text = rest.split_once("</think>").map_or("", |(_, answer)| answer);
+    // A role line and a reasoning block can come in either order.
+    loop {
+        if let Some(rest) = text.strip_prefix("<|im_start|>") {
+            text = rest.split_once('\n').map_or("", |(_, answer)| answer);
+        } else if let Some(rest) = text.strip_prefix("<think>") {
+            text = rest.split_once("</think>").map_or("", |(_, answer)| answer);
+        } else {
+            break;
+        }
+        text = text.trim_start();
     }
     // The end of the turn, or a new turn the model started on its own.
     for end in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"] {
@@ -161,5 +162,13 @@ mod tests {
         );
         assert_eq!(clean_reply("<think>\n\n</think>\n\n\"Hello.\""), "Hello.");
         assert_eq!(clean_reply("<think>still thinking"), "");
+        assert_eq!(
+            clean_reply("<think>fix it</think>\n<|im_start|>assistant\nFixed.<|im_end|>"),
+            "Fixed."
+        );
+        assert_eq!(
+            clean_reply("<|im_start|>assistant\n<think>fix it</think>\nFixed.<|im_end|>"),
+            "Fixed."
+        );
     }
 }

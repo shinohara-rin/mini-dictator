@@ -449,13 +449,16 @@ fn transcript(
         .collect()
 }
 
-/// True for the metadata Qwen3-ASR writes before `<asr_text>`, such as `language English` or
-/// `language None` for audio without speech.
+/// True for the metadata Qwen3-ASR writes before `<asr_text>`: a `language English` line, or
+/// `language None` for audio without speech. Another line can come before it, such as the role of
+/// a turn the model started on its own (`assistant`).
 fn is_language_header(text: &str) -> bool {
-    let text = text.trim_start();
-    text.get(..8)
-        .is_some_and(|word| word.eq_ignore_ascii_case("language"))
-        && text[8..].starts_with(char::is_whitespace)
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.get(..8)
+            .is_some_and(|word| word.eq_ignore_ascii_case("language"))
+            && line[8..].starts_with(char::is_whitespace)
+    })
 }
 
 /// Decodes UTF-8 like [`String::from_utf8_lossy`], with the text offset of every byte offset, so
@@ -707,9 +710,20 @@ mod tests {
         let with = |parts: &[&[u32]]| parts.concat();
 
         assert_eq!(text(&with(&[&header, &[asr_text], &body])), "ab ab");
-        // The model opened with a new turn before the header.
+        // The model opened with a new turn before the header, with or without a role line (a
+        // short stand-in for `assistant` here).
         assert_eq!(
             text(&with(&[&[im_start], &header, &[asr_text], &body])),
+            "ab ab"
+        );
+        assert_eq!(
+            text(&with(&[
+                &[im_start],
+                &encode("ab\n"),
+                &header,
+                &[asr_text],
+                &body
+            ])),
             "ab ab"
         );
         // A marker inside the text.
@@ -728,7 +742,9 @@ mod tests {
         assert!(is_language_header("language English"));
         assert!(is_language_header("Language None"));
         assert!(is_language_header("language Chinese\n"));
+        assert!(is_language_header("assistant\nlanguage German"));
         assert!(!is_language_header("languages are fun"));
+        assert!(!is_language_header("a language German"));
         assert!(!is_language_header("lang"));
         assert!(!is_language_header("言語は日本語"));
     }
