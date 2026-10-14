@@ -237,6 +237,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             samples: audio,
             start_sample: 0,
             truncated: false,
+            pre_roll: 0,
+            post_roll: 0,
         }],
         Some(path) => segments(SileroVad::load(path)?, &engine.config, &audio),
         None => segments(EnergyVad::default(), &engine.config, &audio),
@@ -284,9 +286,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  plain:  {}", transcript.reference.text());
         println!("  marked: {}", transcript.marked);
-        let pause_seconds = session
-            .joiner
-            .pause_before(segment, &engine.config.segmenter);
+        let pause_seconds = session.joiner.pause_before(segment);
         let mut text = transcript.reference.text();
         let mut rewritten = false;
         if args.rewrite_url.is_some() {
@@ -312,7 +312,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let joined = session
                 .joiner
                 .join(&session.inserted, &piece, &engine.config.join);
-            session.joiner.typed(segment, &engine.config.segmenter);
+            session.joiner.typed(segment);
             session.inserted.push_str(&joined);
         }
     }

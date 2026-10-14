@@ -11,7 +11,7 @@
 //! [`JoinConfig::sentence_pause_seconds`], and its next word loses the capital the recognizer gave it.
 
 use crate::audio::SAMPLE_RATE;
-use crate::vad::{SegmenterConfig, SpeechSegment};
+use crate::vad::SpeechSegment;
 
 #[derive(Debug, Clone)]
 pub struct JoinConfig {
@@ -51,15 +51,15 @@ pub struct Joiner {
 
 impl Joiner {
     /// The silence before `segment`'s speech, not counting the audio the segmenter keeps around it.
-    pub fn pause_before(&self, segment: &SpeechSegment, config: &SegmenterConfig) -> Option<f32> {
-        let (start, _) = speech_span(segment, config);
+    pub fn pause_before(&self, segment: &SpeechSegment) -> Option<f32> {
+        let start = segment.speech_start();
         self.speech_end
             .map(|end| start.saturating_sub(end) as f32 / SAMPLE_RATE as f32)
     }
 
     /// Records that `segment`'s text was typed.
-    pub fn typed(&mut self, segment: &SpeechSegment, config: &SegmenterConfig) {
-        self.speech_end = Some(speech_span(segment, config).1);
+    pub fn typed(&mut self, segment: &SpeechSegment) {
+        self.speech_end = Some(segment.speech_end());
     }
 
     /// The text to type for `piece` after `typed`: a held period when the piece starts a new
@@ -68,7 +68,7 @@ impl Joiner {
         let (body, period, closing) = split_final_period(piece.text.trim());
         let continues = piece.pause_seconds.is_some_and(|pause| {
             // An opening quote or bracket says nothing; the letter after it does.
-            let first = body.chars().find(|&c| !is_lead_in(c));
+            let first = skip_lead_in(body).chars().next();
             if body.chars().next().is_some_and(is_joining_punctuation)
                 || first.is_some_and(char::is_lowercase)
             {
@@ -129,21 +129,6 @@ impl Joiner {
     }
 }
 
-/// Where a segment's speech starts and ends, without its pre-roll and post-roll. A segment cut at
-/// the length limit has no post-roll, and the part after it no pre-roll; counting them anyway
-/// makes the pause between them a quarter second, still short.
-fn speech_span(segment: &SpeechSegment, config: &SegmenterConfig) -> (u64, u64) {
-    let ms = |ms: u32| ms as u64 * SAMPLE_RATE as u64 / 1000;
-    let end = segment.start_sample + segment.samples.len() as u64;
-    let start = (segment.start_sample + ms(config.pre_roll_ms)).min(end);
-    let end = if segment.truncated {
-        end
-    } else {
-        end.saturating_sub(ms(config.post_roll_ms)).max(start)
-    };
-    (start, end)
-}
-
 /// Splits off a final period, Latin or CJK, with any closing quotes or brackets after it:
 /// `He said “fast.”` gives `He said “fast` and `.`, `”`. An ellipsis stays, and so does the period
 /// of an abbreviation like "Dr.", and `?` and `!`, which the recognizer rarely adds where a
@@ -191,13 +176,21 @@ fn is_closing_punctuation(c: char) -> bool {
     )
 }
 
-/// Opening punctuation and the spaces after it, before a piece's first word.
-fn is_lead_in(c: char) -> bool {
-    is_opening_punctuation(c) || c.is_whitespace()
+/// `text` after what comes before its first word: opening punctuation, spaces, and a list
+/// number such as `1.` or `2)`.
+fn skip_lead_in(text: &str) -> &str {
+    let text = text.trim_start_matches(|c: char| is_opening_punctuation(c) || c.is_whitespace());
+    let digits = text.trim_start_matches(|c: char| c.is_ascii_digit());
+    match digits.strip_prefix(['.', ')']) {
+        Some(rest) if digits.len() < text.len() && rest.starts_with(char::is_whitespace) => {
+            rest.trim_start()
+        }
+        _ => text,
+    }
 }
 
 fn first_word(text: &str) -> &str {
-    text.trim_start_matches(is_lead_in)
+    skip_lead_in(text)
         .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
         .next()
         .unwrap_or("")
@@ -228,7 +221,7 @@ fn lowercase_first_word(text: &str, names: &[String]) -> String {
     if !first.is_uppercase() || keeps_capital(word, names) {
         return text.to_owned();
     }
-    let start = text.len() - text.trim_start_matches(is_lead_in).len();
+    let start = text.len() - skip_lead_in(text).len();
     let (lead, rest) = text.split_at(start);
     lead.chars()
         .chain(first.to_lowercase())
@@ -446,6 +439,10 @@ mod tests {
             "Done. - Next step."
         );
         assert_eq!(
+            dictate(&[(0.0, "Done."), (0.7, "1. Next step.")], true),
+            "Done. 1. Next step."
+        );
+        assert_eq!(
             dictate(&[(0.0, "He said “hello."), (0.7, "” and left.")], false),
             "He said “hello” and left."
         );
@@ -468,31 +465,27 @@ mod tests {
 
     #[test]
     fn pauses_leave_out_the_pre_roll_and_post_roll() {
-        let config = SegmenterConfig::default();
-        let segment = |start_sample: u64, seconds: f32, truncated| SpeechSegment {
+        let segment = |start_sample: u64, seconds: f32, pre_roll, post_roll| SpeechSegment {
             samples: vec![0.0; (seconds * SAMPLE_RATE as f32) as usize],
             start_sample,
-            truncated,
+            truncated: false,
+            pre_roll,
+            post_roll,
         };
         let mut joiner = Joiner::default();
-        let first = segment(0, 2.0, false);
-        assert_eq!(joiner.pause_before(&first, &config), None);
-        joiner.typed(&first, &config);
+        let first = segment(0, 2.0, 4_000, 2_400);
+        assert_eq!(joiner.pause_before(&first), None);
+        joiner.typed(&first);
         // Speech ended at 1.85 s and the next starts at 2.5 + 0.25 s.
         let pause = joiner
-            .pause_before(&segment(40_000, 1.0, false), &config)
+            .pause_before(&segment(40_000, 1.0, 4_000, 2_400))
             .unwrap();
         assert!((pause - 0.9).abs() < 1e-3, "{pause}");
-
-        // The part after a cut at the length limit follows without a pause worth a period.
-        let cut = segment(0, 20.0, true);
-        joiner.typed(&cut, &config);
+        // A short pause leaves less than the full pre-roll before the next speech.
+        joiner.typed(&segment(0, 2.0, 4_000, 2_400));
         let pause = joiner
-            .pause_before(&segment(320_000, 1.0, false), &config)
+            .pause_before(&segment(32_000, 1.0, 1_600, 2_400))
             .unwrap();
-        assert!(
-            pause < JoinConfig::default().sentence_pause_seconds,
-            "{pause}"
-        );
+        assert!((pause - 0.25).abs() < 1e-3, "{pause}");
     }
 }

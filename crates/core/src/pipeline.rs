@@ -266,7 +266,7 @@ impl Engine {
         if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
         }
-        let pause_seconds = session.joiner.pause_before(segment, &self.config.segmenter);
+        let pause_seconds = session.joiner.pause_before(segment);
         let request = self.rewrite_request(&transcript, session, pause_seconds);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
@@ -304,7 +304,7 @@ impl Engine {
         let text = session
             .joiner
             .join(&session.inserted, &piece, &self.config.join);
-        session.joiner.typed(segment, &self.config.segmenter);
+        session.joiner.typed(segment);
         let inserted = self.insert(text, session, sink, events);
         if inserted.is_err() {
             // Nothing was typed, so the period held before is still the one to type at the end.
@@ -742,6 +742,8 @@ mod tests {
             .to_model_input(&mut Resampler::default()),
             start_sample: 0,
             truncated: false,
+            pre_roll: 0,
+            post_roll: 0,
         };
         assert!(!engine
             .transcribe(&segment, &session, true)
