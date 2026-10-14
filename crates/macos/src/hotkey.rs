@@ -255,12 +255,6 @@ impl Matcher {
         }
     }
 
-    pub fn set_hotkey(&mut self, hotkey: Hotkey) {
-        self.hotkey = hotkey;
-        self.active = false;
-        self.armed = self.held.is_empty();
-    }
-
     /// The signal, if any, and whether to keep the key from other apps.
     pub fn key_down(&mut self, code: u16, repeat: bool) -> (Option<Signal>, bool) {
         match self.hotkey.key {

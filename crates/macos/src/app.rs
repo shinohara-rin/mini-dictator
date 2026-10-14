@@ -443,6 +443,7 @@ pub fn run() {
                     if capture.take().is_some() {
                         // Clicked again while recording: keep the current hotkey.
                         ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                        listener = listen(hotkey);
                         return;
                     }
                     let proxy = proxy.clone();
@@ -453,6 +454,11 @@ pub fn run() {
                     });
                     if capture.is_some() {
                         ui.change_hotkey.set_text(RECORDING_LABEL);
+                        // Keys pressed while recording are not the current hotkey's. Without a
+                        // listener, none of them can queue a signal that lands after recording.
+                        listener = None;
+                        started_by_press = false;
+                        stop_on_release = false;
                     } else {
                         ui.status.set_text("Allow Accessibility to record a hotkey");
                         is_trusted(true);
@@ -505,7 +511,7 @@ pub fn run() {
             }
             Event::UserEvent(AppEvent::CheckPermissions) => {
                 let Some(ui) = &ui else { return };
-                if listener.is_none() {
+                if listener.is_none() && capture.is_none() {
                     listener = listen(hotkey);
                 }
                 let summary = permissions::summary(&permissions::missing());
@@ -527,14 +533,13 @@ pub fn run() {
                     Outcome::Cancelled => {
                         capture = None;
                         ui.change_hotkey.set_text(change_label(&ui.hotkey));
+                        listener = listen(hotkey);
                         return;
                     }
                 };
                 capture = None;
                 hotkey = new;
-                if let Some(listener) = &listener {
-                    listener.set_hotkey(new);
-                }
+                listener = listen(hotkey);
                 let recorded = new.to_string();
                 ui.set_hotkey(&recorded);
                 if let Err(error) = Config::save_hotkey(&recorded) {

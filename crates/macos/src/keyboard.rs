@@ -3,10 +3,8 @@
 //! the Accessibility permission the app already asks for. Each keeps the keys it uses from
 //! reaching other apps, and lets modifier changes through so no modifier looks stuck elsewhere.
 
-use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::{null_mut, NonNull};
-use std::rc::Rc;
 
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource,
@@ -154,13 +152,6 @@ unsafe extern "C-unwind" fn on_event(
 /// Watches for the hotkey until dropped.
 pub struct Listener {
     _tap: Tap,
-    matcher: Rc<RefCell<Matcher>>,
-}
-
-impl Listener {
-    pub fn set_hotkey(&self, hotkey: Hotkey) {
-        self.matcher.borrow_mut().set_hotkey(hotkey);
-    }
 }
 
 /// `on_signal` runs on the main thread.
@@ -168,19 +159,15 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
     let held = Held::from_flags(
         CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).bits(),
     );
-    let matcher = Rc::new(RefCell::new(Matcher::new(hotkey, held)));
-    let shared = matcher.clone();
+    let mut matcher = Matcher::new(hotkey, held);
     let tap = Tap::new(
         KEYS | CLICKS,
         Box::new(move |key| {
-            let (signal, swallow) = {
-                let mut matcher = shared.borrow_mut();
-                match key {
-                    Key::Down { code, repeat } => matcher.key_down(code, repeat),
-                    Key::Up { code } => matcher.key_up(code),
-                    Key::Modifiers(held) => (matcher.modifiers_changed(held), false),
-                    Key::Click => (matcher.mouse_down(), false),
-                }
+            let (signal, swallow) = match key {
+                Key::Down { code, repeat } => matcher.key_down(code, repeat),
+                Key::Up { code } => matcher.key_up(code),
+                Key::Modifiers(held) => (matcher.modifiers_changed(held), false),
+                Key::Click => (matcher.mouse_down(), false),
             };
             if let Some(signal) = signal {
                 on_signal(signal);
@@ -188,7 +175,7 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
             swallow
         }),
     )?;
-    Some(Listener { _tap: tap, matcher })
+    Some(Listener { _tap: tap })
 }
 
 /// A recording in progress. Dropping it stops recording.
