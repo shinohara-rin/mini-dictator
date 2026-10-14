@@ -40,7 +40,7 @@ const JINGLE_VOLUME: f32 = 0.35;
 /// voice detector's memory of the last frames.
 const ECHO_MARGIN: Duration = Duration::from_millis(250);
 
-/// When the verbose cues the app started stop reaching the microphone. The microphone callback
+/// When the voice-like cues the app started stop reaching the microphone. The microphone callback
 /// reads it to mark the audio recorded meanwhile, so a cue that sounds a little like a voice cannot
 /// start a segment of its own, which would play another cue.
 #[derive(Clone)]
@@ -131,7 +131,9 @@ impl Sounds {
             // A sound still playing ignores `play`; start it over instead.
             sound.stop();
             sound.play();
-            self.playback.started(sound.duration());
+            if jingle.sounds_like_voice() {
+                self.playback.started(sound.duration());
+            }
         }
     }
 }

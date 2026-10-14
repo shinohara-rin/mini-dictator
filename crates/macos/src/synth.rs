@@ -39,6 +39,17 @@ impl Jingle {
         Jingle::Error,
     ];
 
+    /// The cues that Silero VAD scores as speech when the microphone picks them up from the
+    /// speakers (over 0.5 for 200 ms or more at moderate levels). The bells, arpeggio, zips and
+    /// bonk stay under 0.45, so they never hold back speech detection.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn sounds_like_voice(self) -> bool {
+        matches!(
+            self,
+            Jingle::Heard | Jingle::Unclear | Jingle::Nothing | Jingle::Warning
+        )
+    }
+
     /// The cue as a 16-bit mono WAV file.
     pub fn wav(self) -> Vec<u8> {
         wav(&self.samples())
