@@ -50,6 +50,9 @@ const SHIFT: usize = 2;
 const COMMAND: usize = 3;
 
 /// The left and right device bits of each modifier in an event's flags, then its side-blind bit.
+/// Function (Globe) in an event's flags.
+const FUNCTION_BIT: u64 = 0x0080_0000;
+
 const DEVICE_BITS: [(u64, u64, u64); 4] = [
     (0x0000_0001, 0x0000_2000, 0x0004_0000),
     (0x0000_0020, 0x0000_0040, 0x0008_0000),
@@ -62,6 +65,9 @@ const DEVICE_BITS: [(u64, u64, u64); 4] = [
 pub struct Held {
     left: [bool; 4],
     right: [bool; 4],
+    /// Function (Globe), which never takes part in a hotkey but keeps a lone modifier from
+    /// firing as part of a Function shortcut.
+    function: bool,
 }
 
 impl Held {
@@ -76,11 +82,18 @@ impl Held {
                 held.left[i] = true;
             }
         }
+        held.function = flags & FUNCTION_BIT != 0;
         held
     }
 
+    /// Whether no modifier a hotkey can use is down. Function does not count.
     pub fn is_empty(self) -> bool {
-        self == Self::default()
+        self.left == [false; 4] && self.right == [false; 4]
+    }
+
+    /// Whether no modifier at all is down, Function included.
+    fn is_idle(self) -> bool {
+        self.is_empty() && !self.function
     }
 
     fn union(self, other: Self) -> Self {
@@ -89,6 +102,7 @@ impl Held {
             held.left[i] |= other.left[i];
             held.right[i] |= other.right[i];
         }
+        held.function |= other.function;
         held
     }
 
@@ -262,7 +276,7 @@ impl Matcher {
             held,
             keys: HashSet::new(),
             active: false,
-            armed: held.is_empty(),
+            armed: held.is_idle(),
             button_down: false,
         }
     }
@@ -284,7 +298,7 @@ impl Matcher {
             None => {
                 self.keys.insert(code);
                 // A key typed with a modifier down makes that press part of a shortcut.
-                if !self.held.is_empty() {
+                if !self.held.is_idle() {
                     self.armed = false;
                 }
                 if std::mem::take(&mut self.active) {
@@ -302,7 +316,7 @@ impl Matcher {
         if self.hotkey.key.is_some() {
             return None;
         }
-        if !self.held.is_empty() {
+        if !self.held.is_idle() {
             self.armed = false;
         }
         std::mem::take(&mut self.active).then_some(Signal::Interrupted)
@@ -327,11 +341,11 @@ impl Matcher {
         if self.hotkey.key.is_some() {
             return None;
         }
-        if held.is_empty() {
+        if held.is_idle() {
             self.armed = true;
             return std::mem::take(&mut self.active).then_some(Signal::Released);
         }
-        if self.hotkey.has_extra(held) {
+        if self.hotkey.has_extra(held) || held.function {
             self.armed = false;
             return std::mem::take(&mut self.active).then_some(Signal::Interrupted);
         }
@@ -740,6 +754,26 @@ mod tests {
         assert_eq!(
             matcher.modifiers_changed(held(&[], &[COMMAND])),
             Some(Signal::Pressed)
+        );
+    }
+
+    #[test]
+    fn function_keeps_a_lone_modifier_from_firing() {
+        let mut matcher = Matcher::new(hotkey("RightCmd"), Held::default());
+        let function = Held::from_flags(FUNCTION_BIT);
+        matcher.modifiers_changed(function);
+        let mut with_command = held(&[], &[COMMAND]);
+        with_command.function = true;
+        assert_eq!(matcher.modifiers_changed(with_command), None);
+        matcher.modifiers_changed(Held::default());
+
+        assert_eq!(
+            matcher.modifiers_changed(held(&[], &[COMMAND])),
+            Some(Signal::Pressed)
+        );
+        assert_eq!(
+            matcher.modifiers_changed(with_command),
+            Some(Signal::Interrupted)
         );
     }
 
