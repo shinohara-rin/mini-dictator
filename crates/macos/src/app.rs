@@ -28,11 +28,15 @@ use crate::config::{config_path, support_dir, Config, APP_NAME};
 use crate::context::{is_trusted, AccessibilityReader};
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
+use crate::permissions;
 use crate::sound::{self, Cue};
 use crate::switches::Switchable;
 
 /// A press longer than this is push-to-talk: releasing the key stops the dictation.
 const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
+
+/// How often the menu checks permissions, which the user can grant at any time in System Settings.
+const PERMISSION_POLL: Duration = Duration::from_secs(2);
 
 enum AppEvent {
     Menu(MenuEvent),
@@ -41,6 +45,7 @@ enum AppEvent {
     Core(CoreEvent),
     /// The worker finished, with an error if the dictation failed.
     Done(Option<String>),
+    CheckPermissions,
 }
 
 struct Switches {
@@ -128,6 +133,7 @@ struct Ui {
     status: MenuItem,
     toggle: MenuItem,
     last: MenuItem,
+    permissions: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
     open_config: MenuItem,
@@ -141,6 +147,7 @@ impl Ui {
         let status = MenuItem::new("Loading the model…", false, None);
         let toggle = MenuItem::new(format!("Start Dictation ({})", config.hotkey), false, None);
         let last = MenuItem::new("Nothing dictated yet", false, None);
+        let permissions = MenuItem::new(permissions::summary(&permissions::missing()), false, None);
         let rewrite = CheckMenuItem::new(
             "Rewrite with LLM",
             !config.rewrite.model.is_empty(),
@@ -157,6 +164,7 @@ impl Ui {
             &status,
             &toggle,
             &last,
+            &permissions,
             &separator,
             &rewrite,
             &screen,
@@ -178,6 +186,7 @@ impl Ui {
             status,
             toggle,
             last,
+            permissions,
             rewrite,
             screen,
             open_config,
@@ -266,6 +275,15 @@ pub fn run() {
                 }
                 // Prompts for the permission that both reading the screen and pasting need.
                 is_trusted(true);
+                {
+                    let proxy = proxy.clone();
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(PERMISSION_POLL);
+                        if proxy.send_event(AppEvent::CheckPermissions).is_err() {
+                            break;
+                        }
+                    });
+                }
                 let proxy = proxy.clone();
                 let config = config.clone();
                 std::thread::spawn(move || {
@@ -366,6 +384,13 @@ pub fn run() {
                             .set_text(shorten(&format!("Warning: {warning}"), 60));
                     }
                     CoreEvent::Finished => {}
+                }
+            }
+            Event::UserEvent(AppEvent::CheckPermissions) => {
+                let Some(ui) = &ui else { return };
+                let summary = permissions::summary(&permissions::missing());
+                if ui.permissions.text() != summary {
+                    ui.permissions.set_text(summary);
                 }
             }
             Event::UserEvent(AppEvent::Done(error)) => {
