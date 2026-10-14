@@ -40,9 +40,9 @@ const JINGLE_VOLUME: f32 = 0.35;
 /// voice detector's memory of the last frames.
 const ECHO_MARGIN: Duration = Duration::from_millis(250);
 
-/// When the sounds the app started stop reaching the microphone. The microphone callback reads it
-/// to mark the audio recorded meanwhile, so a cue that sounds a little like a voice cannot start a
-/// segment of its own, which would play another cue.
+/// When the verbose cues the app started stop reaching the microphone. The microphone callback
+/// reads it to mark the audio recorded meanwhile, so a cue that sounds a little like a voice cannot
+/// start a segment of its own, which would play another cue.
 #[derive(Clone)]
 pub struct Playback {
     base: Instant,
@@ -114,7 +114,9 @@ impl Sounds {
         if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
             sound.setVolume(VOLUME);
             sound.play();
-            self.playback.started(sound.duration());
+            // Not marked as playing: the start cue overlaps the first words, which must be able
+            // to start a segment, and these short clicks were always heard by the microphone
+            // without being taken for speech.
         }
     }
 
