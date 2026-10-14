@@ -748,6 +748,7 @@ mod tests {
             context,
             rewriter,
             config,
+            memory,
         } = engine();
         let lag = 16_000;
         let taken = Arc::default();
@@ -760,6 +761,7 @@ mod tests {
             context,
             rewriter,
             config,
+            memory,
         };
         let mut sink = Collect(Vec::new());
         run_dictation(
