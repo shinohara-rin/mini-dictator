@@ -12,6 +12,8 @@
 //!
 //! The LLM reads hotwords as text in its system prompt, and it gives no token times.
 
+#[doc(hidden)]
+pub mod lab;
 mod tokenizer;
 
 use std::collections::BTreeMap;
