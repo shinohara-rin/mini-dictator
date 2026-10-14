@@ -807,7 +807,7 @@ fn stretch_end(
         end == reference.len()
             || starts_word(
                 tokenizer,
-                Some(reference[end - 1]),
+                &reference[..end],
                 reference[end],
                 &reference[end + 1..],
             )
@@ -839,7 +839,7 @@ fn stretch_end(
     // Punctuation or a word of its own, then the reference's word from its start: the row
     // inserted them in front of it, once the whole reference word follows.
     let inserted = (1..ids.len()).find(|k| {
-        (*k == marks || starts_word(tokenizer, Some(ids[*k - 1]), ids[*k], &ids[*k + 1..]))
+        (*k == marks || starts_word(tokenizer, &ids[..*k], ids[*k], &ids[*k + 1..]))
             && whole(&row[..*k])
             && reference[start..].starts_with(&ids[*k..])
     });
@@ -860,12 +860,7 @@ fn stretch_end(
     let matched = window.into_iter().find(|j| {
         reference[*j] == last
             && ((*j <= following_word
-                && starts_word(
-                    tokenizer,
-                    Some(reference[*j - 1]),
-                    last,
-                    &reference[*j + 1..],
-                )
+                && starts_word(tokenizer, &reference[..*j], last, &reference[*j + 1..])
                 && tokenizer.bytes(last).len() >= 2)
                 || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
     });
@@ -880,8 +875,7 @@ fn stretch_end(
     // The word ended when the next one begins: the row's word stands for the reference's. A
     // character split over tokens shows whether it begins a word only once its last byte is in,
     // so the boundary is the first one the newest token decides, after any punctuation in front.
-    let begins =
-        |k: usize, to: usize| starts_word(tokenizer, Some(ids[k - 1]), ids[k], &ids[k + 1..to]);
+    let begins = |k: usize, to: usize| starts_word(tokenizer, &ids[..k], ids[k], &ids[k + 1..to]);
     let last_index = ids.len() - 1;
     let next = (ids.len().saturating_sub(4).max(marks + 1)..ids.len()).find(|k| {
         begins(*k, ids.len()) && (*k == last_index || !begins(*k, last_index)) && whole(&row[..*k])
@@ -900,7 +894,7 @@ fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize
         .find(|j| {
             starts_word(
                 tokenizer,
-                Some(reference[*j - 1]),
+                &reference[..*j],
                 reference[*j],
                 &reference[*j + 1..],
             )
@@ -911,30 +905,26 @@ fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize
 /// True when a token begins a word: after whitespace, or with punctuation or a CJK character,
 /// which are words of their own, unless it is an apostrophe or hyphen going on from the word in
 /// the `previous` token. The `following` tokens complete a character the token only begins.
-fn starts_word(
-    tokenizer: &BpeTokenizer,
-    previous: Option<u32>,
-    id: u32,
-    following: &[u32],
-) -> bool {
+fn starts_word(tokenizer: &BpeTokenizer, before: &[u32], id: u32, following: &[u32]) -> bool {
     let mut head = tokenizer.bytes(id).to_vec();
     for id in following.iter().take(3) {
         head.extend_from_slice(tokenizer.bytes(*id));
     }
     let first = valid_prefix(&head).chars().next();
     // An apostrophe or hyphen right after a letter joins the word, as in `John's`, the way
-    // `split_words` reads it. A previous token ending inside a character, as the last byte of
-    // `é` can, ends inside a word.
+    // `split_words` reads it. The letter can be split over the tokens `before`, as `é` can.
+    let tail: Vec<u8> = before[before.len().saturating_sub(4)..]
+        .iter()
+        .flat_map(|id| tokenizer.bytes(*id).iter().copied())
+        .collect();
     let joins = matches!(first, Some('\'' | '’' | '-'))
-        && previous.is_some_and(|p| {
-            String::from_utf8_lossy(tokenizer.bytes(p))
-                .chars()
-                .next_back()
-                .is_some_and(|c| {
-                    c == char::REPLACEMENT_CHARACTER
-                        || !(c.is_whitespace() || is_punctuation(c) || is_cjk(c))
-                })
-        });
+        && String::from_utf8_lossy(&tail)
+            .chars()
+            .next_back()
+            .is_some_and(|c| {
+                c == char::REPLACEMENT_CHARACTER
+                    || !(c.is_whitespace() || is_punctuation(c) || is_cjk(c))
+            });
     !joins && first.is_some_and(|c| c.is_whitespace() || is_punctuation(c) || is_cjk(c))
 }
 
@@ -1252,6 +1242,14 @@ mod tests {
         assert_eq!(accent.len(), 2);
         let mut split = row(&[accent[0], accent[1], apostrophe]);
         assert_eq!(stretch_end(&t, &stops, &mut split, &reference, 0), None);
+        // But a hyphen after a split CJK character begins a word of its own.
+        let (hyphen, zh) = (ids("-")[0], ids("中"));
+        let mut cjk_hyphen = row(&[ids("x")[0], zh[0], zh[1], zh[2], hyphen]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut cjk_hyphen, &reference, 0),
+            Some(Some(1))
+        );
+        assert_eq!(cjk_hyphen, row(&[ids("x")[0], zh[0], zh[1], zh[2]]));
         // A newline ends the word like a space.
         let mut newline = row(&[ids("x")[0], ids("y")[0], ids("\n")[0]]);
         assert_eq!(
