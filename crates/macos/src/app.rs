@@ -15,6 +15,7 @@ use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
+use mini_dictator_core::join::JoinConfig;
 use mini_dictator_core::pipeline::{run_dictation, Engine, EngineConfig, Event as CoreEvent};
 use mini_dictator_core::rewrite::{OpenAiCompatible, Rewriter};
 use mini_dictator_core::vad::{EnergyVad, SileroVad};
@@ -95,6 +96,9 @@ fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switc
                 .max_lag_seconds
                 .unwrap_or(EngineConfig::default().max_lag_seconds),
             share_screen_text: config.share_screen_text,
+            join: JoinConfig {
+                sentence_pause_seconds: config.sentence_pause_seconds,
+            },
             debug,
             ..EngineConfig::default()
         },
