@@ -808,9 +808,16 @@ fn stretch_end(
     if marks == ids.len() && room {
         return None;
     }
-    if marks > 0 && reference[start..].starts_with(&ids[marks..]) {
-        if word_ends(start + ids.len() - marks) {
-            row.truncate(marks);
+    // Punctuation or a word of its own, then the reference's word from its start: the row
+    // inserted them in front of it, once the whole reference word follows.
+    let inserted = (1..ids.len()).find(|k| {
+        (*k == marks || starts_word(tokenizer, Some(ids[*k - 1]), ids[*k], &ids[*k + 1..]))
+            && whole(&row[..*k])
+            && reference[start..].starts_with(&ids[*k..])
+    });
+    if let Some(k) = inserted {
+        if word_ends(start + ids.len() - k) {
+            row.truncate(k);
             return Some(Some(start));
         }
         if room {
@@ -1285,6 +1292,13 @@ mod tests {
             stretch_end(&t, &stops, &mut inserted, &long_word, 1),
             Some(Some(1))
         );
+        // A word inserted before the reference's word.
+        let mut inserted = row(&[258, 257]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &reference, 1),
+            Some(Some(1))
+        );
+        assert_eq!(inserted, row(&[258]));
         // A rejoin on a split character waits for all of it.
         let split_later = [256, 258, han[0], han[1], han[2]];
         let mut partial = row(&[y, han[0], han[1]]);
