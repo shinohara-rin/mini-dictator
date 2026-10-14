@@ -1,0 +1,94 @@
+name: Release
+
+# Push a tag such as v0.2.0 to build every artifact and publish them as a GitHub Release; a tag
+# with a hyphen (v0.2.0-rc.1) becomes a prerelease. Running it by hand builds the artifacts
+# without releasing them.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cli:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: macos-latest
+            platform: osx-arm64
+          - os: windows-latest
+            platform: win-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        if: github.ref_type == 'tag'
+      - run: cargo build --release --locked -p mini-dictator-cli
+      - run: sh scripts/package-cli.sh ${{ matrix.platform }} ${VERSION:-}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: md-${{ matrix.platform }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        if: github.ref_type == 'tag'
+      - run: sh scripts/bundle-macos.sh ${VERSION:-}
+      # ditto keeps the bundle's symlinks and signature intact, unlike zip.
+      - name: Package
+        run: |
+          version=${VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' crates/macos/Cargo.toml)}
+          mkdir -p target/dist
+          ditto -c -k --keepParent "target/release/Mini Dictator.app" \
+            "target/dist/Mini-Dictator-$version-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: target/dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [cli, macos-app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum * > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: |
+            The builds are not signed or notarized yet. On macOS, unzip the app, move it to
+            Applications, and run `xattr -dr com.apple.quarantine "/Applications/Mini Dictator.app"`
+            before the first launch; the `md` CLI needs the same for its folder. Models are not
+            included: see `scripts/fetch-models.sh`.
+
+            Each `md` archive carries ONNX Runtime beside the binary, so `--ort` is not needed.
+        run: |
+          prerelease=
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --generate-notes $prerelease --notes "$NOTES"

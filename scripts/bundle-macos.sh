@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds "Mini Dictator.app" (Apple Silicon) in target/release, with ONNX Runtime in Contents/Frameworks.
 #
-#   scripts/bundle-macos.sh
+#   scripts/bundle-macos.sh [version]
 #
 # The app is signed ad hoc. macOS asks for microphone and accessibility permission on first use;
 # a rebuilt app counts as a new app for accessibility, so remove and re-add it in
@@ -10,6 +10,7 @@ set -eu
 
 ORT_VERSION=1.31.0
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+VERSION=${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/macos/Cargo.toml")}
 APP="$ROOT/target/release/Mini Dictator.app"
 CACHE="$ROOT/target/onnxruntime-$ORT_VERSION"
 
@@ -36,7 +37,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>dev.shinohara-rin.mini-dictator</string>
   <key>CFBundleExecutable</key><string>mini-dictator</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION%%-*}</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
