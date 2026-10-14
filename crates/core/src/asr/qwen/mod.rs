@@ -310,7 +310,6 @@ impl QwenAsr {
         prompt: &[i64],
         rows: &[&EncoderOutput],
         reference: &[u32],
-        max_new: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         let batch = rows.len();
         let (frames, dim) = (rows[0].frames, rows[0].dim);
@@ -320,7 +319,6 @@ impl QwenAsr {
         // stopped there, not when it ran out of tokens or a loop was cut off.
         let stopped = reference.last().is_some_and(|id| stops(*id));
         let reference = &reference[..reference.len() - usize::from(stopped)];
-        let reference = &reference[..reference.len().min(max_new)];
         let length = reference.len();
         let total = context + length + LOCAL_TOKENS + 1;
         let width = self.shape.kv_heads * self.shape.head_dim;
@@ -651,7 +649,7 @@ impl QwenAsr {
                 let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
                 let generated = match reference {
                     Some(ids) if ids.iter().any(|id| !self.template.stops.contains(id)) => {
-                        self.generate_noisy(&prompt, &rows, ids, max_new)?
+                        self.generate_noisy(&prompt, &rows, ids)?
                     }
                     _ => self.generate(&prompt, &rows, max_new)?,
                 };
@@ -771,10 +769,20 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
+    // Back on the reference: two tokens in a row match it, or one whole word does at most one
+    // reference word on, as when the row skips a comma or reads two characters as one word. One
+    // common word such as ` the` alone can match further on by chance.
+    let following_word = next_word(tokenizer, reference, next_word(tokenizer, reference, start));
     let window = (start + 1)..reference.len().min(start + REJOIN_WINDOW + 1);
     let matched = window.into_iter().find(|j| {
         reference[*j] == last
-            && ((starts_word(tokenizer, reference.get(*j - 1).copied(), last)
+            && ((*j <= following_word
+                && starts_word(
+                    tokenizer,
+                    Some(reference[*j - 1]),
+                    last,
+                    &reference[*j + 1..],
+                )
                 && tokenizer.bytes(last).len() >= 2)
                 || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
     });
@@ -798,10 +806,14 @@ fn stretch_end(
     {
         return Some(Some(start));
     }
-    // The word ended when the next one begins: the row's word stands for the reference's.
-    let previous = row.len().checked_sub(2).map(|k| row[k].0);
-    if row.len() >= 2 && starts_word(tokenizer, previous, last) && whole(&row[..row.len() - 1]) {
-        row.pop();
+    // The word ended when the next one begins: the row's word stands for the reference's. A
+    // character split over tokens shows whether it begins a word only once its last byte is in.
+    let ids: Vec<u32> = row.iter().map(|(id, _)| *id).collect();
+    let next = (ids.len().saturating_sub(4).max(1)..ids.len()).find(|k| {
+        starts_word(tokenizer, Some(ids[*k - 1]), ids[*k], &ids[*k + 1..]) && whole(&row[..*k])
+    });
+    if let Some(k) = next {
+        row.truncate(k);
         return Some(Some(next_word(tokenizer, reference, start)));
     }
     // A word too long to finish here: it stands for the reference's word all the same.
@@ -811,19 +823,35 @@ fn stretch_end(
 /// The first reference token after `start` that begins a word, or the reference's end.
 fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize {
     ((start + 1)..reference.len())
-        .find(|j| starts_word(tokenizer, Some(reference[*j - 1]), reference[*j]))
+        .find(|j| {
+            starts_word(
+                tokenizer,
+                Some(reference[*j - 1]),
+                reference[*j],
+                &reference[*j + 1..],
+            )
+        })
         .unwrap_or(reference.len())
 }
 
 /// True when a token begins a word: after a space, or with punctuation or a CJK character,
 /// which are words of their own, unless it is an apostrophe or hyphen going on from the word in
-/// the `previous` token.
-fn starts_word(tokenizer: &BpeTokenizer, previous: Option<u32>, id: u32) -> bool {
+/// the `previous` token. The `following` tokens complete a character the token only begins.
+fn starts_word(
+    tokenizer: &BpeTokenizer,
+    previous: Option<u32>,
+    id: u32,
+    following: &[u32],
+) -> bool {
     let bytes = tokenizer.bytes(id);
     if bytes.first() == Some(&b' ') {
         return true;
     }
-    let first = valid_prefix(bytes).chars().next();
+    let mut head = bytes.to_vec();
+    for id in following.iter().take(3) {
+        head.extend_from_slice(tokenizer.bytes(*id));
+    }
+    let first = valid_prefix(&head).chars().next();
     // An apostrophe or hyphen right after a letter joins the word, as in `John's`, the way
     // `split_words` reads it.
     let joins = matches!(first, Some('\'' | '’' | '-'))
@@ -1160,6 +1188,25 @@ mod tests {
             stretch_end(&t, &stops, &mut row(&[comma]), &reference, 1),
             Some(Some(1))
         );
+        // A character split over tokens begins a word once all of it is in.
+        let cjk = ids("中");
+        assert_eq!(cjk.len(), 3);
+        let mut split = row(&[ids("x")[0], cjk[0]]);
+        assert_eq!(stretch_end(&t, &stops, &mut split, &reference, 0), None);
+        let mut split = row(&[ids("x")[0], cjk[0], cjk[1], cjk[2]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut split, &reference, 0),
+            Some(Some(1))
+        );
+        assert_eq!(split, row(&ids("x")));
+        // One word can rejoin the reference one word on, but further on it may match by chance.
+        let near = [256, 258, 257];
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&[257]), &near, 0),
+            Some(Some(3))
+        );
+        let far = [256, 258, 258, 257];
+        assert_eq!(stretch_end(&t, &stops, &mut row(&[257]), &far, 0), None);
         // It skipped a comma and is back on the reference.
         let reference = ids("ab, ab c");
         assert_eq!(reference, vec![256, comma, 257, 258]);
