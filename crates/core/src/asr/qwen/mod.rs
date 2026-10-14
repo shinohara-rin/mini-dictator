@@ -784,21 +784,37 @@ fn stretch_end(
         std::str::from_utf8(&bytes)
             .is_ok_and(|text| !text.trim().is_empty() && text.trim().chars().all(is_punctuation))
     };
+    // The reference's word ends after token `end - 1`.
+    let word_ends = |end: usize| {
+        end == reference.len()
+            || starts_word(
+                tokenizer,
+                Some(reference[end - 1]),
+                reference[end],
+                &reference[end + 1..],
+            )
+    };
+    let room = ids.len() < LOCAL_TOKENS;
     // Punctuation where the reference has a word: the tokens after it show whether the row puts
-    // it in front of that word, an insertion, once they make whole characters.
-    if reference.get(start).is_some_and(|r| !punctuation(&[*r])) && ids.len() < LOCAL_TOKENS {
-        if punctuation(&ids) {
-            return None;
+    // it in front of that word, an insertion, once they make the whole word.
+    let marks = if reference.get(start).is_some_and(|r| !punctuation(&[*r])) {
+        (1..=ids.len())
+            .rev()
+            .find(|k| punctuation(&ids[..*k]))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if marks == ids.len() && room {
+        return None;
+    }
+    if marks > 0 && reference[start..].starts_with(&ids[marks..]) {
+        if word_ends(start + ids.len() - marks) {
+            row.truncate(marks);
+            return Some(Some(start));
         }
-        if let Some(marks) = (1..ids.len()).rev().find(|k| punctuation(&ids[..*k])) {
-            let after = &ids[marks..];
-            if reference[start..].starts_with(after) {
-                if !whole(&row[marks..]) {
-                    return None;
-                }
-                row.truncate(marks);
-                return Some(Some(start));
-            }
+        if room {
+            return None;
         }
     }
     // Back on the reference: two tokens in a row match it, or one whole word does at most one
@@ -818,13 +834,22 @@ fn stretch_end(
                 && tokenizer.bytes(last).len() >= 2)
                 || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
     });
+    // It rejoins where a whole character of the reference ends, so a shared first byte is not
+    // taken for the reference's character.
     if let Some(j) = matched {
-        return Some(Some(j + 1));
+        if whole(row) || !room {
+            return Some(Some(j + 1));
+        }
+        return None;
     }
     // The word ended when the next one begins: the row's word stands for the reference's. A
-    // character split over tokens shows whether it begins a word only once its last byte is in.
-    let next = (ids.len().saturating_sub(4).max(1)..ids.len()).find(|k| {
-        starts_word(tokenizer, Some(ids[*k - 1]), ids[*k], &ids[*k + 1..]) && whole(&row[..*k])
+    // character split over tokens shows whether it begins a word only once its last byte is in,
+    // so the boundary is the first one the newest token decides, after any punctuation in front.
+    let begins =
+        |k: usize, to: usize| starts_word(tokenizer, Some(ids[k - 1]), ids[k], &ids[k + 1..to]);
+    let last_index = ids.len() - 1;
+    let next = (ids.len().saturating_sub(4).max(marks + 1)..ids.len()).find(|k| {
+        begins(*k, ids.len()) && (*k == last_index || !begins(*k, last_index)) && whole(&row[..*k])
     });
     if let Some(k) = next {
         row.truncate(k);
@@ -1249,6 +1274,25 @@ mod tests {
         assert_eq!(
             stretch_end(&t, &stops, &mut inserted, &split_reference, 1),
             Some(Some(1))
+        );
+        // The whole reference word has to follow the punctuation, not only its first token.
+        let (x, y) = (ids("x")[0], ids("y")[0]);
+        let long_word = [256, 257, x, 258];
+        let mut begun = row(&[comma, 257]);
+        assert_eq!(stretch_end(&t, &stops, &mut begun, &long_word, 1), None);
+        let mut inserted = row(&[comma, 257, x]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &long_word, 1),
+            Some(Some(1))
+        );
+        // A rejoin on a split character waits for all of it.
+        let split_later = [256, 258, han[0], han[1], han[2]];
+        let mut partial = row(&[y, han[0], han[1]]);
+        assert_eq!(stretch_end(&t, &stops, &mut partial, &split_later, 1), None);
+        let mut rejoined = row(&[y, han[0], han[1], han[2]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut rejoined, &split_later, 1),
+            Some(Some(5))
         );
         let mut ended = row(&[comma, 300]);
         assert_eq!(
