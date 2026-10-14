@@ -382,7 +382,7 @@ pub fn run() {
                     }
                 } else if event.id == ui.screen.id() {
                     if let Some(s) = &switches {
-                        s.screen.store(ui.screen.is_checked(), Ordering::Relaxed);
+                        s.screen.store(ui.screen.is_checked(), Ordering::SeqCst);
                     }
                     if let Some(engine) = engine.as_ref().filter(|_| !ui.screen.is_checked()) {
                         engine.memory.clear();
@@ -495,9 +495,11 @@ fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc
                 };
                 last = Some((window, Instant::now()));
             }
-            // Checked again, in case the switch went off during the read.
-            if screen_on.load(Ordering::Relaxed) {
-                engine.memory.observe(&terms, Instant::now());
+            engine.memory.observe(&terms, Instant::now());
+            // The menu stores the switch, then clears the memory. If it went off around this
+            // write, the clear may have come first, so clear again.
+            if !screen_on.load(Ordering::SeqCst) {
+                engine.memory.clear();
             }
         }
     });

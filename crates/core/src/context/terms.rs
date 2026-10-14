@@ -69,7 +69,12 @@ pub fn rank_terms(context: &ScreenContext, limit: usize) -> Vec<Term> {
         if let Some(label) = cjk_label(text) {
             found.push((label, TermForm::Label));
         }
-        found.extend(rare_lowercase_labels(text));
+        // A label the scan above already found, quoted for example, is the same occurrence.
+        for (label, form) in rare_lowercase_labels(text) {
+            if !found.iter().any(|(p, _)| p.eq_ignore_ascii_case(&label)) {
+                found.push((label, form));
+            }
+        }
         for (phrase, form) in found {
             let key = phrase.to_lowercase();
             let entry = scores.entry(key).or_insert_with(|| {
@@ -367,6 +372,16 @@ mod tests {
         assert_eq!(
             phrases(&context),
             vec!["Airicraft", "Google Chrome", "Minecraft"]
+        );
+    }
+
+    #[test]
+    fn a_quoted_rare_word_counts_once() {
+        let found = rank_terms(&screen(&[(Region::Window, "see \"airicraft\"")]), 10);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].phrase.as_str(), found[0].score),
+            ("airicraft", 1.0)
         );
     }
 
