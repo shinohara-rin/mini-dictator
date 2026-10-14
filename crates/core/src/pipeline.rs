@@ -31,6 +31,10 @@ pub enum Event {
     Listening {
         hotwords: usize,
     },
+    /// The detector closed a segment of this many seconds, and the recognizer starts on it.
+    Heard {
+        seconds: f32,
+    },
     /// A segment was decoded. `marked` carries the uncertainty markers.
     Transcribed {
         plain: String,
@@ -237,6 +241,9 @@ impl Engine {
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<String>> {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
+        events(Event::Heard {
+            seconds: segment.duration_seconds(),
+        });
         let transcript = self.transcribe(segment, session, behind_seconds.is_none())?;
         let plain = transcript.reference.text();
         if self.debug() {
@@ -580,6 +587,20 @@ mod tests {
         assert_eq!(text, "HELLO HELLO");
         assert!(
             matches!(events[0], Event::Listening { hotwords: 1 }),
+            "{events:?}"
+        );
+        // Each segment is announced before its transcript.
+        let order: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Heard { seconds } if *seconds > 0.0 => Some("heard"),
+                Event::Transcribed { .. } => Some("transcribed"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["heard", "transcribed", "heard", "transcribed"],
             "{events:?}"
         );
         // Debug logging is off.

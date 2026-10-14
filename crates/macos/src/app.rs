@@ -22,7 +22,7 @@ use mini_dictator_core::vad::{EnergyVad, SileroVad};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::{config_path, debug_log_path, support_dir, Config, APP_NAME};
@@ -31,7 +31,7 @@ use crate::debug_log;
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
 use crate::permissions;
-use crate::sound::{self, Cue};
+use crate::sound::{Cue, Jingle, Level, Sounds};
 use crate::switches::Switchable;
 
 /// A press longer than this is push-to-talk: releasing the key stops the dictation.
@@ -161,10 +161,12 @@ struct Ui {
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
     debug: CheckMenuItem,
+    /// Off, minimal, and verbose, checked like radio buttons.
+    sound_levels: [(Level, CheckMenuItem); 3],
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
-    beep: bool,
+    sounds: Sounds,
 }
 
 impl Ui {
@@ -181,6 +183,19 @@ impl Ui {
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
         let debug = CheckMenuItem::new("Write Debug Log", true, config.debug, None);
+        let level = config.sound_level();
+        let sound_levels = [
+            (Level::Off, "Off"),
+            (Level::Minimal, "Microphone Only"),
+            (Level::Verbose, "Every Step"),
+        ]
+        .map(|(l, label)| (l, CheckMenuItem::new(label, true, l == level, None)));
+        let sounds_menu = Submenu::with_items(
+            "Sounds",
+            true,
+            &[&sound_levels[0].1, &sound_levels[1].1, &sound_levels[2].1],
+        )
+        .expect("sounds menu");
         let open_config = MenuItem::new("Open Settings File…", true, None);
         let open_folder = MenuItem::new("Open Models Folder…", true, None);
         let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, None);
@@ -195,6 +210,7 @@ impl Ui {
             &rewrite,
             &screen,
             &debug,
+            &sounds_menu,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_folder,
@@ -217,10 +233,11 @@ impl Ui {
             rewrite,
             screen,
             debug,
+            sound_levels,
             open_config,
             open_folder,
             quit,
-            beep: config.beep,
+            sounds: Sounds::new(level),
         }
     }
 
@@ -230,8 +247,23 @@ impl Ui {
     }
 
     fn cue(&self, cue: Cue) {
-        if self.beep {
-            sound::play(cue);
+        self.sounds.cue(cue);
+    }
+
+    fn jingle(&self, jingle: Jingle) {
+        self.sounds.jingle(jingle);
+    }
+
+    /// Checks the chosen level only, and plays a sample of it.
+    fn pick_sounds(&self, level: Level) {
+        for (l, item) in &self.sound_levels {
+            item.set_checked(*l == level);
+        }
+        self.sounds.set_level(level);
+        match level {
+            Level::Off => {}
+            Level::Minimal => self.cue(Cue::Start),
+            Level::Verbose => self.jingle(Jingle::Ready),
         }
     }
 }
@@ -340,11 +372,13 @@ pub fn run() {
                         switches = Some(found);
                         ui.toggle.set_enabled(true);
                         ui.show(State::Idle, "Ready");
+                        ui.jingle(Jingle::Ready);
                     }
                     Err(error) => {
                         eprintln!("model: {error}");
                         debug_log::write(&format!("model: {error}"));
                         ui.show(State::Error, &shorten(&format!("Model: {error}"), 60));
+                        ui.jingle(Jingle::Error);
                     }
                 }
             }
@@ -392,6 +426,12 @@ pub fn run() {
                     }
                 } else if event.id == ui.debug.id() {
                     debug_log::set_enabled(ui.debug.is_checked());
+                } else if let Some((level, _)) = ui
+                    .sound_levels
+                    .iter()
+                    .find(|(_, item)| event.id == *item.id())
+                {
+                    ui.pick_sounds(*level);
                 } else if event.id == ui.open_config.id() {
                     open(&config_path());
                 } else if event.id == ui.open_folder.id() {
@@ -407,11 +447,17 @@ pub fn run() {
                         State::Listening,
                         &format!("Listening ({hotwords} names on screen)"),
                     ),
+                    CoreEvent::Heard { .. } => ui.jingle(Jingle::Heard),
                     CoreEvent::Transcribed {
                         unclear_spans,
                         behind_seconds,
                         ..
                     } => {
+                        if behind_seconds.is_some() {
+                            ui.jingle(Jingle::CatchingUp);
+                        } else if unclear_spans > 0 {
+                            ui.jingle(Jingle::Unclear);
+                        }
                         let state = if dictation.is_some() {
                             State::Listening
                         } else {
@@ -423,14 +469,17 @@ pub fn run() {
                         };
                         ui.show(state, &status);
                     }
-                    CoreEvent::Inserted { text } => ui
-                        .last
-                        .set_text(format!("Last: {}", shorten(text.trim(), 40))),
+                    CoreEvent::Inserted { text } => {
+                        ui.last
+                            .set_text(format!("Last: {}", shorten(text.trim(), 40)));
+                        ui.jingle(Jingle::Typed);
+                    }
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
                         debug_log::write(&format!("warning: {warning}"));
                         ui.last
                             .set_text(shorten(&format!("Warning: {warning}"), 60));
+                        ui.jingle(Jingle::Warning);
                     }
                     // The worker writes these to the log itself.
                     CoreEvent::Debug(_) | CoreEvent::Finished => {}
@@ -457,6 +506,7 @@ pub fn run() {
                         eprintln!("dictation: {error}");
                         debug_log::write(&format!("dictation failed: {error}"));
                         ui.show(State::Error, &shorten(&format!("Error: {error}"), 60));
+                        ui.jingle(Jingle::Error);
                     }
                     None => ui.show(State::Idle, "Ready"),
                 }
@@ -518,6 +568,7 @@ fn start(
         Ok(stream) => stream,
         Err(error) => {
             ui.show(State::Error, &shorten(&format!("Microphone: {error}"), 60));
+            ui.jingle(Jingle::Error);
             return None;
         }
     };

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sound::Level;
+
 pub const APP_NAME: &str = "Mini Dictator";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,8 +27,15 @@ pub struct Config {
     pub screen_memory_seconds: u64,
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
-    /// Play a short sound when the microphone opens and closes.
-    pub beep: bool,
+    /// `"off"`, `"minimal"` (a sound when the microphone opens and closes), or `"verbose"` (also a
+    /// cue for each segment heard, unclear words, catching up, text typed, and errors). The menu
+    /// changes it until the app quits.
+    // A config written before this field keeps its own setting, not the new default.
+    #[serde(default)]
+    pub sounds: Option<Level>,
+    /// The older switch for the microphone sounds, read when `sounds` is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beep: Option<bool>,
     /// Write `debug.log` next to this file: the screen text and hotwords, each decode and its
     /// uncertainty check, the rewrite prompt and reply, and timings. The menu turns it on and off
     /// until the app quits.
@@ -70,7 +79,8 @@ impl Default for Config {
             read_screen: true,
             screen_memory_seconds: 60,
             share_screen_text: true,
-            beep: true,
+            sounds: Some(Level::Verbose),
+            beep: None,
             debug: false,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
@@ -148,6 +158,14 @@ impl Config {
             return support_dir().join(path);
         }
         path.to_path_buf()
+    }
+
+    /// `sounds`, else `beep` from a config written before it, else the minimal sounds that config had.
+    pub fn sound_level(&self) -> Level {
+        self.sounds.unwrap_or(match self.beep {
+            Some(false) => Level::Off,
+            _ => Level::Minimal,
+        })
     }
 
     /// ONNX Runtime: the config, then `ORT_DYLIB_PATH`, then the app bundle's Frameworks folder.

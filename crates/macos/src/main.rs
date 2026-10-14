@@ -21,6 +21,9 @@ mod permissions;
 mod sound;
 #[cfg(target_os = "macos")]
 mod switches;
+// Pure Rust, so its tests run on every platform.
+#[cfg(any(target_os = "macos", test))]
+mod synth;
 
 #[cfg(target_os = "macos")]
 fn main() {
