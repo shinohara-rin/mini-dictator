@@ -769,6 +769,16 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
+    let text = |id: u32| String::from_utf8_lossy(tokenizer.bytes(id)).into_owned();
+    let punctuation = |id: u32| {
+        let text = text(id);
+        !text.trim().is_empty() && text.trim().chars().all(is_punctuation)
+    };
+    // Punctuation, then the reference's word: the punctuation goes in front of the word.
+    if row.len() == 2 && punctuation(row[0].0) && reference.get(start) == Some(&last) {
+        row.pop();
+        return Some(Some(start));
+    }
     // Back on the reference: two tokens in a row match it, or one whole word does at most one
     // reference word on, as when the row skips a comma or reads two characters as one word. One
     // common word such as ` the` alone can match further on by chance.
@@ -796,15 +806,11 @@ fn stretch_end(
             .collect();
         std::str::from_utf8(&bytes).is_ok()
     };
-    let text = |id: u32| String::from_utf8_lossy(tokenizer.bytes(id)).into_owned();
-    let punctuation = |id: u32| {
-        let text = text(id);
-        !text.trim().is_empty() && text.trim().chars().all(is_punctuation)
-    };
-    // Punctuation where the reference has a word: the row likely puts it before that word.
+    // Punctuation where the reference has a word: the token after it shows whether the row puts
+    // it in front of that word.
     if row.len() == 1 && punctuation(last) && reference.get(start).is_some_and(|r| !punctuation(*r))
     {
-        return Some(Some(start));
+        return None;
     }
     // The word ended when the next one begins: the row's word stands for the reference's. A
     // character split over tokens shows whether it begins a word only once its last byte is in.
@@ -1183,10 +1189,22 @@ mod tests {
             stretch_end(&t, &stops, &mut long.clone(), &reference, 0),
             Some(Some(1))
         );
-        // A comma before a word comes in front of it.
+        // A comma before a word comes in front of it, once the word follows; before a stop, it
+        // ends the row.
         assert_eq!(
             stretch_end(&t, &stops, &mut row(&[comma]), &reference, 1),
+            None
+        );
+        let mut inserted = row(&[comma, 257]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &reference, 1),
             Some(Some(1))
+        );
+        assert_eq!(inserted, row(&[comma]));
+        let mut ended = row(&[comma, 300]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut ended, &reference, 1),
+            Some(None)
         );
         // A character split over tokens begins a word once all of it is in.
         let cjk = ids("中");
