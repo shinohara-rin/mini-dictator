@@ -508,7 +508,17 @@ impl NemoTransducer {
                 }
                 let (_, mut row) = expansions.next_if(|(&j, _)| j == i).expect("expanded");
                 log_softmax(&mut row, blank as usize, self.search.blank_penalty);
-                for token in top_k(&row, beam) {
+                // Hotword boosts come after the acoustic pruning, so the next token of a started
+                // hotword joins the candidates however the acoustics rank it.
+                let mut tokens = top_k(&row, beam);
+                if let Some(graph) = graph {
+                    for token in graph.continuations(hyp.context_state) {
+                        if !tokens.contains(&(token as usize)) {
+                            tokens.push(token as usize);
+                        }
+                    }
+                }
+                for token in tokens {
                     let mut next = hyp.clone();
                     next.log_prob += row[token];
                     if token as u32 == blank {

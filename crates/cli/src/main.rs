@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::audio::{AudioChunk, Resampler};
-use mini_dictator_core::context::{rank_terms, ContextSource, Region, ScreenContext, TextBlock};
+use mini_dictator_core::context::{
+    rank_terms, ContextProvider, ContextSource, Region, ScreenContext, TextBlock,
+};
 use mini_dictator_core::pipeline::{
     run_dictation, Engine, EngineConfig, Event, SessionContext, TextSink, Timings, Transcript,
 };
@@ -149,6 +151,15 @@ fn segments<V: VoiceActivityDetector>(
 
 /// Plays `audio` into [`run_dictation`] in 100 ms blocks at real-time pace, printing each event
 /// with the time since playback started.
+/// The screen given on the command line, as live dictation would read it.
+struct Fixed(ScreenContext);
+
+impl ContextProvider for Fixed {
+    fn snapshot(&self) -> mini_dictator_core::Result<ScreenContext> {
+        Ok(self.0.clone())
+    }
+}
+
 fn live<V: VoiceActivityDetector>(
     engine: &Engine,
     vad: V,
@@ -259,7 +270,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         debug: std::sync::Arc::new(args.debug.into()),
         ..EngineConfig::default()
     };
-    let engine = Engine {
+    let mut engine = Engine {
         asr: recognizer,
         context: Box::new(mini_dictator_core::context::NoContext),
         memory: Default::default(),
@@ -308,6 +319,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let audio = read_wav(&args.wav)?.to_model_input(&mut Resampler::default());
     if args.live {
+        // The pipeline reads the screen itself when dictation starts.
+        engine.context = Box::new(Fixed(session.screen));
         return match &args.vad {
             Some(path) => live(&engine, SileroVad::load(path)?, audio),
             None => live(&engine, EnergyVad::default(), audio),
