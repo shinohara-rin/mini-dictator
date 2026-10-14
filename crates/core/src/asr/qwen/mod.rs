@@ -268,11 +268,13 @@ impl QwenAsr {
                 if done[b] {
                     continue;
                 }
+                // A stop stays in the output, so a later pass knows the decode ended on one;
+                // the transcript leaves it out with the other added tokens.
+                generated[b].push((id, log_prob));
                 if self.template.stops.contains(&id) {
                     done[b] = true;
                     continue;
                 }
-                generated[b].push((id, log_prob));
                 if is_degenerate(&generated[b]) {
                     trim_degenerate_tail(&mut generated[b]);
                     done[b] = true;
@@ -295,8 +297,8 @@ impl QwenAsr {
     /// Decodes noisy rows whose clean decode generated `reference`, in far fewer calls than
     /// [`Self::generate`]. One call reads the prompt and the reference in every row, which gives
     /// each row's own pick after every reference token. Where a row's pick differs from the
-    /// reference, that row decodes on its own to the end of the word (no call at all when the
-    /// pick is a whole word), and the sample is the reference with that word replaced.
+    /// reference, that row decodes on its own until the next word begins, and the sample is the
+    /// reference with that word replaced.
     ///
     /// A full greedy decode of the row would also condition everything after a replaced word on
     /// it, so this is an approximation, but it keeps whole words for the readings the uncertainty
@@ -313,6 +315,11 @@ impl QwenAsr {
         let batch = rows.len();
         let (frames, dim) = (rows[0].frames, rows[0].dim);
         let context = prompt.len();
+        let stops = |id: u32| self.template.stops.contains(&id);
+        // Past the reference, rows are checked for words it lacks only when the clean decode
+        // stopped there, not when it ran out of tokens or a loop was cut off.
+        let stopped = reference.last().is_some_and(|id| stops(*id));
+        let reference = &reference[..reference.len() - usize::from(stopped)];
         let reference = &reference[..reference.len().min(max_new)];
         let length = reference.len();
         let total = context + length + LOCAL_TOKENS + 1;
@@ -338,7 +345,6 @@ impl QwenAsr {
             total,
             context - 1,
         )?;
-        let stops = |id: u32| self.template.stops.contains(&id);
         // The noisy rows keep the reference's `language X<asr_text>` header, if it has one; any
         // other text before the marker is transcript, as `transcript` keeps it.
         let header = reference
@@ -360,7 +366,7 @@ impl QwenAsr {
             if i < header {
                 false
             } else if i == length {
-                !stops(pick)
+                stopped && !stops(pick)
             } else {
                 pick != reference[i]
             }
@@ -644,7 +650,7 @@ impl QwenAsr {
             for part in indices.chunks(rows_per_call) {
                 let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
                 let generated = match reference {
-                    Some(ids) if !ids.is_empty() => {
+                    Some(ids) if ids.iter().any(|id| !self.template.stops.contains(id)) => {
                         self.generate_noisy(&prompt, &rows, ids, max_new)?
                     }
                     _ => self.generate(&prompt, &rows, max_new)?,

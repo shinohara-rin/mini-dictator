@@ -76,8 +76,8 @@ pub struct TimedToken {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Hypothesis {
     pub tokens: Vec<TimedToken>,
-    /// The ids the decoder generated, for a backend that can score this hypothesis again. Empty
-    /// when the backend doesn't keep them.
+    /// The ids the decoder generated, with the stop it ended on if it stopped, for a backend that
+    /// can score this hypothesis again. Empty when the backend doesn't keep them.
     pub ids: Vec<u32>,
 }
 
