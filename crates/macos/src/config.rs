@@ -105,22 +105,22 @@ pub fn config_path() -> PathBuf {
 
 /// Where a write to `path` should land: a symlinked config, such as one kept in a dotfiles
 /// repository, is replaced at its target, even when that target does not exist yet.
-fn link_target(path: &Path) -> PathBuf {
+fn link_target(path: &Path) -> Result<PathBuf, String> {
     if let Ok(path) = std::fs::canonicalize(path) {
-        return path;
+        return Ok(path);
     }
     let mut path = path.to_path_buf();
     // A bound on the hops, in case the links form a loop.
     for _ in 0..32 {
         let Ok(target) = std::fs::read_link(&path) else {
-            break;
+            return Ok(path);
         };
         path = match path.parent() {
             Some(parent) => parent.join(target),
             None => target,
         };
     }
-    path
+    Err(format!("{}: too many symbolic links", path.display()))
 }
 
 /// Writes the config file, readable by the user only since it can hold an API key. The text goes
@@ -130,7 +130,7 @@ fn write(text: &str) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
 
     std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
-    let path = link_target(&config_path());
+    let path = link_target(&config_path())?;
     let temporary = path.with_extension("toml.tmp");
     let written = (|| {
         // A leftover temporary could be open elsewhere with looser permissions, so start fresh:
@@ -251,7 +251,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
         let link = dir.join("config.toml");
         std::os::unix::fs::symlink("dotfiles/dictator.toml", &link).unwrap();
-        assert_eq!(link_target(&link), dir.join("dotfiles/dictator.toml"));
+        assert_eq!(link_target(&link), Ok(dir.join("dotfiles/dictator.toml")));
+        // A loop is refused rather than overwritten.
+        let looped = dir.join("loop.toml");
+        std::os::unix::fs::symlink("loop.toml", &looped).unwrap();
+        assert!(link_target(&looped).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
