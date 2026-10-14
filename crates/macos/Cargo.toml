@@ -26,4 +26,5 @@ objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFArray", "CFDictionary", "CFNumber", "CFCGTypes", "CFMachPort", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventTypes", "CGRemoteOperation", "CGEventSource"] }
 objc2-application-services = { version = "0.3", features = ["HIServices", "AXUIElement", "AXError", "AXValue", "libc"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat"] }
 libc = "0.2"
