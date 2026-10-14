@@ -12,6 +12,8 @@ pub struct SearchConfig {
     pub blank_penalty: f32,
     /// Log-score bonus per hotword token.
     pub hotword_boost: f32,
+    /// Language for models that take one, such as `en` or `ja-JP`. `None` lets the model detect it.
+    pub language: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -20,6 +22,7 @@ impl Default for SearchConfig {
             beam: 4,
             blank_penalty: 0.0,
             hotword_boost: 1.5,
+            language: None,
         }
     }
 }

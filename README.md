@@ -3,7 +3,8 @@
 A minimal AI dictation app: a tray icon, a hotkey, and your words in the focused app.
 
 The core does VAD gating, speech recognition biased toward the terms on your screen (Qwen3-ASR 0.6B
-by default, about 30 languages; sherpa-onnx transducers also work), uncertainty estimation by Monte
+by default, about 30 languages; NVIDIA's Nemotron ASR Streaming encodes while you speak, so text
+comes back sooner; sherpa-onnx transducers also work), uncertainty estimation by Monte
 Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](docs/architecture.md).
 
 ## Status
@@ -47,6 +48,12 @@ cargo run --release -p mini-dictator-cli -- \
 
 The `--model` directory decides the backend. With a transducer such as
 `sherpa-onnx-zipformer-en-2023-06-26`, `--beam` and `--boost` tune the hotword search.
+
+For streaming, fetch `MODEL=sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11` and
+add `--live`: it plays the file into the pipeline in real time, as the app does, and prints how long
+the text took after the audio ended (`--debug` adds each step). `--language ja` (or `en`, `de-DE`,
+...) fixes the language instead of detecting it. In the app, point `model_dir` at that directory and
+set `language` in `config.toml`.
 
 Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run
 the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at

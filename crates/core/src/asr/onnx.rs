@@ -103,6 +103,11 @@ pub struct OnnxTransducer {
 
 impl OnnxTransducer {
     pub fn load(files: &TransducerFiles, threads: usize) -> Result<(Self, SymbolTable)> {
+        Self::with_encoder(load_session(&files.encoder, threads)?, files)
+    }
+
+    /// Loads the decoder and joiner next to an encoder session that is already loaded.
+    pub fn with_encoder(encoder: Session, files: &TransducerFiles) -> Result<(Self, SymbolTable)> {
         let decoder = load_session(&files.decoder, 1)?;
         let metadata = decoder.metadata().map_err(model_error)?;
         let read = |key: &str| -> Result<usize> {
@@ -115,7 +120,7 @@ impl OnnxTransducer {
         drop(metadata);
         let symbols = SymbolTable::load(&files.tokens)?;
         let model = Self {
-            encoder: Mutex::new(load_session(&files.encoder, threads)?),
+            encoder: Mutex::new(encoder),
             decoder: Mutex::new(decoder),
             joiner: Mutex::new(load_session(&files.joiner, 1)?),
             context_size,

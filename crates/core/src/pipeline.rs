@@ -4,14 +4,19 @@
 //! sends microphone blocks on the channel and drops the sender when the user releases the hotkey
 //! (or presses it again). The context snapshot is taken first, before any speech is decoded, so a
 //! slow accessibility read delays nothing: audio waits in the channel.
+//!
+//! With a streaming recognizer ([`Asr::stream`]) the encoder reads the audio as it arrives, and a
+//! segment waits only until the encoder has passed its end. Otherwise each segment is encoded once
+//! the voice activity detector closes it.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::asr::{Asr, Bias, Hypothesis};
+use crate::asr::{Asr, Bias, EncoderOutput, EncoderStream, Hypothesis};
 use crate::audio::{AudioChunk, Resampler, SAMPLE_RATE};
 use crate::context::{rank_terms, ContextProvider, ScreenContext};
 use crate::rewrite::{user_prompt, RewriteRequest, Rewriter};
@@ -107,6 +112,7 @@ pub struct Transcript {
 /// Time spent on each step of [`Engine::transcribe`].
 #[derive(Debug, Clone, Default)]
 pub struct Timings {
+    /// Zero when a streaming encoder had encoded the segment while it was spoken.
     pub encode: Duration,
     pub decode: Duration,
     /// The noisy decodes of the uncertainty check.
@@ -154,15 +160,20 @@ impl Engine {
         }
     }
 
-    /// Decodes one segment, with the uncertainty check when `check` is true.
+    /// Decodes one segment, with the uncertainty check when `check` is true. `encoded` is the
+    /// segment's encoder output when a stream has computed it already.
     pub fn transcribe(
         &self,
         segment: &SpeechSegment,
+        encoded: Option<EncoderOutput>,
         session: &SessionContext,
         check: bool,
     ) -> Result<Transcript> {
         let started = Instant::now();
-        let encoder = self.asr.encode(&segment.samples)?;
+        let encoder = match encoded {
+            Some(encoder) => encoder,
+            None => self.asr.encode(&segment.samples)?,
+        };
         let encoded = started.elapsed();
         let reference = self.asr.decode_one(&encoder, &session.bias)?;
         let decoded = started.elapsed();
@@ -217,24 +228,27 @@ impl Engine {
         }
     }
 
-    /// Decodes, rewrites, and inserts one segment. `lag_seconds` is how long ago its audio ended.
-    /// Returns the inserted text, if any.
+    /// Decodes, rewrites, and inserts one segment. `encoded` is its encoder output from a stream,
+    /// if any, and `lag_seconds` is how long ago its audio ended. Returns the inserted text, if any.
     pub fn process(
         &self,
         segment: &SpeechSegment,
+        encoded: Option<EncoderOutput>,
         lag_seconds: f32,
         session: &mut SessionContext,
         sink: &mut dyn TextSink,
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<String>> {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
-        let transcript = self.transcribe(segment, session, behind_seconds.is_none())?;
+        let streamed = encoded.is_some();
+        let transcript = self.transcribe(segment, encoded, session, behind_seconds.is_none())?;
         let plain = transcript.reference.text();
         if self.debug() {
             events(Event::Debug(describe_transcript(
                 segment,
                 lag_seconds,
                 behind_seconds.is_some(),
+                streamed,
                 &transcript,
             )));
         }
@@ -339,6 +353,7 @@ fn describe_transcript(
     segment: &SpeechSegment,
     lag_seconds: f32,
     behind: bool,
+    streamed: bool,
     transcript: &Transcript,
 ) -> String {
     let Timings {
@@ -352,7 +367,11 @@ fn describe_transcript(
         segment.start_sample as f32 / SAMPLE_RATE as f32,
         segment.duration_seconds(),
         if segment.truncated { " (truncated)" } else { "" },
-        ms(*encode),
+        if streamed {
+            "streamed".to_owned()
+        } else {
+            ms(*encode)
+        },
         ms(*decode),
         transcript.reference.text(),
     );
@@ -389,6 +408,56 @@ fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF)
 }
 
+/// Runs `step` on the stream. A failed stream is dropped with a warning, and the segments it has
+/// not covered are encoded on their own.
+fn feed(
+    stream: &mut Option<Box<dyn EncoderStream + '_>>,
+    step: impl FnOnce(&mut dyn EncoderStream) -> Result<()>,
+    events: &mut dyn FnMut(Event),
+) {
+    if let Some(s) = stream.as_deref_mut() {
+        if let Err(error) = step(s) {
+            events(Event::Warning(format!(
+                "streaming encoder stopped: {error}"
+            )));
+            *stream = None;
+        }
+    }
+}
+
+/// Processes the waiting segments in order, as far as the stream has encoded them. Without a
+/// stream, every segment goes at once.
+fn drain(
+    engine: &Engine,
+    stream: &mut Option<Box<dyn EncoderStream + '_>>,
+    waiting: &mut VecDeque<SpeechSegment>,
+    clock: (u64, Instant),
+    session: &mut SessionContext,
+    sink: &mut dyn TextSink,
+    events: &mut dyn FnMut(Event),
+) -> Result<()> {
+    while let Some(segment) = waiting.front() {
+        let end = segment.start_sample + segment.samples.len() as u64;
+        let encoded = match stream.as_deref_mut() {
+            Some(s) => match s.take(segment.start_sample, end) {
+                Some(frames) => Some(frames),
+                None => break,
+            },
+            None => None,
+        };
+        let segment = waiting.pop_front().expect("front exists");
+        engine.process(
+            &segment,
+            encoded,
+            lag(&segment, clock),
+            session,
+            sink,
+            events,
+        )?;
+    }
+    Ok(())
+}
+
 /// Runs one dictation until `audio` closes. Returns all inserted text.
 pub fn run_dictation<V: VoiceActivityDetector>(
     engine: &Engine,
@@ -405,17 +474,36 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     let mut resampler = Resampler::default();
     // Samples heard so far, and when the last of them was recorded.
     let mut clock = (0, Instant::now());
+    let mut stream = engine.asr.stream();
+    // Segments that wait for the stream to encode their end.
+    let mut waiting = VecDeque::new();
 
     for chunk in audio {
         let samples = chunk.to_model_input(&mut resampler);
         clock = (clock.0 + samples.len() as u64, chunk.captured);
-        for segment in segmenter.push(&samples) {
-            engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
-        }
+        feed(&mut stream, |s| s.accept(&samples), events);
+        waiting.extend(segmenter.push(&samples));
+        drain(
+            engine,
+            &mut stream,
+            &mut waiting,
+            clock,
+            &mut session,
+            sink,
+            events,
+        )?;
     }
-    if let Some(segment) = segmenter.finish() {
-        engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
-    }
+    waiting.extend(segmenter.finish());
+    feed(&mut stream, |s| s.finish(), events);
+    drain(
+        engine,
+        &mut stream,
+        &mut waiting,
+        clock,
+        &mut session,
+        sink,
+        events,
+    )?;
     events(Event::Finished);
     Ok(session.inserted)
 }
@@ -565,6 +653,104 @@ mod tests {
         )));
     }
 
+    /// Wraps a recognizer with a stream that encodes a segment only once it has heard `lag`
+    /// more samples, and records each segment it hands out.
+    struct Streaming {
+        inner: Box<dyn Asr>,
+        lag: u64,
+        /// `(start, end, samples heard)` of each segment taken.
+        taken: Arc<std::sync::Mutex<Vec<(u64, u64, u64)>>>,
+    }
+
+    struct LaggingStream<'a> {
+        asr: &'a Streaming,
+        samples: Vec<f32>,
+        finished: bool,
+    }
+
+    impl EncoderStream for LaggingStream<'_> {
+        fn accept(&mut self, samples: &[f32]) -> Result<()> {
+            self.samples.extend_from_slice(samples);
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            self.finished = true;
+            Ok(())
+        }
+        fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput> {
+            let heard = self.samples.len() as u64;
+            if !self.finished && heard < end + self.asr.lag {
+                return None;
+            }
+            self.asr.taken.lock().unwrap().push((start, end, heard));
+            self.asr
+                .inner
+                .encode(&self.samples[start as usize..end as usize])
+                .ok()
+        }
+    }
+
+    impl Asr for Streaming {
+        fn bias(&self, phrases: &[String]) -> Bias {
+            self.inner.bias(phrases)
+        }
+        fn encode(&self, _: &[f32]) -> Result<EncoderOutput> {
+            panic!("a streaming recognizer encodes through its stream")
+        }
+        fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>> {
+            self.inner.decode(encoders, bias)
+        }
+        fn frame_seconds(&self) -> f32 {
+            self.inner.frame_seconds()
+        }
+        fn stream(&self) -> Option<Box<dyn EncoderStream + '_>> {
+            Some(Box::new(LaggingStream {
+                asr: self,
+                samples: Vec::new(),
+                finished: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_streaming_recognizer_decodes_each_segment_once_its_frames_are_ready() {
+        let Engine {
+            asr,
+            context,
+            rewriter,
+            config,
+        } = engine();
+        let lag = 16_000;
+        let taken = Arc::default();
+        let engine = Engine {
+            asr: Box::new(Streaming {
+                inner: asr,
+                lag,
+                taken: Arc::clone(&taken),
+            }),
+            context,
+            rewriter,
+            config,
+        };
+        let mut sink = Collect(Vec::new());
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now()),
+            &mut sink,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(sink.0, vec!["HELLO", " HELLO"]);
+        let taken = taken.lock().unwrap();
+        assert_eq!(taken.len(), 2, "{taken:?}");
+        // The first segment waited for the stream; the second ended too close to the end of the
+        // audio, so it came out when the stream finished.
+        assert!(taken[0].2 >= taken[0].1 + lag, "{taken:?}");
+        assert!(taken[1].2 < taken[1].1 + lag, "{taken:?}");
+        assert!(taken[0].1 <= taken[1].0, "{taken:?}");
+    }
+
     #[test]
     fn debug_events_show_the_context_the_decodes_and_the_rewrite() {
         let engine = engine();
@@ -633,13 +819,13 @@ mod tests {
             truncated: false,
         };
         assert!(!engine
-            .transcribe(&segment, &session, true)
+            .transcribe(&segment, None, &session, true)
             .unwrap()
             .uncertainty
             .samples
             .is_empty());
         assert!(engine
-            .transcribe(&segment, &session, false)
+            .transcribe(&segment, None, &session, false)
             .unwrap()
             .uncertainty
             .samples
@@ -650,6 +836,7 @@ mod tests {
             engine
                 .process(
                     &segment,
+                    None,
                     lag,
                     &mut session,
                     &mut Collect(Vec::new()),

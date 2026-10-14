@@ -59,7 +59,10 @@ fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switc
     let recognizer = asr::load(
         &Config::resolve(&config.model_dir),
         performance_cores(),
-        SearchConfig::default(),
+        SearchConfig {
+            language: Some(config.language.clone()).filter(|l| !l.is_empty()),
+            ..SearchConfig::default()
+        },
     )
     .map_err(|e| e.to_string())?;
     let mut monte_carlo = recognizer.monte_carlo();
