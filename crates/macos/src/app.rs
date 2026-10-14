@@ -490,7 +490,8 @@ fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc
                 .is_some_and(|(seen, read)| *seen == window && read.elapsed() < MEMORY_REREAD);
             if !fresh {
                 terms = match engine.context.snapshot() {
-                    Ok(screen) => rank_terms(&screen, engine.config.max_hotwords),
+                    // Every term; the memory applies its own cap.
+                    Ok(screen) => rank_terms(&screen, usize::MAX),
                     Err(_) => Vec::new(),
                 };
                 last = Some((window, Instant::now()));
