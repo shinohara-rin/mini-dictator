@@ -81,7 +81,12 @@ impl Joiner {
                 // can tell.
                 false
             } else {
-                pause < config.sentence_pause_seconds
+                // A question or exclamation already ended its sentence.
+                let ended = typed
+                    .trim_end()
+                    .trim_end_matches(is_closing_punctuation)
+                    .ends_with(['?', '!', '？', '！']);
+                !ended && pause < config.sentence_pause_seconds
             }
         });
         let mut text = if continues {
@@ -193,8 +198,7 @@ fn keeps_capital(word: &str, names: &[String]) -> bool {
         || word.chars().skip(1).any(char::is_uppercase)
         || names.iter().any(|name| {
             name.split_whitespace()
-                .next()
-                .is_some_and(|n| n.eq_ignore_ascii_case(word))
+                .any(|n| n.eq_ignore_ascii_case(word))
         })
 }
 
@@ -241,7 +245,7 @@ mod tests {
     fn dictate(pieces: &[(f32, &str)], rewritten: bool) -> String {
         let mut joiner = Joiner::default();
         let mut typed = String::new();
-        let names = ["Rin".to_owned()];
+        let names = ["Rin".to_owned(), "Sulfur Cube".to_owned()];
         for (i, (pause, text)) in pieces.iter().enumerate() {
             let piece = Piece {
                 text,
@@ -293,6 +297,11 @@ mod tests {
             dictate(&[(0.0, "That works."), (2.0, "Next, the icon.")], false),
             "That works. Next, the icon."
         );
+        // So does a question mark, however short the pause.
+        assert_eq!(
+            dictate(&[(0.0, "Are you ready?"), (0.7, "Yes.")], false),
+            "Are you ready? Yes."
+        );
     }
 
     #[test]
@@ -340,6 +349,10 @@ mod tests {
                 true
             ),
             "I think Rin can help. ONNX works."
+        );
+        assert_eq!(
+            dictate(&[(0.0, "Ask."), (0.7, "Cube can help.")], true),
+            "Ask Cube can help."
         );
         // An opening quote does not hide the capital after it.
         assert_eq!(
