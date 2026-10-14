@@ -146,14 +146,15 @@ fn is_rare(word: &str) -> bool {
 }
 
 /// Rare lowercase words of a short element, such as a repository name in a breadcrumb.
-/// Capitalized ones are already names.
+/// Capitalized ones are already names, and mixed-case ones identifiers.
 fn rare_lowercase_labels(text: &str) -> Vec<(String, TermForm)> {
     if text.split_whitespace().count() > PHRASE_WORDS {
         return Vec::new();
     }
     latin_words(text)
         .into_iter()
-        .filter(|(_, _, word)| word.starts_with(|c: char| c.is_ascii_lowercase()) && is_rare(word))
+        // All lowercase: a lower-camel word such as `myWidget` is already an identifier.
+        .filter(|(_, _, word)| word.bytes().all(|b| b.is_ascii_lowercase()) && is_rare(word))
         .map(|(_, _, word)| (word.to_owned(), TermForm::Label))
         .collect()
 }
@@ -366,6 +367,16 @@ mod tests {
         assert_eq!(
             phrases(&context),
             vec!["Airicraft", "Google Chrome", "Minecraft"]
+        );
+    }
+
+    #[test]
+    fn a_rare_lower_camel_identifier_counts_once() {
+        let found = rank_terms(&screen(&[(Region::Window, "open myUniqueWidget")]), 10);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].phrase.as_str(), found[0].score),
+            ("myUniqueWidget", 1.0)
         );
     }
 

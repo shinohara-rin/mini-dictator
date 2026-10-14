@@ -106,10 +106,16 @@ impl TermMemory {
         let current = |e: &Entry| self.decay(e.weight, now.saturating_duration_since(e.updated));
         state.entries.retain(|_, e| current(e) >= FORGET_WEIGHT);
         if state.entries.len() > self.config.max_terms {
-            let mut weights: Vec<f32> = state.entries.values().map(current).collect();
-            weights.sort_by(|a, b| b.total_cmp(a));
-            let floor = weights[self.config.max_terms - 1];
-            state.entries.retain(|_, e| current(e) >= floor);
+            // Exactly the heaviest `max_terms`, even when weights tie at the cut.
+            let mut ranked: Vec<(String, f32)> = state
+                .entries
+                .iter()
+                .map(|(key, e)| (key.clone(), current(e)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (key, _) in &ranked[self.config.max_terms..] {
+                state.entries.remove(key);
+            }
         }
     }
 
@@ -228,6 +234,12 @@ mod tests {
         );
         let recalled = memory.recall(start + Duration::from_secs(5));
         assert_eq!(phrases(&recalled), vec!["B2", "C3"]);
+        // Ties at the cut still leave exactly `max_terms`.
+        memory.observe(
+            &[term("D4", 9.0), term("E5", 9.0), term("F6", 9.0)],
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(memory.recall(start + Duration::from_secs(10)).len(), 2);
         memory.clear();
         assert!(memory.recall(start + Duration::from_secs(5)).is_empty());
     }
