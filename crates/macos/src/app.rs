@@ -26,7 +26,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::{config_path, debug_log_path, support_dir, Config, APP_NAME};
-use crate::context::{focused_window, is_trusted, AccessibilityReader};
+use crate::context::{focused_window, is_trusted, AccessibilityReader, FocusedWindow};
 use crate::debug_log;
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
@@ -470,7 +470,7 @@ pub fn run() {
 /// An unchanged window counts its last terms again without a read.
 fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let mut last: Option<((String, String), Instant)> = None;
+        let mut last: Option<(FocusedWindow, Instant)> = None;
         let mut terms = Vec::new();
         loop {
             std::thread::sleep(MEMORY_SAMPLE);
@@ -492,12 +492,14 @@ fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc
                 .as_ref()
                 .is_some_and(|(seen, read)| *seen == window && read.elapsed() < MEMORY_REREAD);
             if !fresh {
-                terms = match engine.context.snapshot() {
-                    // Every term; the memory applies its own cap.
-                    Ok(screen) => rank_terms(&screen, usize::MAX),
-                    Err(_) => Vec::new(),
+                // Every term; the memory applies its own cap. A failed read is retried next time.
+                (terms, last) = match engine.context.snapshot() {
+                    Ok(screen) => (
+                        rank_terms(&screen, usize::MAX),
+                        Some((window, Instant::now())),
+                    ),
+                    Err(_) => (Vec::new(), None),
                 };
-                last = Some((window, Instant::now()));
             }
             // Ignored if the switch went off during the read.
             engine.memory.observe(&terms, Instant::now());
