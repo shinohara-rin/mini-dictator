@@ -67,7 +67,9 @@ impl Tap {
         // until `Tap` drops, which removes the tap first.
         let port = unsafe {
             CGEvent::tap_create(
-                CGEventTapLocation::SessionEventTap,
+                // Where keys enter the window server, ahead of system shortcuts such as the
+                // dictation key's.
+                CGEventTapLocation::HIDEventTap,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
                 mask,

@@ -209,8 +209,10 @@ impl FromStr for Hotkey {
         if hotkey.modifiers == [None; 4] {
             match hotkey.key {
                 None => return Err("an empty hotkey".into()),
-                Some(code) if !is_function_key(code) => {
-                    return Err(format!("{text}: only F1 to F20 work without a modifier"))
+                Some(code) if !stands_alone(code) => {
+                    return Err(format!(
+                        "{text}: only F1 to F20 and Dictation work without a modifier"
+                    ))
                 }
                 Some(_) => {}
             }
@@ -375,7 +377,7 @@ impl Recorder {
         key_name(code)?;
         self.last_key = Some(code);
         self.key_held = self.held;
-        if self.held.is_empty() && !is_function_key(code) {
+        if self.held.is_empty() && !stands_alone(code) {
             self.combination = None;
             return Some(Outcome::NeedsModifier);
         }
@@ -422,9 +424,11 @@ impl Recorder {
     }
 }
 
-/// F1 to F20 work as a hotkey alone; any other key needs a modifier, or it could not be typed.
-fn is_function_key(code: u16) -> bool {
-    key_name(code).is_some_and(|name| name.len() > 1 && name.starts_with('F'))
+/// F1 to F20 and the dictation key work as a hotkey alone; any other key needs a modifier, or it
+/// could not be typed.
+fn stands_alone(code: u16) -> bool {
+    code == KEY_DICTATION
+        || key_name(code).is_some_and(|name| name.len() > 1 && name.starts_with('F'))
 }
 
 /// The key code for a name, ignoring case.
@@ -553,7 +557,12 @@ const KEYS: &[(u16, &str)] = &[
     (0x7c, "Right"),
     (0x7d, "Down"),
     (0x7e, "Up"),
+    (KEY_DICTATION, "Dictation"),
 ];
+
+/// The microphone key on F5 of recent Mac keyboards, when F keys are not set to act as standard
+/// function keys.
+const KEY_DICTATION: u16 = 0xb0;
 
 #[cfg(test)]
 mod tests {
@@ -758,6 +767,11 @@ mod tests {
         assert_eq!(
             recorder.key_up(KEY_F5),
             Some(Outcome::Recorded(hotkey("F5")))
+        );
+        recorder.key_down(KEY_DICTATION, false);
+        assert_eq!(
+            recorder.key_up(KEY_DICTATION),
+            Some(Outcome::Recorded(hotkey("Dictation")))
         );
     }
 

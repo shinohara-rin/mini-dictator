@@ -24,8 +24,9 @@ Press ⌥Space to start and again to stop, or hold it while you speak. A soft ti
 microphone opens and a pop when it closes. The first run asks for microphone and accessibility
 permission; accessibility is needed to see the hotkey, to read names from the focused window, and
 to paste. To pick another hotkey, choose Change Hotkey in the menu, press the new combination, and
-let go; Esc cancels. A hotkey can be a key with modifiers (`Ctrl+Shift+D`), a function key alone
-(`F13`), or modifiers alone (`RightCmd`), and Option and Command can name a side (`RightAlt`).
+let go; Esc cancels. A hotkey can be a key with modifiers (`Ctrl+Shift+D`), a function key or the
+microphone key alone (`F13`, `Dictation`), or modifiers alone (`RightCmd`), and Option and Command
+can name a side (`RightAlt`).
 Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens its
 folder): the model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite
 endpoint. Edits to the file apply on the next launch. Names seen on screen in the last few minutes
