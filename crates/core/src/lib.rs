@@ -9,6 +9,7 @@
 //! 4. [`uncertainty`] decodes the same encoder output again with Gaussian noise and marks the spans
 //!    where the decodes disagree.
 //! 5. [`rewrite`] asks an LLM for the final text, with the marked transcript and the screen context.
+//! 6. [`join`] continues a sentence that a pause split into segments, or ends it.
 //!
 //! [`pipeline`] runs these steps. Everything that touches the operating system (audio capture,
 //! accessibility, OCR, text insertion, the tray) is a trait here and lives in a platform shell.
@@ -18,6 +19,7 @@ pub mod audio;
 pub mod context;
 pub mod error;
 pub mod features;
+pub mod join;
 pub mod pipeline;
 pub mod rewrite;
 pub mod rng;

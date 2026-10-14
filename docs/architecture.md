@@ -22,10 +22,12 @@ hotkey down
   ├─ uncertainty  EncoderOutput + N(0, σ·std_d) × K ─► batched decode ─► K Hypotheses
   │               analyze() ─► unstable / dropped spans ─► format_for_llm()
   │                                            │  `the [unclear: "B", also heard "D"] ...`
-  ├─ rewrite ── Rewriter::rewrite(marked transcript, screen terms, text before cursor)
+  ├─ rewrite ── Rewriter::rewrite(marked transcript, screen terms, text before cursor, pause)
+  │                                            │
+  ├─ join ───── Joiner::join()   holds the final period until the next segment
   │                                            │
   └─ sink ───── TextSink::insert(text)         ▼
-hotkey up ─► Segmenter::finish() flushes the last utterance
+hotkey up ─► Segmenter::finish() flushes the last utterance, Joiner::finish() its period
 ```
 
 `pipeline::run_dictation` runs this on a worker thread. The shell sends microphone blocks on a
@@ -39,6 +41,14 @@ catching up. A segment that keeps up arrives about half a second after its audio
 comes back as soon as the backlog is gone. The clean decode always runs. Each block carries the time
 it was recorded, so the lag also counts audio that waited while the worker loaded the VAD.
 
+The recognizer hears each segment alone and writes it as a full sentence, so a sentence split by a
+pause would come out as "If we can. Use speculative decoding." The joiner types each segment without
+its final period and decides at the next one: the rewrite model, told the text so far and the pause,
+starts its reply lowercase to continue the sentence or with a capital to start one. Without a
+rewrite, a pause shorter than `sentence_pause_seconds` (1.5 s) continues the sentence and lowercases
+the next word unless it is "I", an acronym, or a screen term. The held period is typed when a new
+sentence starts or the hotkey is released.
+
 ## Modules
 
 | Module | Role | Main types |
@@ -50,6 +60,7 @@ it was recorded, so the lag also counts audio that waited while the worker loade
 | `uncertainty` | Monte Carlo over encoder output, span analysis | `MonteCarloConfig`, `estimate`, `analyze`, `format_for_llm` |
 | `context` | Screen text model and hotword ranking | `ContextProvider`, `ScreenContext`, `TextBlock`, `Region`, `FallbackProvider`, `rank_terms` |
 | `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `PassThrough` |
+| `join` | Continues or ends a sentence split by a pause | `Joiner`, `JoinConfig`, `Piece` |
 | `pipeline` | One dictation, end to end | `Engine`, `run_dictation`, `TextSink`, `Event` |
 
 Default features need no native code, so `cargo test` runs anywhere. `onnx` adds ONNX Runtime

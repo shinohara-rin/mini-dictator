@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mini_dictator_core::join::JoinConfig;
 use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "Mini Dictator";
@@ -31,6 +32,9 @@ pub struct Config {
     /// uncertainty check, the rewrite prompt and reply, and timings. The menu turns it on and off
     /// until the app quits.
     pub debug: bool,
+    /// Without a rewrite, a pause this long ends a sentence, and after a shorter one the next
+    /// words continue it. With a rewrite, the model decides and is told the pause.
+    pub sentence_pause_seconds: f32,
     pub uncertainty: Uncertainty,
     pub rewrite: Rewrite,
 }
@@ -72,6 +76,7 @@ impl Default for Config {
             share_screen_text: true,
             beep: true,
             debug: false,
+            sentence_pause_seconds: JoinConfig::default().sentence_pause_seconds,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
         }

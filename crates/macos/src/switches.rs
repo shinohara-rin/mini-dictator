@@ -37,10 +37,10 @@ impl<T: ContextProvider> ContextProvider for Switchable<T> {
 }
 
 impl Rewriter for Switchable<Option<Box<dyn Rewriter>>> {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String> {
+    fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>> {
         match (&self.inner, self.on()) {
             (Some(rewriter), true) => rewriter.rewrite(request),
-            _ => Ok(request.plain_transcript.clone()),
+            _ => Ok(None),
         }
     }
 }
