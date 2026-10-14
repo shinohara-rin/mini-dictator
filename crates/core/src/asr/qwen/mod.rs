@@ -99,6 +99,8 @@ impl Default for QwenConfig {
 struct Template {
     im_start: u32,
     im_end: u32,
+    /// Tokens that end the answer: the end of the turn or of the text.
+    stops: [u32; 2],
     audio_start: u32,
     audio_end: u32,
     audio_pad: u32,
@@ -115,9 +117,11 @@ impl Template {
                 .added(name)
                 .ok_or_else(|| Error::Model(format!("tokenizer has no {name}")))
         };
+        let im_end = added("<|im_end|>")?;
         Ok(Self {
             im_start: added("<|im_start|>")?,
-            im_end: added("<|im_end|>")?,
+            im_end,
+            stops: [im_end, added("<|endoftext|>")?],
             audio_start: added("<|audio_start|>")?,
             audio_end: added("<|audio_end|>")?,
             audio_pad: added("<|audio_pad|>")?,
@@ -257,7 +261,7 @@ impl QwenAsr {
                 if done[b] {
                     continue;
                 }
-                if id == eos {
+                if self.template.stops.contains(&id) {
                     done[b] = true;
                     continue;
                 }
@@ -373,22 +377,14 @@ impl QwenAsr {
         Ok(picks)
     }
 
-    /// Words of the generated text after its `language X<asr_text>` header. Uncertainty compares
-    /// decodes word by word, because BPE can split one word differently in two decodes.
+    /// Words of the generated text after its `language X<asr_text>` header, without added tokens.
+    /// Uncertainty compares decodes word by word, because BPE can split one word differently in
+    /// two decodes.
     fn to_hypothesis(&self, generated: &[(u32, f32)]) -> Hypothesis {
-        let header = generated
-            .iter()
-            .take(16)
-            .position(|(id, _)| *id == self.template.asr_text)
-            .filter(|end| {
-                let ids: Vec<u32> = generated[..*end].iter().map(|(id, _)| *id).collect();
-                self.tokenizer.decode(&ids).starts_with("language ")
-            })
-            .map_or(0, |end| end + 1);
-        let body = &generated[header..];
+        let body = transcript(&self.tokenizer, self.template.asr_text, generated);
         let mut bytes = Vec::new();
         let mut starts = Vec::with_capacity(body.len());
-        for (id, _) in body {
+        for (id, _) in &body {
             starts.push(bytes.len());
             bytes.extend_from_slice(self.tokenizer.bytes(*id));
         }
@@ -422,6 +418,44 @@ impl QwenAsr {
         (frames as f32 * self.frame_seconds() * self.config.tokens_per_second) as usize
             + self.config.extra_tokens
     }
+}
+
+/// The generated tokens after the `language X<asr_text>` header, without added tokens. Chat and
+/// audio markers are never text, and the model sometimes opens its answer with `<|im_start|>`
+/// before the header.
+fn transcript(
+    tokenizer: &BpeTokenizer,
+    asr_text: u32,
+    generated: &[(u32, f32)],
+) -> Vec<(u32, f32)> {
+    let tokens: Vec<(u32, f32)> = generated
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id == asr_text || !tokenizer.is_added(*id))
+        .collect();
+    let header = tokens
+        .iter()
+        .take(16)
+        .position(|(id, _)| *id == asr_text)
+        .filter(|end| {
+            let ids: Vec<u32> = tokens[..*end].iter().map(|(id, _)| *id).collect();
+            is_language_header(&tokenizer.decode(&ids))
+        })
+        .map_or(0, |end| end + 1);
+    tokens[header..]
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != asr_text)
+        .collect()
+}
+
+/// True for the metadata Qwen3-ASR writes before `<asr_text>`, such as `language English` or
+/// `language None` for audio without speech.
+fn is_language_header(text: &str) -> bool {
+    let text = text.trim_start();
+    text.get(..8)
+        .is_some_and(|word| word.eq_ignore_ascii_case("language"))
+        && text[8..].starts_with(char::is_whitespace)
 }
 
 /// Decodes UTF-8 like [`String::from_utf8_lossy`], with the text offset of every byte offset, so
@@ -652,6 +686,51 @@ mod tests {
         let (id, log_prob) = pick(&[0.0, 2.0f32.ln(), 0.0, f32::NAN]);
         assert_eq!(id, 1);
         assert!((log_prob - 0.5f32.ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_the_transcript_past_chat_tokens() {
+        let tokenizer = tokenizer::tests::tokenizer();
+        let (im_start, asr_text) = (301, 302);
+        let text = |generated: &[u32]| {
+            let generated: Vec<(u32, f32)> = generated.iter().map(|id| (*id, 0.0)).collect();
+            let ids: Vec<u32> = transcript(&tokenizer, asr_text, &generated)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect();
+            tokenizer.decode(&ids)
+        };
+        let encode = |text: &str| tokenizer.encode(text);
+        // One token per byte here, so the header is short enough for the 16-token window.
+        let header = encode("language De");
+        let body = encode("ab ab");
+        let with = |parts: &[&[u32]]| parts.concat();
+
+        assert_eq!(text(&with(&[&header, &[asr_text], &body])), "ab ab");
+        // The model opened with a new turn before the header.
+        assert_eq!(
+            text(&with(&[&[im_start], &header, &[asr_text], &body])),
+            "ab ab"
+        );
+        // A marker inside the text.
+        assert_eq!(
+            text(&with(&[&header, &[asr_text], &body, &[im_start]])),
+            "ab ab"
+        );
+        // No header: everything is text.
+        assert_eq!(text(&body), "ab ab");
+        // Silence.
+        assert_eq!(text(&with(&[&encode("language None"), &[asr_text]])), "");
+    }
+
+    #[test]
+    fn recognizes_the_language_header() {
+        assert!(is_language_header("language English"));
+        assert!(is_language_header("Language None"));
+        assert!(is_language_header("language Chinese\n"));
+        assert!(!is_language_header("languages are fun"));
+        assert!(!is_language_header("lang"));
+        assert!(!is_language_header("言語は日本語"));
     }
 
     #[test]

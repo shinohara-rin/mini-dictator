@@ -20,10 +20,11 @@ scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX
 open "target/release/Mini Dictator.app"
 ```
 
-Press ⌥Space to start and again to stop, or hold it while you speak. The first run asks for
-microphone and accessibility permission; accessibility is needed both to read names from the
-focused window and to paste. Settings live in `~/Library/Application Support/Mini Dictator/config.toml`
-(the menu opens it): the model, the hotkey, the uncertainty samples, and the rewrite endpoint.
+Press ⌥Space to start and again to stop, or hold it while you speak. A soft tick plays when the
+microphone opens and a pop when it closes. The first run asks for microphone and accessibility
+permission; accessibility is needed both to read names from the focused window and to paste.
+Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens it): the
+model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite endpoint.
 
 ## Try the core on a WAV file
 

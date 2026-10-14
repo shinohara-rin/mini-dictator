@@ -28,6 +28,7 @@ use crate::config::{config_path, support_dir, Config, APP_NAME};
 use crate::context::{is_trusted, AccessibilityReader};
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
+use crate::sound::{self, Cue};
 use crate::switches::Switchable;
 
 /// A press longer than this is push-to-talk: releasing the key stops the dictation.
@@ -128,6 +129,7 @@ struct Ui {
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
+    beep: bool,
 }
 
 impl Ui {
@@ -177,12 +179,19 @@ impl Ui {
             open_config,
             open_folder,
             quit,
+            beep: config.beep,
         }
     }
 
     fn show(&self, state: State, status: &str) {
         let _ = self.tray.set_icon_templated(Some(icon(state)));
         self.status.set_text(status);
+    }
+
+    fn cue(&self, cue: Cue) {
+        if self.beep {
+            sound::play(cue);
+        }
     }
 }
 
@@ -356,6 +365,7 @@ pub fn run() {
                 // The dictation failed while the microphone was on: stop recording.
                 if dictation.take().is_some() {
                     ui.toggle.set_text("Start Dictation");
+                    ui.cue(Cue::Stop);
                 }
                 match error {
                     Some(error) => {
@@ -386,6 +396,7 @@ fn start(
     };
     ui.toggle.set_text("Stop Dictation");
     ui.show(State::Listening, "Listening");
+    ui.cue(Cue::Start);
 
     std::thread::spawn(move || {
         let mut sink = PasteSink;
@@ -426,6 +437,7 @@ fn start(
 fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
     if let Some(mut current) = dictation.take() {
         current.stream.take();
+        ui.cue(Cue::Stop);
         ui.toggle.set_text("Start Dictation");
         ui.show(State::Working, "Finishing…");
     }

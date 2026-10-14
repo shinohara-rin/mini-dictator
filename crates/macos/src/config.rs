@@ -22,6 +22,8 @@ pub struct Config {
     pub read_screen: bool,
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
+    /// Play a short sound when the microphone opens and closes.
+    pub beep: bool,
     pub uncertainty: Uncertainty,
     pub rewrite: Rewrite,
 }
@@ -57,6 +59,7 @@ impl Default for Config {
             hotkey: "Alt+Space".into(),
             read_screen: true,
             share_screen_text: true,
+            beep: true,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
         }
