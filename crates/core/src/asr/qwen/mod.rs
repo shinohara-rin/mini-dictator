@@ -339,11 +339,20 @@ impl QwenAsr {
             context - 1,
         )?;
         let stops = |id: u32| self.template.stops.contains(&id);
-        // The noisy rows keep the reference's `language X<asr_text>` header.
+        // The noisy rows keep the reference's `language X<asr_text>` header, if it has one; any
+        // other text before the marker is transcript, as `transcript` keeps it.
         let header = reference
             .iter()
             .take(16)
             .position(|id| *id == self.template.asr_text)
+            .filter(|end| {
+                let ids: Vec<u32> = reference[..*end]
+                    .iter()
+                    .copied()
+                    .filter(|id| !self.tokenizer.is_added(*id))
+                    .collect();
+                is_language_header(&self.tokenizer.decode(&ids))
+            })
             .map_or(0, |end| end + 1);
         let pick_at = |b: usize, i: usize| scored[b][i];
         let differs = |b: usize, i: usize| {
