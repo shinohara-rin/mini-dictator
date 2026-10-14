@@ -12,8 +12,6 @@
 //!
 //! The LLM reads hotwords as text in its system prompt, and it gives no token times.
 
-#[doc(hidden)]
-pub mod lab;
 mod tokenizer;
 
 use std::collections::BTreeMap;
@@ -26,7 +24,9 @@ use ort::value::{Tensor, TensorRef};
 pub use tokenizer::BpeTokenizer;
 
 use super::onnx::load_session;
-use super::{split_words, Asr, Bias, EncoderOutput, Hypothesis, TimedToken};
+use super::{
+    is_cjk, is_punctuation, split_words, Asr, Bias, EncoderOutput, Hypothesis, TimedToken,
+};
 use crate::features::WhisperMel;
 use crate::uncertainty::MonteCarloConfig;
 use crate::{Error, Result};
@@ -248,16 +248,21 @@ impl QwenAsr {
         let mut start = 0;
         let mut length = context;
         loop {
-            let picks = self.step(
-                &input,
-                batch,
-                length,
-                start,
-                &audio,
-                (frames, dim),
-                &mut cache,
-                total,
-            )?;
+            let picks: Vec<(u32, f32)> = self
+                .step(
+                    &input,
+                    batch,
+                    length,
+                    start,
+                    &audio,
+                    (frames, dim),
+                    &mut cache,
+                    total,
+                    length - 1,
+                )?
+                .into_iter()
+                .map(|row| row[0])
+                .collect();
             start += length;
             for (b, (id, log_prob)) in picks.iter().copied().enumerate() {
                 if done[b] {
@@ -287,8 +292,182 @@ impl QwenAsr {
         Ok(generated)
     }
 
+    /// Decodes noisy rows whose clean decode generated `reference`, in far fewer calls than
+    /// [`Self::generate`]. One call reads the prompt and the reference in every row, which gives
+    /// each row's own pick after every reference token. Where a row's pick differs from the
+    /// reference, that row decodes on its own to the end of the word (no call at all when the
+    /// pick is a whole word), and the sample is the reference with that word replaced.
+    ///
+    /// A full greedy decode of the row would also condition everything after a replaced word on
+    /// it, so this is an approximation, but it keeps whole words for the readings the uncertainty
+    /// analysis compares. The int8 decoder quantizes the activations of a whole call together, so picks
+    /// in the scoring call can differ slightly from one-token calls, about as much as other rows
+    /// in a batch change them.
+    fn generate_noisy(
+        &self,
+        prompt: &[i64],
+        rows: &[&EncoderOutput],
+        reference: &[u32],
+        max_new: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
+        let batch = rows.len();
+        let (frames, dim) = (rows[0].frames, rows[0].dim);
+        let context = prompt.len();
+        let reference = &reference[..reference.len().min(max_new)];
+        let length = reference.len();
+        let total = context + length + LOCAL_TOKENS + 1;
+        let width = self.shape.kv_heads * self.shape.head_dim;
+        let mut cache: Vec<Vec<f32>> = (0..2 * self.shape.layers)
+            .map(|_| vec![0.0; batch * total * width])
+            .collect();
+        let audio: Vec<f32> = rows
+            .iter()
+            .flat_map(|row| row.data[..frames * dim].iter().copied())
+            .collect();
+        let mut input: Vec<i64> = prompt.to_vec();
+        input.extend(reference.iter().map(|id| i64::from(*id)));
+        // After the prompt and after each reference token: what each row picks next.
+        let scored = self.step(
+            &input.repeat(batch),
+            batch,
+            input.len(),
+            0,
+            &audio,
+            (frames, dim),
+            &mut cache,
+            total,
+            context - 1,
+        )?;
+        let stops = |id: u32| self.template.stops.contains(&id);
+        // The noisy rows keep the reference's `language X<asr_text>` header.
+        let header = reference
+            .iter()
+            .take(16)
+            .position(|id| *id == self.template.asr_text)
+            .map_or(0, |end| end + 1);
+        let pick_at = |b: usize, i: usize| scored[b][i];
+        let differs = |b: usize, i: usize| {
+            let pick = pick_at(b, i).0;
+            if i < header {
+                false
+            } else if i == length {
+                !stops(pick)
+            } else {
+                pick != reference[i]
+            }
+        };
+
+        let mut stretches: Vec<Vec<Stretch>> = vec![Vec::new(); batch];
+        let mut resume = vec![0usize; batch];
+        let slab = total * width;
+        let row_audio = frames * dim;
+        for i in 0..=length {
+            let group: Vec<usize> = (0..batch)
+                .filter(|b| i >= resume[*b] && differs(*b, i))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let mut finished: Vec<(usize, Stretch)> = Vec::new();
+            let mut open: Vec<(usize, Vec<(u32, f32)>)> = Vec::new();
+            for b in group {
+                let mut row = vec![pick_at(b, i)];
+                match stretch_end(
+                    &self.tokenizer,
+                    &self.template.stops,
+                    &mut row,
+                    reference,
+                    i,
+                ) {
+                    Some(end) => finished.push((
+                        b,
+                        Stretch {
+                            start: i,
+                            tokens: row,
+                            end,
+                        },
+                    )),
+                    None => open.push((b, row)),
+                }
+            }
+            if !open.is_empty() {
+                // The cache of each open row holds the prompt and the reference before `i`.
+                let mut local_cache: Vec<Vec<f32>> = cache
+                    .iter()
+                    .map(|buffer| {
+                        open.iter()
+                            .flat_map(|(b, _)| buffer[b * slab..(b + 1) * slab].iter().copied())
+                            .collect()
+                    })
+                    .collect();
+                let local_audio: Vec<f32> = open
+                    .iter()
+                    .flat_map(|(b, _)| audio[b * row_audio..(b + 1) * row_audio].iter().copied())
+                    .collect();
+                let mut ends: Vec<Option<Option<usize>>> = vec![None; open.len()];
+                let mut position = context + i;
+                while ends.iter().any(Option::is_none) && position + 1 < total {
+                    let input: Vec<i64> = open
+                        .iter()
+                        .zip(&ends)
+                        .map(|((_, row), end)| {
+                            i64::from(match (end, row.last()) {
+                                (None, Some((id, _))) => *id,
+                                _ => self.template.im_end,
+                            })
+                        })
+                        .collect();
+                    let picks = self.step(
+                        &input,
+                        open.len(),
+                        1,
+                        position,
+                        &local_audio,
+                        (frames, dim),
+                        &mut local_cache,
+                        total,
+                        0,
+                    )?;
+                    position += 1;
+                    for (o, (_, row)) in open.iter_mut().enumerate() {
+                        if ends[o].is_none() {
+                            row.push(picks[o][0]);
+                            ends[o] = stretch_end(
+                                &self.tokenizer,
+                                &self.template.stops,
+                                row,
+                                reference,
+                                i,
+                            );
+                        }
+                    }
+                }
+                for ((b, row), end) in open.into_iter().zip(ends) {
+                    let end = end.unwrap_or(Some((i + row.len()).min(length)));
+                    finished.push((
+                        b,
+                        Stretch {
+                            start: i,
+                            tokens: row,
+                            end,
+                        },
+                    ));
+                }
+            }
+            for (b, stretch) in finished {
+                resume[b] = stretch.end.unwrap_or(usize::MAX);
+                stretches[b].push(stretch);
+            }
+        }
+
+        Ok((0..batch)
+            .map(|b| splice(reference, &scored[b], &stretches[b]))
+            .collect())
+    }
+
     /// Runs the decoder on `length` new tokens per row at cache position `start`, stores their
-    /// cache entries, and returns each row's most likely next token with its log probability.
+    /// cache entries, and returns each row's most likely next token with its log probability after
+    /// each new token from `keep_from` on.
     #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
@@ -300,7 +479,8 @@ impl QwenAsr {
         (frames, dim): (usize, usize),
         cache: &mut [Vec<f32>],
         total: usize,
-    ) -> Result<Vec<(u32, f32)>> {
+        keep_from: usize,
+    ) -> Result<Vec<Vec<(u32, f32)>>> {
         let shape = &self.shape;
         let width = shape.kv_heads * shape.head_dim;
         let mut inputs: Vec<(String, SessionInputValue<'_>)> = vec![
@@ -357,8 +537,12 @@ impl QwenAsr {
         let steps = logits_shape[1] as usize;
         let picks = (0..batch)
             .map(|b| {
-                let last = (b * steps + steps - 1) * vocab;
-                pick(&logits[last..last + vocab])
+                (keep_from..steps)
+                    .map(|p| {
+                        let at = (b * steps + p) * vocab;
+                        pick(&logits[at..at + vocab])
+                    })
+                    .collect()
             })
             .collect();
 
@@ -413,7 +597,55 @@ impl QwenAsr {
                 }
             })
             .collect();
-        Hypothesis { tokens }
+        Hypothesis {
+            tokens,
+            ids: generated.iter().map(|(id, _)| *id).collect(),
+        }
+    }
+
+    /// Decodes rows in batches of the same audio length, which share a prompt: greedily, or
+    /// starting from the ids of a reference decode.
+    fn decode_rows(
+        &self,
+        encoders: &[EncoderOutput],
+        bias: &Bias,
+        reference: Option<&[u32]>,
+    ) -> Result<Vec<Hypothesis>> {
+        let mut results = vec![Hypothesis::default(); encoders.len()];
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (index, encoder) in encoders.iter().enumerate() {
+            if encoder.frames > 0 {
+                groups.entry(encoder.frames).or_default().push(index);
+            }
+        }
+        let vocab = self.tokenizer.vocab_size();
+        for (frames, indices) in groups {
+            let prompt = self.prompt(frames, &bias.phrases);
+            let max_new = self.max_new_tokens(frames);
+            let cache_bytes = 2
+                * self.shape.layers
+                * (prompt.len() + max_new)
+                * self.shape.kv_heads
+                * self.shape.head_dim
+                * 4;
+            // The first call returns logits for every position it reads.
+            let first_call = prompt.len() + reference.map_or(0, <[u32]>::len);
+            let row_bytes = cache_bytes + first_call * vocab * 4;
+            let rows_per_call = (self.config.batch_bytes / row_bytes).max(1);
+            for part in indices.chunks(rows_per_call) {
+                let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
+                let generated = match reference {
+                    Some(ids) if !ids.is_empty() => {
+                        self.generate_noisy(&prompt, &rows, ids, max_new)?
+                    }
+                    _ => self.generate(&prompt, &rows, max_new)?,
+                };
+                for (index, generated) in part.iter().zip(generated) {
+                    results[*index] = self.to_hypothesis(&generated);
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn max_new_tokens(&self, frames: usize) -> usize {
@@ -505,6 +737,134 @@ fn pick(logits: &[f32]) -> (u32, f32) {
         .sum();
     (best as u32, -sum.ln())
 }
+
+/// Where a stretch a noisy row decodes on its own, from reference token `start`, takes the
+/// reference back: `Some(Some(j))` to go on from reference token `j` (`start` itself when the
+/// stretch only adds punctuation), `Some(None)` once the row stopped, or `None` while the
+/// stretch goes on. It ends at the end of its first word,
+/// whose next token it drops, or earlier where it meets the reference again: two tokens that
+/// match in a row, or one matching token that starts a word, as when the row skips a comma.
+fn stretch_end(
+    tokenizer: &BpeTokenizer,
+    stops: &[u32],
+    row: &mut Vec<(u32, f32)>,
+    reference: &[u32],
+    start: usize,
+) -> Option<Option<usize>> {
+    let (last, _) = *row.last()?;
+    if stops.contains(&last) {
+        row.pop();
+        return Some(None);
+    }
+    let window = (start + 1)..reference.len().min(start + REJOIN_WINDOW + 1);
+    let matched = window.into_iter().find(|j| {
+        reference[*j] == last
+            && ((starts_word(tokenizer, last) && tokenizer.bytes(last).len() >= 2)
+                || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
+    });
+    if let Some(j) = matched {
+        return Some(Some(j + 1));
+    }
+    let whole = |tokens: &[(u32, f32)]| {
+        let bytes: Vec<u8> = tokens
+            .iter()
+            .flat_map(|(id, _)| tokenizer.bytes(*id).iter().copied())
+            .collect();
+        std::str::from_utf8(&bytes).is_ok()
+    };
+    let text = |id: u32| String::from_utf8_lossy(tokenizer.bytes(id)).into_owned();
+    let punctuation = |id: u32| {
+        let text = text(id);
+        !text.trim().is_empty() && text.trim().chars().all(is_punctuation)
+    };
+    // Punctuation where the reference has a word: the row likely puts it before that word.
+    if row.len() == 1 && punctuation(last) && reference.get(start).is_some_and(|r| !punctuation(*r))
+    {
+        return Some(Some(start));
+    }
+    // One whole-word token in place of a reference token before the next word: a word for a
+    // word, with no need to decode on.
+    let next_starts_word = reference
+        .get(start + 1)
+        .is_none_or(|id| starts_word(tokenizer, *id));
+    // A token that begins the reference's word, as " Mon" begins " Monroe", likely goes on.
+    let begins_reference = |id: u32| {
+        let ours = text(id).to_lowercase();
+        let theirs = reference
+            .get(start)
+            .map_or(String::new(), |r| text(*r).to_lowercase());
+        theirs.len() > ours.len() && theirs.starts_with(&ours)
+    };
+    if row.len() == 1
+        && starts_word(tokenizer, last)
+        && whole(row)
+        && next_starts_word
+        && !begins_reference(last)
+    {
+        return Some(Some(start + 1));
+    }
+    if row.len() >= 2 && starts_word(tokenizer, last) && whole(&row[..row.len() - 1]) {
+        row.pop();
+        let next_word = ((start + 1)..reference.len())
+            .find(|j| starts_word(tokenizer, reference[*j]))
+            .unwrap_or(reference.len());
+        return Some(Some(next_word));
+    }
+    (row.len() >= LOCAL_TOKENS).then(|| Some((start + row.len()).min(reference.len())))
+}
+
+/// True when a token begins a word: after a space, or with punctuation or a CJK character,
+/// which are words of their own.
+fn starts_word(tokenizer: &BpeTokenizer, id: u32) -> bool {
+    let bytes = tokenizer.bytes(id);
+    if bytes.first() == Some(&b' ') {
+        return true;
+    }
+    let head = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or(""),
+    };
+    head.chars()
+        .next()
+        .is_some_and(|c| is_punctuation(c) || is_cjk(c))
+}
+
+/// Tokens a noisy row decodes on its own from reference token `start`, and the reference token it
+/// goes on from after them (`None`: the row stopped).
+#[derive(Debug, Clone)]
+struct Stretch {
+    start: usize,
+    tokens: Vec<(u32, f32)>,
+    end: Option<usize>,
+}
+
+/// A noisy row's sample: the reference, with the row's own log probabilities, and its stretches
+/// in place of the reference tokens they cover.
+fn splice(reference: &[u32], scored: &[(u32, f32)], stretches: &[Stretch]) -> Vec<(u32, f32)> {
+    let own = |from: usize, to: usize| {
+        reference[from..to]
+            .iter()
+            .zip(&scored[from..to])
+            .map(|(id, (_, log_prob))| (*id, *log_prob))
+    };
+    let mut row = Vec::with_capacity(reference.len());
+    let mut at = 0;
+    for stretch in stretches {
+        row.extend(own(at, stretch.start));
+        row.extend(stretch.tokens.iter().copied());
+        match stretch.end {
+            Some(end) => at = end,
+            None => return row,
+        }
+    }
+    row.extend(own(at.min(reference.len()), reference.len()));
+    row
+}
+
+/// Tokens a noisy row decodes on its own where it leaves the reference, at most, and how far ahead
+/// in the reference it may come back. Most disagreements are one word.
+const LOCAL_TOKENS: usize = 8;
+const REJOIN_WINDOW: usize = 12;
 
 /// Tokens a greedy decode stuck in a loop cycles over: at most this many distinct ids in the last
 /// [`LOOP_WINDOW`]. Real speech varies more than that, even repeated lyrics.
@@ -613,43 +973,26 @@ impl Asr for QwenAsr {
     }
 
     fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>> {
-        let mut results = vec![Hypothesis::default(); encoders.len()];
-        // Rows batch only with rows of the same audio length, since they share the prompt.
-        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for (index, encoder) in encoders.iter().enumerate() {
-            if encoder.frames > 0 {
-                groups.entry(encoder.frames).or_default().push(index);
-            }
-        }
-        let vocab = self.tokenizer.vocab_size();
-        for (frames, indices) in groups {
-            let prompt = self.prompt(frames, &bias.phrases);
-            let max_new = self.max_new_tokens(frames);
-            let cache_bytes = 2
-                * self.shape.layers
-                * (prompt.len() + max_new)
-                * self.shape.kv_heads
-                * self.shape.head_dim
-                * 4;
-            // The first pass returns logits for every prompt position.
-            let row_bytes = cache_bytes + prompt.len() * vocab * 4;
-            let rows_per_call = (self.config.batch_bytes / row_bytes).max(1);
-            for part in indices.chunks(rows_per_call) {
-                let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
-                for (index, generated) in part.iter().zip(self.generate(&prompt, &rows, max_new)?) {
-                    results[*index] = self.to_hypothesis(&generated);
-                }
-            }
-        }
-        Ok(results)
+        self.decode_rows(encoders, bias, None)
+    }
+
+    /// Scores the reference under every noisy copy in one call, and decodes on only from where a
+    /// copy's pick differs (see [`QwenAsr::generate_noisy`]).
+    fn decode_noisy(
+        &self,
+        encoders: &[EncoderOutput],
+        bias: &Bias,
+        reference: &Hypothesis,
+    ) -> Result<Vec<Hypothesis>> {
+        self.decode_rows(encoders, bias, Some(&reference.ids))
     }
 
     fn frame_seconds(&self) -> f32 {
         0.08
     }
 
-    /// Every noisy decode reruns the whole LLM, prompt included, so there are fewer of them than for a
-    /// transducer. Audio features also need less noise than transducer encoder output to move the
+    /// Every noisy decode reads the whole prompt and transcript again, so there are fewer of them
+    /// than for a transducer. Audio features also need less noise than transducer encoder output to move the
     /// decode where the model is unsure.
     fn monte_carlo(&self) -> MonteCarloConfig {
         MonteCarloConfig {
@@ -737,6 +1080,88 @@ mod tests {
         assert_eq!(text(&body), "ab ab");
         // Silence.
         assert_eq!(text(&with(&[&encode("language None"), &[asr_text]])), "");
+    }
+
+    #[test]
+    fn ends_a_noisy_stretch_where_it_rejoins_or_its_word_ends() {
+        let t = tokenizer::tests::tokenizer();
+        let stops = [300];
+        let row = |ids: &[u32]| ids.iter().map(|id| (*id, 0.0)).collect::<Vec<(u32, f32)>>();
+        let ids = |text: &str| t.encode(text);
+        let (space, comma) = (ids(" ")[0], ids(",")[0]);
+        let reference = ids("ab ab ab");
+        assert_eq!(reference, vec![256, 257, 257]);
+
+        // Inside a word, and a token that begins the reference's word, both go on.
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&ids("x")), &reference, 0),
+            None
+        );
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&[space]), &reference, 1),
+            None
+        );
+        // A word for a word.
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&[258]), &reference, 1),
+            Some(Some(2))
+        );
+        // Its word ended: the next word's first token goes, and the reference's next word follows.
+        let mut ended = row(&[ids("x")[0], ids("y")[0], space]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut ended, &reference, 0),
+            Some(Some(1))
+        );
+        assert_eq!(ended, row(&ids("xy")));
+        // The row stopped.
+        let mut stopped = row(&[ids("x")[0], 300]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut stopped, &reference, 0),
+            Some(None)
+        );
+        assert_eq!(stopped, row(&ids("x")));
+        // Out of tokens.
+        let long = row(&ids("xxxxxxxx"));
+        assert_eq!(
+            stretch_end(&t, &stops, &mut long.clone(), &reference, 0),
+            Some(Some(3))
+        );
+        // A comma before a word comes in front of it.
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&[comma]), &reference, 1),
+            Some(Some(1))
+        );
+        // It skipped a comma and is back on the reference.
+        let reference = ids("ab, ab c");
+        assert_eq!(reference, vec![256, comma, 257, 258]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut row(&[257]), &reference, 1),
+            Some(Some(3))
+        );
+    }
+
+    #[test]
+    fn splices_stretches_into_the_reference() {
+        let reference = [1, 2, 3, 4, 5];
+        let scored: Vec<(u32, f32)> = (0..6).map(|i| (0, -(i as f32))).collect();
+        let stretch = |start, tokens: &[(u32, f32)], end| Stretch {
+            start,
+            tokens: tokens.to_vec(),
+            end,
+        };
+        assert_eq!(
+            splice(&reference, &scored, &[stretch(1, &[(9, -9.0)], Some(3))]),
+            vec![(1, 0.0), (9, -9.0), (4, -3.0), (5, -4.0)]
+        );
+        // A row that stopped early, and one that went on past the reference.
+        assert_eq!(
+            splice(&reference, &scored, &[stretch(2, &[], None)]),
+            vec![(1, 0.0), (2, -1.0)]
+        );
+        assert_eq!(
+            splice(&reference, &scored, &[stretch(5, &[(7, -7.0)], Some(5))]).len(),
+            6
+        );
     }
 
     #[test]

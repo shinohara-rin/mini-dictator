@@ -141,7 +141,7 @@ pub fn estimate<A: Asr + ?Sized>(
         let noisy: Vec<EncoderOutput> = (0..count)
             .map(|_| perturb(encoder, &scale, config.relative_sigma, &mut rng))
             .collect();
-        samples.extend(asr.decode(&noisy, bias)?);
+        samples.extend(asr.decode_noisy(&noisy, bias, reference)?);
         Ok(())
     };
 

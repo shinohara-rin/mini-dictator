@@ -746,6 +746,7 @@ mod tests {
                     log_prob: 0.0,
                 })
                 .collect(),
+            ids: Vec::new(),
         }
     }
 
@@ -868,6 +869,7 @@ mod tests {
                     log_prob: 0.0,
                 })
                 .collect(),
+            ids: Vec::new(),
         }
     }
 
