@@ -18,6 +18,8 @@ pub enum Side {
     Either,
     Left,
     Right,
+    /// Left and right together, as a chord of both Command keys.
+    Both,
 }
 
 /// Control, Option, Shift and Command, in the order macOS menus show them.
@@ -95,7 +97,7 @@ impl Held {
             (false, false) => None,
             (true, false) => Some(Side::Left),
             (false, true) => Some(Side::Right),
-            (true, true) => Some(Side::Either),
+            (true, true) => Some(Side::Both),
         }
     }
 }
@@ -134,6 +136,7 @@ impl Hotkey {
                 Some(Side::Either) => left || right,
                 Some(Side::Left) => left && !right,
                 Some(Side::Right) => right && !left,
+                Some(Side::Both) => left && right,
             }
         })
     }
@@ -142,7 +145,7 @@ impl Hotkey {
     fn has_extra(&self, held: Held) -> bool {
         (0..4).any(|i| match self.modifiers[i] {
             None => held.side(i).is_some(),
-            Some(Side::Either) => false,
+            Some(Side::Either | Side::Both) => false,
             Some(Side::Left) => held.right[i],
             Some(Side::Right) => held.left[i],
         })
@@ -158,6 +161,7 @@ impl fmt::Display for Hotkey {
                 Some(Side::Either) => parts.push((*name).to_owned()),
                 Some(Side::Left) => parts.push(format!("Left{name}")),
                 Some(Side::Right) => parts.push(format!("Right{name}")),
+                Some(Side::Both) => parts.push(format!("Left{name}+Right{name}")),
             }
         }
         if let Some(name) = self.key.and_then(key_name) {
@@ -194,9 +198,14 @@ impl FromStr for Hotkey {
                 .iter()
                 .position(|(_, names)| names.contains(&bare))
             {
-                if hotkey.modifiers[i].replace(side).is_some() {
-                    return Err(format!("{text}: {part} appears twice"));
-                }
+                // `LeftCmd+RightCmd` is both Command keys together.
+                hotkey.modifiers[i] = match (hotkey.modifiers[i], side) {
+                    (None, side) => Some(side),
+                    (Some(Side::Left), Side::Right) | (Some(Side::Right), Side::Left) => {
+                        Some(Side::Both)
+                    }
+                    _ => return Err(format!("{text}: {part} appears twice")),
+                };
                 continue;
             }
             let code = key_code(&lower).ok_or_else(|| format!("{text}: unknown key {part}"))?;
@@ -824,6 +833,27 @@ mod tests {
         assert_eq!(
             recorder.modifiers_changed(Held::default()),
             Some(Outcome::Recorded(hotkey("RightCmd+D")))
+        );
+    }
+
+    #[test]
+    fn both_sides_of_a_modifier_make_a_chord() {
+        let mut recorder = Recorder::default();
+        recorder.modifiers_changed(held(&[COMMAND], &[]));
+        recorder.modifiers_changed(held(&[COMMAND], &[COMMAND]));
+        let recorded = recorder.modifiers_changed(Held::default());
+        assert_eq!(
+            recorded,
+            Some(Outcome::Recorded(hotkey("LeftCmd+RightCmd")))
+        );
+        assert_eq!(hotkey("RightCmd+LeftCmd").to_string(), "LeftCmd+RightCmd");
+        assert!("LeftCmd+LeftCmd".parse::<Hotkey>().is_err());
+
+        let mut matcher = Matcher::new(hotkey("LeftCmd+RightCmd"), Held::default());
+        assert_eq!(matcher.modifiers_changed(held(&[COMMAND], &[])), None);
+        assert_eq!(
+            matcher.modifiers_changed(held(&[COMMAND], &[COMMAND])),
+            Some(Signal::Pressed)
         );
     }
 
