@@ -286,22 +286,24 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let pause_seconds = session
             .joiner
             .pause_before(segment, &engine.config.segmenter);
-        let plain = transcript.reference.text();
-        let mut text = plain.clone();
+        let mut text = transcript.reference.text();
+        let mut rewritten = false;
         if args.rewrite_url.is_some() {
             let request = engine.rewrite_request(&transcript, &session, pause_seconds);
             let started = Instant::now();
             match engine.rewriter.rewrite(&request) {
-                Ok(rewritten) => {
-                    println!("  rewrite ({}): {rewritten}", ms(started.elapsed()));
-                    text = rewritten;
+                Ok(Some(reply)) => {
+                    println!("  rewrite ({}): {reply}", ms(started.elapsed()));
+                    text = reply;
+                    rewritten = true;
                 }
+                Ok(None) => {}
                 Err(error) => println!("  rewrite failed: {error}"),
             }
         }
         if !text.trim().is_empty() {
             let piece = Piece {
-                rewritten: text != plain,
+                rewritten,
                 text: &text,
                 pause_seconds,
                 names: &session.hotwords,

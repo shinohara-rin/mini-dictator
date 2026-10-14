@@ -267,24 +267,26 @@ impl Engine {
                 ms(started.elapsed()),
                 indent(&user_prompt(&request), "    "),
                 match &rewritten {
-                    Ok(text) => format!("{text:?}"),
+                    Ok(Some(text)) => format!("{text:?}"),
+                    Ok(None) => "off, the transcript stands".into(),
                     Err(error) => format!("failed: {error}"),
                 }
             )));
         }
-        let text = match rewritten {
-            Ok(text) => text,
+        // Without a rewrite, the capitals are the recognizer's, chosen without the text before.
+        let (text, rewritten) = match rewritten {
+            Ok(Some(text)) => (text, true),
+            Ok(None) => (plain, false),
             Err(error) => {
                 events(Event::Warning(error.to_string()));
-                plain.clone()
+                (plain, false)
             }
         };
         if text.trim().is_empty() {
             return Ok(None);
         }
-        // A pass-through rewrite returns the transcript, whose capitals the recognizer chose alone.
         let piece = Piece {
-            rewritten: text != plain,
+            rewritten,
             text: &text,
             pause_seconds,
             names: &session.hotwords,
@@ -603,8 +605,8 @@ mod tests {
     struct Sentences;
 
     impl Rewriter for Sentences {
-        fn rewrite(&self, _: &RewriteRequest) -> Result<String> {
-            Ok("Hello.".into())
+        fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
+            Ok(Some("Hello.".into()))
         }
     }
 
@@ -651,7 +653,7 @@ mod tests {
         assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
         assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
         assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
-        assert!(debug[2].contains("reply: \"HELLO\""), "{}", debug[2]);
+        assert!(debug[2].contains("reply: off"), "{}", debug[2]);
     }
 
     #[test]

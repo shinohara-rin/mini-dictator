@@ -28,15 +28,16 @@ pub struct RewriteRequest {
 
 /// Rewrites a transcript. The HTTP implementation is [`OpenAiCompatible`]; shells can add others.
 pub trait Rewriter: Send + Sync {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String>;
+    /// The rewritten text, or None when no model ran and the plain transcript stands.
+    fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>>;
 }
 
 /// Inserts the plain transcript. Used when no rewrite model is configured.
 pub struct PassThrough;
 
 impl Rewriter for PassThrough {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String> {
-        Ok(request.plain_transcript.clone())
+    fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
+        Ok(None)
     }
 }
 
