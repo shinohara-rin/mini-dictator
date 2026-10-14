@@ -6,7 +6,9 @@
 //! slow accessibility read delays nothing: audio waits in the channel.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::asr::{Asr, Bias, Hypothesis};
@@ -44,8 +46,8 @@ pub enum Event {
     /// A step failed. The dictation goes on when it can: a failed rewrite inserts the plain transcript.
     Warning(String),
     /// What one step read, produced, and how long it took, for a debug log: the screen text and
-    /// hotwords, each decode, the uncertainty check, and the rewrite prompt and reply. Shells drop
-    /// these unless the user turned debug logging on.
+    /// hotwords, each decode, the uncertainty check, and the rewrite prompt and reply.
+    /// Emitted only while [`EngineConfig::debug`] is set.
     Debug(String),
     Finished,
 }
@@ -65,6 +67,8 @@ pub struct EngineConfig {
     pub share_screen_text: bool,
     /// Characters of focused-field text the rewrite model reads.
     pub preceding_chars: usize,
+    /// Emit [`Event::Debug`]. A shell flips it while dictations run; off, nothing is formatted.
+    pub debug: Arc<AtomicBool>,
 }
 
 impl Default for EngineConfig {
@@ -77,6 +81,7 @@ impl Default for EngineConfig {
             max_hotwords: 100,
             share_screen_text: true,
             preceding_chars: 400,
+            debug: Arc::default(),
         }
     }
 }
@@ -116,6 +121,10 @@ pub struct Engine {
 }
 
 impl Engine {
+    fn debug(&self) -> bool {
+        self.config.debug.load(Ordering::Relaxed)
+    }
+
     /// Reads the screen and prepares its terms as hotwords. A failed read gives an empty context.
     pub fn prepare(&self, events: &mut dyn FnMut(Event)) -> SessionContext {
         let started = Instant::now();
@@ -129,12 +138,14 @@ impl Engine {
             .map(|t| t.phrase)
             .collect();
         let bias = self.asr.bias(&hotwords);
-        events(Event::Debug(describe_context(
-            &screen,
-            &hotwords,
-            read,
-            started.elapsed() - read,
-        )));
+        if self.debug() {
+            events(Event::Debug(describe_context(
+                &screen,
+                &hotwords,
+                read,
+                started.elapsed() - read,
+            )));
+        }
         SessionContext {
             screen,
             hotwords,
@@ -219,12 +230,14 @@ impl Engine {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
         let transcript = self.transcribe(segment, session, behind_seconds.is_none())?;
         let plain = transcript.reference.text();
-        events(Event::Debug(describe_transcript(
-            segment,
-            lag_seconds,
-            behind_seconds.is_some(),
-            &transcript,
-        )));
+        if self.debug() {
+            events(Event::Debug(describe_transcript(
+                segment,
+                lag_seconds,
+                behind_seconds.is_some(),
+                &transcript,
+            )));
+        }
         events(Event::Transcribed {
             plain: plain.clone(),
             marked: transcript.marked.clone(),
@@ -237,15 +250,17 @@ impl Engine {
         let request = self.rewrite_request(&transcript, session);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
-        events(Event::Debug(format!(
-            "rewrite in {}\n  prompt:\n{}\n  reply: {}",
-            ms(started.elapsed()),
-            indent(&user_prompt(&request), "    "),
-            match &rewritten {
-                Ok(text) => format!("{text:?}"),
-                Err(error) => format!("failed: {error}"),
-            }
-        )));
+        if self.debug() {
+            events(Event::Debug(format!(
+                "rewrite in {}\n  prompt:\n{}\n  reply: {}",
+                ms(started.elapsed()),
+                indent(&user_prompt(&request), "    "),
+                match &rewritten {
+                    Ok(text) => format!("{text:?}"),
+                    Err(error) => format!("failed: {error}"),
+                }
+            )));
+        }
         let text = match rewritten {
             Ok(text) => text,
             Err(error) => {
@@ -529,11 +544,7 @@ mod tests {
             crate::vad::EnergyVad::default(),
             speech(Instant::now()),
             &mut sink,
-            &mut |e| {
-                if !matches!(e, Event::Debug(_)) {
-                    events.push(e)
-                }
-            },
+            &mut |e| events.push(e),
         )
         .unwrap();
         assert_eq!(sink.0, vec!["HELLO", " HELLO"]);
@@ -542,6 +553,8 @@ mod tests {
             matches!(events[0], Event::Listening { hotwords: 1 }),
             "{events:?}"
         );
+        // Debug logging is off.
+        assert!(events.iter().all(|e| !matches!(e, Event::Debug(_))));
         // The audio was all recorded just now, so no segment came in late.
         assert!(events.iter().all(|e| !matches!(
             e,
@@ -554,9 +567,11 @@ mod tests {
 
     #[test]
     fn debug_events_show_the_context_the_decodes_and_the_rewrite() {
+        let engine = engine();
+        engine.config.debug.store(true, Ordering::Relaxed);
         let mut debug = Vec::new();
         run_dictation(
-            &engine(),
+            &engine,
             crate::vad::EnergyVad::default(),
             speech(Instant::now()),
             &mut Collect(Vec::new()),

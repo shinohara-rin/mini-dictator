@@ -49,7 +49,7 @@ struct Switches {
     screen: Arc<AtomicBool>,
 }
 
-fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
+fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switches), String> {
     init_runtime(config.onnxruntime_path().as_deref()).map_err(|e| format!("ONNX Runtime: {e}"))?;
     let recognizer = asr::load(
         &Config::resolve(&config.model_dir),
@@ -90,6 +90,7 @@ fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
                 .max_lag_seconds
                 .unwrap_or(EngineConfig::default().max_lag_seconds),
             share_screen_text: config.share_screen_text,
+            debug,
             ..EngineConfig::default()
         },
     };
@@ -225,7 +226,8 @@ pub fn run() {
             Config::default()
         }
     };
-    debug_log::init(debug_log_path(), config.debug);
+    let debug = Arc::new(AtomicBool::new(config.debug));
+    debug_log::init(debug_log_path(), debug.clone());
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     // A menu bar app: no Dock icon, no app menu.
@@ -274,9 +276,10 @@ pub fn run() {
                 is_trusted(true);
                 let proxy = proxy.clone();
                 let config = config.clone();
+                let debug = debug.clone();
                 std::thread::spawn(move || {
-                    let loaded =
-                        load_engine(&config).map(|(engine, found)| (Arc::new(engine), found));
+                    let loaded = load_engine(&config, debug)
+                        .map(|(engine, found)| (Arc::new(engine), found));
                     let _ = proxy.send_event(AppEvent::Loaded(loaded));
                 });
             }
