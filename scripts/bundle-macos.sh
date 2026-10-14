@@ -16,10 +16,14 @@ CACHE="$ROOT/target/onnxruntime-$ORT_VERSION"
 
 cargo build --release -p mini-dictator-macos --manifest-path "$ROOT/Cargo.toml"
 
+# The archive's paths start with ./, so unpack into a scratch folder and take the folder inside.
 if [ ! -f "$CACHE/lib/libonnxruntime.$ORT_VERSION.dylib" ]; then
-  mkdir -p "$CACHE"
+  rm -rf "$CACHE" "$CACHE.tmp"
+  mkdir -p "$CACHE.tmp"
   curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz" \
-    | tar xz -C "$CACHE" --strip-components 1
+    | tar xz -C "$CACHE.tmp"
+  mv "$CACHE.tmp"/onnxruntime-* "$CACHE"
+  rm -rf "$CACHE.tmp"
 fi
 
 rm -rf "$APP"

@@ -16,17 +16,21 @@ STAGE="$ROOT/target/dist/$NAME"
 CACHE="$ROOT/target/onnxruntime-$ORT_VERSION-$PLATFORM"
 ORT_URL="https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-$PLATFORM-$ORT_VERSION"
 
-if [ ! -d "$CACHE/lib" ]; then
-  mkdir -p "$CACHE"
+# The archives differ in layout (the macOS one has a leading ./), so unpack into a scratch folder
+# and take the one top-level folder from it.
+if [ ! -f "$CACHE/LICENSE" ]; then
+  rm -rf "$CACHE" "$CACHE.tmp"
+  mkdir -p "$CACHE.tmp"
   case $PLATFORM in
     win-*)
       curl -fsSL -o "$CACHE.zip" "$ORT_URL.zip"
       7z x -bso0 -o"$CACHE.tmp" "$CACHE.zip"
-      mv "$CACHE.tmp"/*/* "$CACHE"
-      rm -rf "$CACHE.zip" "$CACHE.tmp"
+      rm "$CACHE.zip"
       ;;
-    *) curl -fsSL "$ORT_URL.tgz" | tar xz -C "$CACHE" --strip-components 1 ;;
+    *) curl -fsSL "$ORT_URL.tgz" | tar xz -C "$CACHE.tmp" ;;
   esac
+  mv "$CACHE.tmp"/onnxruntime-* "$CACHE"
+  rm -rf "$CACHE.tmp"
 fi
 
 rm -rf "$STAGE"
