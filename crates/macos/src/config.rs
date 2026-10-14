@@ -92,21 +92,32 @@ pub fn config_path() -> PathBuf {
     support_dir().join("config.toml")
 }
 
-/// Writes the config file, readable by the user only since it can hold an API key.
+/// Writes the config file, readable by the user only since it can hold an API key. The text goes
+/// to a temporary file that then replaces the config, so a failed write leaves the old one whole.
 fn write(text: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = config_path();
+    let temporary = path.with_extension("toml.tmp");
     std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    file.write_all(text.as_bytes()).map_err(|e| e.to_string())
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        // `mode` applies only to a new file; a leftover temporary keeps its own permissions.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("{}: {e}", path.display())
+    })
 }
 
 /// The config text with `hotkey` set, its comments and layout untouched. A file that does not

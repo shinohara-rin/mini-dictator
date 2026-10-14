@@ -48,7 +48,9 @@ enum AppEvent {
     /// The worker finished, with an error if the dictation failed.
     Done(Option<String>),
     CheckPermissions,
-    HotKeyRecorded(Outcome),
+    /// The result of the recording with this number. A recording cancelled from the menu may
+    /// still deliver one, which is then ignored.
+    HotKeyRecorded(u64, Outcome),
 }
 
 struct Switches {
@@ -290,6 +292,7 @@ pub fn run() {
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
     let mut capture: Option<Capture> = None;
+    let mut recording: u64 = 0;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -381,8 +384,10 @@ pub fn run() {
                     // Unregistered while recording, so pressing it records it instead of dictating.
                     let _ = hotkeys.unregister(hotkey);
                     let proxy = proxy.clone();
+                    recording += 1;
+                    let current = recording;
                     capture = recorder::start(move |outcome| {
-                        let _ = proxy.send_event(AppEvent::HotKeyRecorded(outcome));
+                        let _ = proxy.send_event(AppEvent::HotKeyRecorded(current, outcome));
                     });
                     if capture.is_some() {
                         ui.change_hotkey
@@ -441,9 +446,11 @@ pub fn run() {
                     ui.permissions.set_text(summary);
                 }
             }
-            Event::UserEvent(AppEvent::HotKeyRecorded(outcome)) => {
+            Event::UserEvent(AppEvent::HotKeyRecorded(number, outcome)) => {
                 let Some(ui) = &mut ui else { return };
-                capture = None;
+                if number != recording || capture.take().is_none() {
+                    return;
+                }
                 let recorded = match outcome {
                     Outcome::Recorded(text) => text,
                     Outcome::Cancelled => {
