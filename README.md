@@ -28,6 +28,11 @@ model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite
 on screen in the last few minutes count as well as the current window's; `screen_memory_seconds`
 sets how fast they fade (0 turns the memory off).
 
+To see what a dictation did, check Write Debug Log in the menu, or set `debug = true` to have it on
+from launch. It writes `debug.log` next to `config.toml`: the screen text and hotwords, each decode
+with its noisy decodes and unclear spans, the rewrite prompt and reply, and timings. It holds what
+was on your screen, so it is off by default; past 5 MB it moves to `debug.log.1`.
+
 ## Try the core on a WAV file
 
 ```sh

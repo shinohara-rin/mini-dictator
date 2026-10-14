@@ -25,8 +25,9 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::config::{config_path, support_dir, Config, APP_NAME};
+use crate::config::{config_path, debug_log_path, support_dir, Config, APP_NAME};
 use crate::context::{focused_window, is_trusted, AccessibilityReader};
+use crate::debug_log;
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
 use crate::permissions;
@@ -60,7 +61,7 @@ struct Switches {
     screen: Arc<AtomicBool>,
 }
 
-fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
+fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switches), String> {
     init_runtime(config.onnxruntime_path().as_deref()).map_err(|e| format!("ONNX Runtime: {e}"))?;
     let recognizer = asr::load(
         &Config::resolve(&config.model_dir),
@@ -113,6 +114,7 @@ fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
                 .max_lag_seconds
                 .unwrap_or(EngineConfig::default().max_lag_seconds),
             share_screen_text: config.share_screen_text,
+            debug,
             ..EngineConfig::default()
         },
     };
@@ -155,6 +157,7 @@ struct Ui {
     permissions: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
+    debug: CheckMenuItem,
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
@@ -174,6 +177,7 @@ impl Ui {
             None,
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
+        let debug = CheckMenuItem::new("Write Debug Log", true, config.debug, None);
         let open_config = MenuItem::new("Open Settings File…", true, None);
         let open_folder = MenuItem::new("Open Models Folder…", true, None);
         let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, None);
@@ -187,6 +191,7 @@ impl Ui {
             &separator,
             &rewrite,
             &screen,
+            &debug,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_folder,
@@ -208,6 +213,7 @@ impl Ui {
             permissions,
             rewrite,
             screen,
+            debug,
             open_config,
             open_folder,
             quit,
@@ -248,6 +254,8 @@ pub fn run() {
             Config::default()
         }
     };
+    let debug = Arc::new(AtomicBool::new(config.debug));
+    debug_log::init(debug_log_path(), debug.clone());
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     // A menu bar app: no Dock icon, no app menu.
@@ -307,9 +315,10 @@ pub fn run() {
                 }
                 let proxy = proxy.clone();
                 let config = config.clone();
+                let debug = debug.clone();
                 std::thread::spawn(move || {
-                    let loaded =
-                        load_engine(&config).map(|(engine, found)| (Arc::new(engine), found));
+                    let loaded = load_engine(&config, debug)
+                        .map(|(engine, found)| (Arc::new(engine), found));
                     let _ = proxy.send_event(AppEvent::Loaded(loaded));
                 });
             }
@@ -320,6 +329,10 @@ pub fn run() {
                         if config.screen_memory_seconds > 0 {
                             sample_screen(loaded.clone(), dictating.clone());
                         }
+                        debug_log::write(&format!(
+                            "loaded {}",
+                            Config::resolve(&config.model_dir).display()
+                        ));
                         engine = Some(loaded);
                         switches = Some(found);
                         ui.toggle.set_enabled(true);
@@ -327,6 +340,7 @@ pub fn run() {
                     }
                     Err(error) => {
                         eprintln!("model: {error}");
+                        debug_log::write(&format!("model: {error}"));
                         ui.show(State::Error, &shorten(&format!("Model: {error}"), 60));
                     }
                 }
@@ -373,6 +387,8 @@ pub fn run() {
                     if let Some(engine) = engine.as_ref().filter(|_| !ui.screen.is_checked()) {
                         engine.memory.clear();
                     }
+                } else if event.id == ui.debug.id() {
+                    debug_log::set_enabled(ui.debug.is_checked());
                 } else if event.id == ui.open_config.id() {
                     open(&config_path());
                 } else if event.id == ui.open_folder.id() {
@@ -409,10 +425,12 @@ pub fn run() {
                         .set_text(format!("Last: {}", shorten(text.trim(), 40))),
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
+                        debug_log::write(&format!("warning: {warning}"));
                         ui.last
                             .set_text(shorten(&format!("Warning: {warning}"), 60));
                     }
-                    CoreEvent::Finished => {}
+                    // The worker writes these to the log itself.
+                    CoreEvent::Debug(_) | CoreEvent::Finished => {}
                 }
             }
             Event::UserEvent(AppEvent::CheckPermissions) => {
@@ -434,6 +452,7 @@ pub fn run() {
                 match error {
                     Some(error) => {
                         eprintln!("dictation: {error}");
+                        debug_log::write(&format!("dictation failed: {error}"));
                         ui.show(State::Error, &shorten(&format!("Error: {error}"), 60));
                     }
                     None => ui.show(State::Idle, "Ready"),
@@ -497,9 +516,14 @@ fn start(
     std::thread::spawn(move || {
         let mut sink = PasteSink;
         let events = proxy.clone();
-        let mut forward = move |event: CoreEvent| {
-            let _ = events.send_event(AppEvent::Core(event));
+        let mut forward = move |event: CoreEvent| match event {
+            // Written here, so long screen text never passes through the event loop.
+            CoreEvent::Debug(text) => debug_log::write(&text),
+            event => {
+                let _ = events.send_event(AppEvent::Core(event));
+            }
         };
+        debug_log::write("dictation started");
         let result = match vad_path.map(|p| SileroVad::load(&p)) {
             Some(Ok(vad)) => run_dictation(&engine, vad, receiver, &mut sink, &mut forward),
             Some(Err(error)) => {
@@ -522,6 +546,9 @@ fn start(
                 &mut forward,
             ),
         };
+        if let Ok(text) = &result {
+            debug_log::write(&format!("dictation finished, inserted {text:?}"));
+        }
         let _ = proxy.send_event(AppEvent::Done(result.err().map(|e| e.to_string())));
     });
     Some(Dictation {
