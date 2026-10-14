@@ -327,7 +327,7 @@ pub fn run() {
                 match result {
                     Ok((loaded, found)) => {
                         if config.screen_memory_seconds > 0 {
-                            sample_screen(loaded.clone(), dictating.clone());
+                            sample_screen(loaded.clone(), found.screen.clone(), dictating.clone());
                         }
                         debug_log::write(&format!(
                             "loaded {}",
@@ -463,15 +463,20 @@ pub fn run() {
     });
 }
 
-/// Feeds the term memory every [`MEMORY_SAMPLE`] while no dictation runs. An unchanged window
-/// counts its last terms again without a read. The engine's screen reader returns nothing while the
-/// menu switch is off.
-fn sample_screen(engine: Arc<Engine>, dictating: Arc<AtomicBool>) {
+/// Feeds the term memory every [`MEMORY_SAMPLE`] while no dictation runs and screen reading is on.
+/// An unchanged window counts its last terms again without a read.
+fn sample_screen(engine: Arc<Engine>, screen_on: Arc<AtomicBool>, dictating: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut last: Option<((String, String), Instant)> = None;
         let mut terms = Vec::new();
         loop {
             std::thread::sleep(MEMORY_SAMPLE);
+            if !screen_on.load(Ordering::Relaxed) {
+                // The menu cleared the memory; nothing seen before stays.
+                last = None;
+                terms.clear();
+                continue;
+            }
             if dictating.load(Ordering::Relaxed) {
                 // The dictation reads the screen itself; read afresh after it.
                 last = None;
@@ -490,7 +495,10 @@ fn sample_screen(engine: Arc<Engine>, dictating: Arc<AtomicBool>) {
                 };
                 last = Some((window, Instant::now()));
             }
-            engine.memory.observe(&terms, Instant::now());
+            // Checked again, in case the switch went off during the read.
+            if screen_on.load(Ordering::Relaxed) {
+                engine.memory.observe(&terms, Instant::now());
+            }
         }
     });
 }
