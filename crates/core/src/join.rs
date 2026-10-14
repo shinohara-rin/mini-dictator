@@ -68,7 +68,7 @@ impl Joiner {
         let (body, period, closing) = split_final_period(piece.text.trim());
         let continues = piece.pause_seconds.is_some_and(|pause| {
             // An opening quote or bracket says nothing; the letter after it does.
-            let first = body.chars().find(|&c| !is_opening_punctuation(c));
+            let first = body.chars().find(|&c| !is_lead_in(c));
             if body.chars().next().is_some_and(is_joining_punctuation)
                 || first.is_some_and(char::is_lowercase)
             {
@@ -100,7 +100,7 @@ impl Joiner {
         let after_title = typed
             .strip_suffix('.')
             .and_then(|t| t.rsplit(char::is_whitespace).next())
-            .is_some_and(is_abbreviation);
+            .is_some_and(is_title);
         let body = if continues && !piece.rewritten && !after_title {
             lowercase_first_word(body, piece.names)
         } else {
@@ -176,6 +176,13 @@ fn is_abbreviation(word: &str) -> bool {
         .any(|a| a.eq_ignore_ascii_case(word.trim_start_matches(is_opening_punctuation)))
 }
 
+/// Titles before a name, whose next word keeps its capital.
+fn is_title(word: &str) -> bool {
+    ["mr", "mrs", "ms", "dr", "prof", "st"]
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(word.trim_start_matches(is_opening_punctuation)))
+}
+
 /// Punctuation that closes a quote or an aside.
 fn is_closing_punctuation(c: char) -> bool {
     matches!(
@@ -184,8 +191,13 @@ fn is_closing_punctuation(c: char) -> bool {
     )
 }
 
+/// Opening punctuation and the spaces after it, before a piece's first word.
+fn is_lead_in(c: char) -> bool {
+    is_opening_punctuation(c) || c.is_whitespace()
+}
+
 fn first_word(text: &str) -> &str {
-    text.trim_start_matches(is_opening_punctuation)
+    text.trim_start_matches(is_lead_in)
         .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
         .next()
         .unwrap_or("")
@@ -213,12 +225,14 @@ fn lowercase_first_word(text: &str, names: &[String]) -> String {
     let Some(first) = word.chars().next() else {
         return text.to_owned();
     };
-    if !first.is_uppercase() || keeps_capital(word, names) || !text.starts_with(word) {
+    if !first.is_uppercase() || keeps_capital(word, names) {
         return text.to_owned();
     }
-    first
-        .to_lowercase()
-        .chain(text[first.len_utf8()..].chars())
+    let start = text.len() - text.trim_start_matches(is_lead_in).len();
+    let (lead, rest) = text.split_at(start);
+    lead.chars()
+        .chain(first.to_lowercase())
+        .chain(rest[first.len_utf8()..].chars())
         .collect()
 }
 
@@ -415,6 +429,21 @@ mod tests {
         assert_eq!(
             dictate(&[(0.0, "Ask Dr."), (0.7, "Smith.")], false),
             "Ask Dr. Smith."
+        );
+        assert_eq!(
+            dictate(
+                &[(0.0, "Use a fruit, e.g."), (0.7, "Apples and pears.")],
+                false
+            ),
+            "Use a fruit, e.g. apples and pears."
+        );
+        assert_eq!(
+            dictate(&[(0.0, "I agree."), (0.7, "(This needs work.)")], false),
+            "I agree (this needs work.)"
+        );
+        assert_eq!(
+            dictate(&[(0.0, "Done."), (0.7, "- Next step.")], true),
+            "Done. - Next step."
         );
         assert_eq!(
             dictate(&[(0.0, "He said “hello."), (0.7, "” and left.")], false),
