@@ -154,7 +154,16 @@ A shell returns `TextBlock`s tagged with a `Region` (`Focused` text before the c
 `WindowTitle`, other `Window` elements) instead of one string, because a short standalone element
 (a contact, a channel, a file) is often a name. `rank_terms` adapts AIRI's conversation term rules:
 quoted spans, identifiers (`useMemo`, `ASR`, `Node.js`, `gpt-4o`), runs of capitalized words, and
-short CJK elements. Occurrences weigh 3 in the focused field, 2 in the title, and 1 elsewhere.
+short CJK elements, plus rare words (no whole token in the Qwen tokenizer) where a sentence or an
+element starts, such as a page title. Occurrences weigh 3 in the focused field, 2 in the title, and
+1 elsewhere.
+
+`TermMemory` remembers the terms of recent screens, so a name from the tab you just left still
+counts. The macOS shell checks the focused window every 5 s between dictations and reads it again
+when it changed (or every 30 s). Each sample adds a term's score times the seconds since the last
+one, and weights halve every 60 s, so a name read for a minute outranks one that flashed by. At a
+dictation, `merge_terms` adds the remembered weights to the current screen's scores. Only terms are
+kept, in memory, and turning screen reading off clears them.
 
 `FallbackProvider` tries accessibility first and runs OCR only when accessibility returns too
 little text (games, canvas apps, some Electron apps).
