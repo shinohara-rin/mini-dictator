@@ -5,7 +5,8 @@ use std::collections::{HashMap, VecDeque};
 /// Each hypothesis in the beam carries a [`ContextState`]. A token that extends a partial hotword
 /// earns `boost`. A token that breaks a partial match takes back the bonus that the broken prefix
 /// earned, so a hypothesis cannot collect bonuses from prefixes it never finishes. A finished
-/// hotword keeps its bonus.
+/// hotword keeps `boost` for each of its tokens, also when it overlaps another hotword: with `A B`
+/// and `B C`, the tokens `A B C` finish both.
 ///
 /// Source: Yang et al., "Fast and parallel decoding for transducer" and icefall's `ContextGraph`,
 /// https://github.com/k2-fsa/icefall/blob/master/icefall/context_graph.py
@@ -21,10 +22,19 @@ struct Node {
     fail: usize,
     depth: usize,
     is_end: bool,
+    /// Total length of the hotwords that end here as a proper suffix of this node's tokens.
+    suffix_ends: usize,
 }
 
-/// Position of one hypothesis in the [`ContextGraph`]. The root is state 0.
-pub type ContextState = usize;
+/// Position of one hypothesis in the [`ContextGraph`]. The default is the root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextState {
+    /// The longest hotword prefix that ends the hypothesis.
+    node: usize,
+    /// The last tokens of that prefix whose bonus is provisional: a break takes it back. The
+    /// others already count toward a finished hotword.
+    pending: usize,
+}
 
 impl ContextGraph {
     /// Builds the graph from hotwords spelled in token ids. `boost` is the log-score bonus per token.
@@ -67,6 +77,12 @@ impl ContextGraph {
                     fail = nodes[fail].fail;
                 };
                 nodes[child].fail = target;
+                nodes[child].suffix_ends = nodes[target].suffix_ends
+                    + if nodes[target].is_end {
+                        nodes[target].depth
+                    } else {
+                        0
+                    };
                 queue.push_back(child);
             }
         }
@@ -77,30 +93,42 @@ impl ContextGraph {
         self.nodes.len() == 1
     }
 
-    fn goto(&self, mut state: ContextState, token: u32) -> ContextState {
+    fn goto(&self, mut node: usize, token: u32) -> usize {
         loop {
-            if let Some(&next) = self.nodes[state].children.get(&token) {
+            if let Some(&next) = self.nodes[node].children.get(&token) {
                 return next;
             }
-            if state == 0 {
+            if node == 0 {
                 return 0;
             }
-            state = self.nodes[state].fail;
+            node = self.nodes[node].fail;
         }
     }
 
     /// The score change and the next state after `token`.
     pub fn step(&self, state: ContextState, token: u32) -> (f32, ContextState) {
-        let next = self.goto(state, token);
-        let delta = (self.nodes[next].depth as f32 - self.nodes[state].depth as f32) * self.boost;
-        // A finished hotword keeps its bonus: the next state is the root, so no later step takes it back.
-        let next = if self.nodes[next].is_end { 0 } else { next };
-        (delta, next)
+        let node = self.goto(state.node, token);
+        let next = &self.nodes[node];
+        // The new prefix keeps the pending tokens that it still covers, and adds this one.
+        let mut pending = if node == 0 {
+            0
+        } else {
+            state.pending.min(next.depth - 1) + 1
+        };
+        let mut gain = pending as f32 - state.pending as f32 + next.suffix_ends as f32;
+        if next.is_end {
+            // The prefix is a whole hotword: its pending bonus becomes final, and its other tokens,
+            // which counted toward an overlapping hotword, count again for this one. The state
+            // stays here, so the end of this hotword can start another.
+            gain += (next.depth - pending) as f32;
+            pending = 0;
+        }
+        (gain * self.boost, ContextState { node, pending })
     }
 
     /// The score change at the end of the utterance: an unfinished prefix gives its bonus back.
     pub fn finish(&self, state: ContextState) -> f32 {
-        -(self.nodes[state].depth as f32) * self.boost
+        -(state.pending as f32) * self.boost
     }
 }
 
@@ -109,7 +137,7 @@ mod tests {
     use super::*;
 
     fn walk(graph: &ContextGraph, tokens: &[u32]) -> f32 {
-        let mut state = 0;
+        let mut state = ContextState::default();
         let mut total = 0.0;
         for &token in tokens {
             let (delta, next) = graph.step(state, token);
@@ -137,5 +165,46 @@ mod tests {
         // After 1 2, the token 4 breaks "1 2 3" but "2 4" continues from the shared token 2.
         let graph = ContextGraph::new(&[vec![1, 2, 3], vec![2, 4]], 1.0);
         assert_eq!(walk(&graph, &[1, 2, 4]), 2.0);
+    }
+
+    #[test]
+    fn overlapping_hotwords_both_finish() {
+        let graph = ContextGraph::new(&[vec![1, 2], vec![2, 3]], 1.0);
+        assert_eq!(walk(&graph, &[1, 2, 3]), 4.0);
+        assert_eq!(walk(&graph, &[2, 3]), 2.0);
+        // A longer overlap: "2 3" ends "1 2 3" and starts "2 3 4".
+        let graph = ContextGraph::new(&[vec![1, 2, 3], vec![2, 3, 4]], 1.0);
+        assert_eq!(walk(&graph, &[1, 2, 3, 4]), 6.0);
+        // The second hotword breaks, so only the first keeps its bonus.
+        assert_eq!(walk(&graph, &[1, 2, 3, 9]), 3.0);
+    }
+
+    #[test]
+    fn a_hotword_inside_a_longer_one_counts_on_its_own() {
+        let graph = ContextGraph::new(&[vec![1, 2], vec![1, 2, 3, 4]], 1.0);
+        assert_eq!(walk(&graph, &[1, 2, 3, 4]), 6.0);
+        // The longer one breaks after 3, which gives back only the bonus of 3.
+        assert_eq!(walk(&graph, &[1, 2, 3, 9]), 2.0);
+        assert_eq!(walk(&graph, &[1, 2, 3]), 2.0);
+        // A hotword that ends as a suffix of a longer prefix.
+        let graph = ContextGraph::new(&[vec![1, 2, 3], vec![2]], 1.0);
+        assert_eq!(walk(&graph, &[1, 2, 3]), 4.0);
+        assert_eq!(walk(&graph, &[1, 2, 9]), 1.0);
+    }
+
+    #[test]
+    fn the_score_never_counts_a_bonus_twice_on_the_way() {
+        // The running score is the final bonuses plus the pending prefix, at every step.
+        let graph = ContextGraph::new(&[vec![1, 2], vec![2, 3]], 1.0);
+        let mut state = ContextState::default();
+        let mut running = Vec::new();
+        let mut total = 0.0;
+        for token in [1, 2, 3] {
+            let (delta, next) = graph.step(state, token);
+            total += delta;
+            state = next;
+            running.push(total);
+        }
+        assert_eq!(running, [1.0, 2.0, 4.0]);
     }
 }

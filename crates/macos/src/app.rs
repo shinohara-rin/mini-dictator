@@ -353,6 +353,10 @@ pub fn run() {
             Event::UserEvent(AppEvent::Done(error)) => {
                 busy = false;
                 let Some(ui) = &ui else { return };
+                // The dictation failed while the microphone was on: stop recording.
+                if dictation.take().is_some() {
+                    ui.toggle.set_text("Start Dictation");
+                }
                 match error {
                     Some(error) => {
                         eprintln!("dictation: {error}");

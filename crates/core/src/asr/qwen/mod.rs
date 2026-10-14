@@ -392,7 +392,8 @@ impl QwenAsr {
             starts.push(bytes.len());
             bytes.extend_from_slice(self.tokenizer.bytes(*id));
         }
-        let text = String::from_utf8_lossy(&bytes);
+        let (text, offsets) = decode_lossy(&bytes);
+        let starts: Vec<usize> = starts.iter().map(|s| offsets[*s]).collect();
         let tokens = split_words(&text)
             .into_iter()
             .map(|range| {
@@ -421,6 +422,23 @@ impl QwenAsr {
         (frames as f32 * self.frame_seconds() * self.config.tokens_per_second) as usize
             + self.config.extra_tokens
     }
+}
+
+/// Decodes UTF-8 like [`String::from_utf8_lossy`], with the text offset of every byte offset, so
+/// token starts still point at their text when a malformed sequence turns into U+FFFD.
+fn decode_lossy(bytes: &[u8]) -> (String, Vec<usize>) {
+    let mut text = String::with_capacity(bytes.len());
+    let mut offsets = Vec::with_capacity(bytes.len() + 1);
+    for chunk in bytes.utf8_chunks() {
+        offsets.extend((0..chunk.valid().len()).map(|i| text.len() + i));
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            offsets.extend(std::iter::repeat_n(text.len(), chunk.invalid().len()));
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    offsets.push(text.len());
+    (text, offsets)
 }
 
 /// Hotwords as the system prompt reads them.
@@ -634,5 +652,18 @@ mod tests {
         let (id, log_prob) = pick(&[0.0, 2.0f32.ln(), 0.0, f32::NAN]);
         assert_eq!(id, 1);
         assert!((log_prob - 0.5f32.ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn maps_byte_offsets_through_lossy_decoding() {
+        // A cut-off "中" (E4 B8 AD), then " hi", then a whole "中".
+        let bytes = [0xE4, 0xB8, b' ', b'h', b'i', 0xE4, 0xB8, 0xAD];
+        let (text, offsets) = decode_lossy(&bytes);
+        assert_eq!(text, String::from_utf8_lossy(&bytes));
+        assert_eq!(text, "\u{FFFD} hi中");
+        assert_eq!(offsets.len(), bytes.len() + 1);
+        assert_eq!(&text[offsets[2]..offsets[5]], " hi");
+        assert_eq!(&text[offsets[5]..offsets[8]], "中");
+        assert_eq!(offsets[1], 0);
     }
 }

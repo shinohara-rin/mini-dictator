@@ -1,22 +1,61 @@
 //! Inserts text by pasting it, then puts the clipboard back.
 //!
 //! Pasting works in nearly every app and inserts long text at once. Typed Unicode events are the
-//! alternative, but some apps drop or reorder them. The clipboard is restored only if nothing else
-//! changed it during the paste.
+//! alternative, but some apps drop or reorder them. The clipboard is restored with every item and
+//! type it held (an image, files, rich text), and only if nothing else changed it during the paste.
 
 use std::thread::sleep;
 use std::time::Duration;
 
 use mini_dictator_core::pipeline::TextSink;
 use mini_dictator_core::{Error, Result};
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{
+    NSPasteboard, NSPasteboardItem, NSPasteboardType, NSPasteboardTypeString, NSPasteboardWriting,
+};
 use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSData, NSString};
 
 /// The virtual key code of V on ANSI keyboards. macOS maps Cmd+V by key position.
 const KEY_V: u16 = 9;
 
 pub struct PasteSink;
+
+/// The clipboard's items, each with the data of every type it offers.
+type Snapshot = Vec<Vec<(Retained<NSPasteboardType>, Retained<NSData>)>>;
+
+fn snapshot(pasteboard: &NSPasteboard) -> Snapshot {
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.types()
+                .iter()
+                .filter_map(|kind| item.dataForType(&kind).map(|data| (kind, data)))
+                .collect()
+        })
+        .collect()
+}
+
+fn restore(pasteboard: &NSPasteboard, snapshot: Snapshot) {
+    pasteboard.clearContents();
+    let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = snapshot
+        .into_iter()
+        .map(|types| {
+            let item = NSPasteboardItem::new();
+            for (kind, data) in &types {
+                item.setData_forType(data, kind);
+            }
+            ProtocolObject::from_retained(item)
+        })
+        .collect();
+    if !items.is_empty() {
+        pasteboard.writeObjects(&NSArray::from_retained_slice(&items));
+    }
+}
 
 fn press_command_v() -> Result<()> {
     for down in [true, false] {
@@ -32,22 +71,23 @@ impl TextSink for PasteSink {
     fn insert(&mut self, text: &str) -> Result<()> {
         let pasteboard = NSPasteboard::generalPasteboard();
         let kind = unsafe { NSPasteboardTypeString };
-        let previous = pasteboard.stringForType(kind);
+        let previous = snapshot(&pasteboard);
 
         pasteboard.clearContents();
         if !pasteboard.setString_forType(&NSString::from_str(text), kind) {
+            restore(&pasteboard, previous);
             return Err(Error::Sink("cannot write the clipboard".into()));
         }
         let ours = pasteboard.changeCount();
-        press_command_v()?;
+        if let Err(error) = press_command_v() {
+            restore(&pasteboard, previous);
+            return Err(error);
+        }
 
         // The target app reads the clipboard when it handles the key event, which can take a moment.
         sleep(Duration::from_millis(250));
         if pasteboard.changeCount() == ours {
-            pasteboard.clearContents();
-            if let Some(previous) = previous {
-                pasteboard.setString_forType(&previous, kind);
-            }
+            restore(&pasteboard, previous);
         }
         Ok(())
     }

@@ -20,8 +20,8 @@ tray-icon = "0.26"
 global-hotkey = "0.8"
 cpal = "0.18"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString"] }
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem"] }
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFArray", "CFDictionary", "CFNumber", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventTypes", "CGRemoteOperation", "CGEventSource"] }
 objc2-application-services = { version = "0.3", features = ["HIServices", "AXUIElement", "AXError", "AXValue", "libc"] }

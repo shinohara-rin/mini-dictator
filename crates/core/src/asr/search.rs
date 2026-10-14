@@ -118,7 +118,7 @@ pub fn modified_beam_search_batch<M: TransducerModel + ?Sized>(
         tokens: Vec::new(),
         log_prob: 0.0,
         context_score: 0.0,
-        context_state: 0,
+        context_state: ContextState::default(),
     };
     let mut streams: Vec<Vec<Hyp>> = vec![vec![initial]; encoders.len()];
     let frames = encoders.iter().map(|e| e.frames).max().unwrap_or(0);

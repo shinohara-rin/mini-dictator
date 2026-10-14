@@ -80,7 +80,10 @@ enum State {
     Speech {
         samples: Vec<f32>,
         start_sample: u64,
+        /// Speech frames since the utterance started, across max-length cuts.
         speech_frames: usize,
+        /// Speech frames since the last max-length cut. A part without any is only silence.
+        part_speech_frames: usize,
         silence_frames: usize,
     },
 }
@@ -140,10 +143,18 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 mut samples,
                 start_sample,
                 speech_frames,
+                part_speech_frames,
                 silence_frames,
             } => {
                 samples.extend_from_slice(&tail);
-                self.close(samples, start_sample, speech_frames, silence_frames, false)
+                self.close(
+                    samples,
+                    start_sample,
+                    speech_frames,
+                    part_speech_frames,
+                    silence_frames,
+                    false,
+                )
             }
             State::Silence => None,
         };
@@ -170,6 +181,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                         samples,
                         start_sample,
                         speech_frames: 1,
+                        part_speech_frames: 1,
                         silence_frames: 0,
                     };
                 } else {
@@ -184,12 +196,14 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
             State::Speech {
                 samples,
                 speech_frames,
+                part_speech_frames,
                 silence_frames,
                 start_sample,
             } => {
                 samples.extend_from_slice(frame);
                 if probability >= self.config.threshold {
                     *speech_frames += 1;
+                    *part_speech_frames += 1;
                     *silence_frames = 0;
                 } else if probability < self.config.release_threshold || *silence_frames > 0 {
                     // Between the thresholds, a pause that has started keeps counting.
@@ -201,21 +215,32 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                         samples,
                         start_sample,
                         speech_frames,
+                        part_speech_frames,
                         silence_frames,
                     } = std::mem::replace(&mut self.state, State::Silence)
                     else {
                         unreachable!()
                     };
-                    return self.close(samples, start_sample, speech_frames, silence_frames, false);
+                    return self.close(
+                        samples,
+                        start_sample,
+                        speech_frames,
+                        part_speech_frames,
+                        silence_frames,
+                        false,
+                    );
                 }
                 if samples.len() >= max_samples {
                     let samples = std::mem::take(samples);
                     let start = *start_sample;
                     *start_sample += samples.len() as u64;
-                    // Speech goes on, so the counts carry over: the tail of a long utterance is
-                    // never dropped as too short.
-                    let (speech, silence) = (*speech_frames, *silence_frames);
-                    return self.close(samples, start, speech, silence, true);
+                    // Speech goes on, so the utterance's counts carry over: the tail of a long
+                    // utterance is never dropped as too short, and a pause in progress still ends
+                    // the utterance on time.
+                    let (speech, part_speech, silence) =
+                        (*speech_frames, *part_speech_frames, *silence_frames);
+                    *part_speech_frames = 0;
+                    return self.close(samples, start, speech, part_speech, silence, true);
                 }
                 None
             }
@@ -227,9 +252,14 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
         mut samples: Vec<f32>,
         start_sample: u64,
         speech_frames: usize,
+        part_speech_frames: usize,
         silence_frames: usize,
         truncated: bool,
     ) -> Option<SpeechSegment> {
+        // A part after a max-length cut that holds only the end of a pause has nothing to say.
+        if part_speech_frames == 0 {
+            return None;
+        }
         // Trailing silence beyond the post-roll carries no speech and only slows the decoder down.
         let trailing = silence_frames * self.vad.frame_size();
         let keep_trailing = Self::samples_for(self.config.post_roll_ms).min(trailing);
@@ -329,5 +359,34 @@ mod tests {
             .iter()
             .all(|s| s.truncated && s.samples.len() == 50 * 160));
         assert_eq!(segments[1].start_sample, 50 * 160);
+    }
+
+    #[test]
+    fn a_cut_during_a_pause_emits_no_silent_segment() {
+        let mut segmenter = Segmenter::new(
+            Scripted,
+            SegmenterConfig {
+                max_segment_ms: 500,
+                ..config()
+            },
+        );
+        // The cut lands 5 frames into a 10-frame pause, which then ends the utterance.
+        let segments = segmenter.push(&audio(&[(1.0, 45), (0.0, 30)]));
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].truncated);
+        // 45 speech frames and 1 post-roll frame; the rest of the pause is trimmed.
+        assert_eq!(segments[0].samples.len(), 46 * 160);
+        assert!(segmenter.finish().is_none());
+
+        // The same when the dictation ends during the pause.
+        let segments = segmenter.push(&audio(&[(1.0, 45), (0.0, 8)]));
+        assert_eq!(segments.len(), 1);
+        assert!(segmenter.finish().is_none());
+
+        // Speech after the pause is its own part.
+        let segments = segmenter.push(&audio(&[(1.0, 45), (0.0, 8), (1.0, 10), (0.0, 30)]));
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[1].start_sample, 50 * 160);
+        assert!(!segments[1].truncated);
     }
 }
