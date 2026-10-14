@@ -278,7 +278,8 @@ impl Matcher {
         }
     }
 
-    /// A click with a modifier-only hotkey down, as in Command-click, uses it for something else.
+    /// A click or scroll with a modifier-only hotkey down, as in Command-click or Control-scroll,
+    /// uses it for something else.
     pub fn mouse_down(&mut self) -> Option<Signal> {
         if self.hotkey.key.is_some() {
             return None;

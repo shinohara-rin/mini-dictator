@@ -28,7 +28,7 @@ enum Key {
         code: u16,
     },
     Modifiers(Held),
-    /// A mouse button went down. Never kept from other apps.
+    /// A mouse button went down or the wheel scrolled. Never kept from other apps.
     Click,
 }
 
@@ -37,7 +37,8 @@ const KEYS: CGEventMask = (1 << CGEventType::KeyDown.0)
     | (1 << CGEventType::FlagsChanged.0);
 const CLICKS: CGEventMask = (1 << CGEventType::LeftMouseDown.0)
     | (1 << CGEventType::RightMouseDown.0)
-    | (1 << CGEventType::OtherMouseDown.0);
+    | (1 << CGEventType::OtherMouseDown.0)
+    | (1 << CGEventType::ScrollWheel.0);
 
 /// Returns whether to keep the event from other apps.
 type Handler = Box<dyn FnMut(Key) -> bool>;
@@ -134,9 +135,10 @@ unsafe extern "C-unwind" fn on_event(
         CGEventType::FlagsChanged => {
             Key::Modifiers(Held::from_flags(CGEvent::flags(event_ref).bits()))
         }
-        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
-            Key::Click
-        }
+        CGEventType::LeftMouseDown
+        | CGEventType::RightMouseDown
+        | CGEventType::OtherMouseDown
+        | CGEventType::ScrollWheel => Key::Click,
         _ => return event.as_ptr(),
     };
     let passes = matches!(key, Key::Modifiers(_) | Key::Click);
