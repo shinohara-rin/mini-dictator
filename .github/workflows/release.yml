@@ -35,8 +35,9 @@ jobs:
             echo "::error::$TAG is not a version tag such as v0.2.0 or v0.2.0-rc.1"
             exit 1
           fi
-          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null || true)
-          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+          # gh prints the error body to stdout when the tag doesn't exist, so go by its exit status.
+          if tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null) \
+            && [ "$tagged" != "$GITHUB_SHA" ]; then
             echo "::error::$TAG points at $tagged, not the commit being built ($GITHUB_SHA). Run the workflow on $TAG instead."
             exit 1
           fi
