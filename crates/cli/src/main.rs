@@ -262,6 +262,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine {
         asr: recognizer,
         context: Box::new(mini_dictator_core::context::NoContext),
+        memory: Default::default(),
         rewriter,
         config,
     };

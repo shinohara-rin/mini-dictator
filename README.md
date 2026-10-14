@@ -25,7 +25,9 @@ Press ⌥Space to start and again to stop, or hold it while you speak. A soft ti
 microphone opens and a pop when it closes. The first run asks for microphone and accessibility
 permission; accessibility is needed both to read names from the focused window and to paste.
 Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens it): the
-model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite endpoint.
+model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite endpoint. Names seen
+on screen in the last few minutes count as well as the current window's; `screen_memory_seconds`
+sets how fast they fade (0 turns the memory off).
 
 To see what a dictation did, check Write Debug Log in the menu, or set `debug = true` to have it on
 from launch. It writes `debug.log` next to `config.toml`: the screen text and hotwords, each decode

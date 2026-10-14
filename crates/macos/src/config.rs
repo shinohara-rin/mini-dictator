@@ -23,6 +23,9 @@ pub struct Config {
     pub hotkey: String,
     /// Read the focused window for hotwords.
     pub read_screen: bool,
+    /// Remember names seen on screen for about this long (the half-life of their weight), sampling
+    /// the focused window every few seconds between dictations. 0 turns the memory off.
+    pub screen_memory_seconds: u64,
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
     /// Play a short sound when the microphone opens and closes.
@@ -69,6 +72,7 @@ impl Default for Config {
             onnxruntime: None,
             hotkey: "Alt+Space".into(),
             read_screen: true,
+            screen_memory_seconds: 60,
             share_screen_text: true,
             beep: true,
             debug: false,

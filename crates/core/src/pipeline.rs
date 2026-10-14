@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::asr::{Asr, Bias, EncoderOutput, EncoderStream, Hypothesis};
 use crate::audio::{AudioChunk, Resampler, SAMPLE_RATE};
-use crate::context::{rank_terms, ContextProvider, ScreenContext};
+use crate::context::{merge_terms, rank_terms, ContextProvider, ScreenContext, TermMemory};
 use crate::rewrite::{user_prompt, RewriteRequest, Rewriter};
 use crate::uncertainty::{self, format_for_llm, MonteCarloConfig, Uncertainty};
 use crate::vad::{Segmenter, SegmenterConfig, SpeechSegment, VoiceActivityDetector};
@@ -122,6 +122,8 @@ pub struct Timings {
 pub struct Engine {
     pub asr: Box<dyn Asr>,
     pub context: Box<dyn ContextProvider>,
+    /// Terms of recent screens. A shell that samples the screen between dictations fills it.
+    pub memory: Arc<TermMemory>,
     pub rewriter: Box<dyn Rewriter>,
     pub config: EngineConfig,
 }
@@ -131,7 +133,8 @@ impl Engine {
         self.config.debug.load(Ordering::Relaxed)
     }
 
-    /// Reads the screen and prepares its terms as hotwords. A failed read gives an empty context.
+    /// Reads the screen and prepares its terms, with the remembered ones, as hotwords. A failed read
+    /// gives an empty context.
     pub fn prepare(&self, events: &mut dyn FnMut(Event)) -> SessionContext {
         let started = Instant::now();
         let screen = self.context.snapshot().unwrap_or_else(|error| {
@@ -139,7 +142,13 @@ impl Engine {
             ScreenContext::empty()
         });
         let read = started.elapsed();
-        let hotwords: Vec<String> = rank_terms(&screen, self.config.max_hotwords)
+        let now = Instant::now();
+        // Every current term, so a remembered weight can lift one above the cut.
+        let current = rank_terms(&screen, usize::MAX);
+        // Recalled before this snapshot goes in, so the current screen does not count twice.
+        let recalled = self.memory.recall(now);
+        self.memory.observe(&current, now);
+        let hotwords: Vec<String> = merge_terms(current, recalled, self.config.max_hotwords)
             .into_iter()
             .map(|t| t.phrase)
             .collect();
@@ -589,9 +598,29 @@ mod tests {
                 },
             )),
             context: Box::new(Screen),
+            memory: Arc::default(),
             rewriter: Box::new(PassThrough),
             config: EngineConfig::default(),
         }
+    }
+
+    #[test]
+    fn hotwords_include_names_from_recent_screens() {
+        let engine = engine();
+        let start = Instant::now();
+        engine
+            .memory
+            .observe(&[], start - std::time::Duration::from_secs(5));
+        engine.memory.observe(
+            &[crate::context::Term {
+                phrase: "Airicraft".into(),
+                score: 1.0,
+                form: crate::context::TermForm::Name,
+            }],
+            start,
+        );
+        let session = engine.prepare(&mut |_| {});
+        assert_eq!(session.hotwords, vec!["Kitty", "Airicraft"]);
     }
 
     fn tone(seconds: f32) -> Vec<f32> {

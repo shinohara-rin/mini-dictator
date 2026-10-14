@@ -3,10 +3,13 @@
 //! A platform shell reads the focused window through its accessibility API (AX on macOS, UI
 //! Automation on Windows, AT-SPI on Linux), or with OCR when the app exposes no text, and returns a
 //! [`ScreenContext`]. [`rank_terms`] picks the names and rare terms in it. They bias the recognizer
-//! as hotwords and tell the rewrite model how the user spells things here.
+//! as hotwords and tell the rewrite model how the user spells things here. A [`TermMemory`] keeps
+//! the terms of the last few minutes of screens, weighted by how long each stayed on screen.
 
+mod memory;
 mod terms;
 
+pub use memory::{merge_terms, MemoryConfig, TermMemory};
 pub use terms::{rank_terms, Term, TermForm};
 
 use crate::Result;
