@@ -69,12 +69,7 @@ pub fn rank_terms(context: &ScreenContext, limit: usize) -> Vec<Term> {
         if let Some(label) = cjk_label(text) {
             found.push((label, TermForm::Label));
         }
-        // A label the scan above already found, quoted for example, is the same occurrence.
-        for (label, form) in rare_lowercase_labels(text) {
-            if !found.iter().any(|(p, _)| p.eq_ignore_ascii_case(&label)) {
-                found.push((label, form));
-            }
-        }
+        found.extend(rare_lowercase_labels(text));
         for (phrase, form) in found {
             let key = phrase.to_lowercase();
             let entry = scores.entry(key).or_insert_with(|| {
@@ -156,7 +151,9 @@ fn rare_lowercase_labels(text: &str) -> Vec<(String, TermForm)> {
     if text.split_whitespace().count() > PHRASE_WORDS {
         return Vec::new();
     }
-    latin_words(text)
+    // Quoted spans are already terms; only words outside them count here.
+    let (_, unquoted) = split_quoted(text);
+    latin_words(&unquoted)
         .into_iter()
         // All lowercase: a lower-camel word such as `myWidget` is already an identifier.
         .filter(|(_, _, word)| word.bytes().all(|b| b.is_ascii_lowercase()) && is_rare(word))
@@ -382,6 +379,12 @@ mod tests {
         assert_eq!(
             (found[0].phrase.as_str(), found[0].score),
             ("airicraft", 1.0)
+        );
+        // A repeat outside the quotes is a second occurrence.
+        let found = rank_terms(&screen(&[(Region::Window, "\"airicraft\" airicraft")]), 10);
+        assert_eq!(
+            (found[0].phrase.as_str(), found[0].score),
+            ("airicraft", 2.0)
         );
     }
 
