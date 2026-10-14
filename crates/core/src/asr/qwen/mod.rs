@@ -767,10 +767,24 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
+    // The start of the row as whole characters: a stretch can begin inside a character the
+    // reference began before `start`, so its bytes come first.
+    let continues = |id: u32| {
+        tokenizer
+            .bytes(id)
+            .first()
+            .is_some_and(|b| b & 0xC0 == 0x80)
+    };
+    let lead = (0..start.min(reference.len()))
+        .rev()
+        .find(|j| !continues(reference[*j]))
+        .unwrap_or(start.min(reference.len()));
     let whole = |tokens: &[(u32, f32)]| {
-        let bytes: Vec<u8> = tokens
+        let bytes: Vec<u8> = reference[lead..start.min(reference.len())]
             .iter()
-            .flat_map(|(id, _)| tokenizer.bytes(*id).iter().copied())
+            .copied()
+            .chain(tokens.iter().map(|(id, _)| *id))
+            .flat_map(|id| tokenizer.bytes(id).iter().copied())
             .collect();
         std::str::from_utf8(&bytes).is_ok()
     };
@@ -1309,6 +1323,16 @@ mod tests {
             stretch_end(&t, &stops, &mut swapped, &split_mark, 1),
             Some(Some(4))
         );
+        // A stretch from inside a character the reference began: its first bytes count.
+        let mid = [256, han[0], han[1], han[2], 258];
+        let other = ids("丫");
+        assert_eq!(other[..2], han[..2]);
+        let mut swapped = row(&[other[2], 257]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut swapped, &mid, 3),
+            Some(Some(4))
+        );
+        assert_eq!(swapped, row(&[other[2]]));
         // A word inserted before the reference's word.
         let mut inserted = row(&[258, 257]);
         assert_eq!(
