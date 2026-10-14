@@ -767,6 +767,10 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
+    // Past the reference's end, everything up to the stop is speech it may have missed.
+    if start >= reference.len() {
+        return (row.len() >= LOCAL_TOKENS).then_some(Some(reference.len()));
+    }
     // The start of the row as whole characters: a stretch can begin inside a character the
     // reference began before `start`, so its bytes come first.
     let continues = |id: u32| {
@@ -1333,6 +1337,15 @@ mod tests {
             Some(Some(4))
         );
         assert_eq!(swapped, row(&[other[2]]));
+        // Past the reference, punctuation and words go on to the stop.
+        let mut added = row(&[comma, 258]);
+        assert_eq!(stretch_end(&t, &stops, &mut added, &reference, 3), None);
+        let mut added = row(&[comma, 258, 300]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut added, &reference, 3),
+            Some(None)
+        );
+        assert_eq!(added, row(&[comma, 258]));
         // A word inserted before the reference's word.
         let mut inserted = row(&[258, 257]);
         assert_eq!(
