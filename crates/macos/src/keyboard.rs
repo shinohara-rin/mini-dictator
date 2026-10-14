@@ -20,10 +20,24 @@ use crate::hotkey::{Held, Hotkey, Matcher, Outcome, Recorder, Signal};
 
 /// A key event as the state machines take it.
 enum Key {
-    Down { code: u16, repeat: bool },
-    Up { code: u16 },
+    Down {
+        code: u16,
+        repeat: bool,
+    },
+    Up {
+        code: u16,
+    },
     Modifiers(Held),
+    /// A mouse button went down. Never kept from other apps.
+    Click,
 }
+
+const KEYS: CGEventMask = (1 << CGEventType::KeyDown.0)
+    | (1 << CGEventType::KeyUp.0)
+    | (1 << CGEventType::FlagsChanged.0);
+const CLICKS: CGEventMask = (1 << CGEventType::LeftMouseDown.0)
+    | (1 << CGEventType::RightMouseDown.0)
+    | (1 << CGEventType::OtherMouseDown.0);
 
 /// Returns whether to keep the event from other apps.
 type Handler = Box<dyn FnMut(Key) -> bool>;
@@ -43,10 +57,7 @@ struct Tap {
 
 impl Tap {
     /// `None` when the tap cannot be created, which means the app lacks Accessibility.
-    fn new(handler: Handler) -> Option<Tap> {
-        let mask: CGEventMask = (1 << CGEventType::KeyDown.0)
-            | (1 << CGEventType::KeyUp.0)
-            | (1 << CGEventType::FlagsChanged.0);
+    fn new(mask: CGEventMask, handler: Handler) -> Option<Tap> {
         let state = Box::into_raw(Box::new(TapState {
             handler,
             port: None,
@@ -123,10 +134,13 @@ unsafe extern "C-unwind" fn on_event(
         CGEventType::FlagsChanged => {
             Key::Modifiers(Held::from_flags(CGEvent::flags(event_ref).bits()))
         }
+        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            Key::Click
+        }
         _ => return event.as_ptr(),
     };
-    let modifiers = matches!(key, Key::Modifiers(_));
-    if (state.handler)(key) && !modifiers {
+    let passes = matches!(key, Key::Modifiers(_) | Key::Click);
+    if (state.handler)(key) && !passes {
         null_mut()
     } else {
         event.as_ptr()
@@ -152,20 +166,24 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
     );
     let matcher = Rc::new(RefCell::new(Matcher::new(hotkey, held)));
     let shared = matcher.clone();
-    let tap = Tap::new(Box::new(move |key| {
-        let (signal, swallow) = {
-            let mut matcher = shared.borrow_mut();
-            match key {
-                Key::Down { code, repeat } => matcher.key_down(code, repeat),
-                Key::Up { code } => matcher.key_up(code),
-                Key::Modifiers(held) => (matcher.modifiers_changed(held), false),
+    let tap = Tap::new(
+        KEYS | CLICKS,
+        Box::new(move |key| {
+            let (signal, swallow) = {
+                let mut matcher = shared.borrow_mut();
+                match key {
+                    Key::Down { code, repeat } => matcher.key_down(code, repeat),
+                    Key::Up { code } => matcher.key_up(code),
+                    Key::Modifiers(held) => (matcher.modifiers_changed(held), false),
+                    Key::Click => (matcher.mouse_down(), false),
+                }
+            };
+            if let Some(signal) = signal {
+                on_signal(signal);
             }
-        };
-        if let Some(signal) = signal {
-            on_signal(signal);
-        }
-        swallow
-    }))?;
+            swallow
+        }),
+    )?;
     Some(Listener { _tap: tap, matcher })
 }
 
@@ -179,19 +197,23 @@ pub struct Capture {
 pub fn record(mut on_outcome: impl FnMut(Outcome) + 'static) -> Option<Capture> {
     let mut recorder = Recorder::default();
     let mut done = false;
-    let tap = Tap::new(Box::new(move |key| {
-        if !done {
-            let outcome = match key {
-                Key::Down { code, repeat } => recorder.key_down(code, repeat),
-                Key::Up { code } => recorder.key_up(code),
-                Key::Modifiers(held) => recorder.modifiers_changed(held),
-            };
-            if let Some(outcome) = outcome {
-                done = !matches!(outcome, Outcome::NeedsModifier);
-                on_outcome(outcome);
+    let tap = Tap::new(
+        KEYS,
+        Box::new(move |key| {
+            if !done {
+                let outcome = match key {
+                    Key::Down { code, repeat } => recorder.key_down(code, repeat),
+                    Key::Up { code } => recorder.key_up(code),
+                    Key::Modifiers(held) => recorder.modifiers_changed(held),
+                    Key::Click => None,
+                };
+                if let Some(outcome) = outcome {
+                    done = !matches!(outcome, Outcome::NeedsModifier);
+                    on_outcome(outcome);
+                }
             }
-        }
-        true
-    }))?;
+            true
+        }),
+    )?;
     Some(Capture { _tap: tap })
 }

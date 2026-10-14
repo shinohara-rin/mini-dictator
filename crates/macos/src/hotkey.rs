@@ -262,6 +262,15 @@ impl Matcher {
         }
     }
 
+    /// A click with a modifier-only hotkey down, as in Command-click, uses it for something else.
+    pub fn mouse_down(&mut self) -> Option<Signal> {
+        if self.hotkey.key.is_some() {
+            return None;
+        }
+        self.armed = false;
+        std::mem::take(&mut self.active).then_some(Signal::Interrupted)
+    }
+
     pub fn key_up(&mut self, code: u16) -> (Option<Signal>, bool) {
         if self.hotkey.key == Some(code) && self.active {
             self.active = false;
@@ -315,6 +324,8 @@ pub struct Recorder {
     /// Every modifier held since the keyboard was last empty.
     peak: Held,
     keys: HashSet<u16>,
+    /// The last named key pressed, while it is still down.
+    last_key: Option<u16>,
     pressed_key: bool,
     combination: Option<Hotkey>,
 }
@@ -331,6 +342,7 @@ impl Recorder {
         self.pressed_key = true;
         // A key with no name here, such as Fn, leaves the combination as it was.
         key_name(code)?;
+        self.last_key = Some(code);
         if self.held.is_empty() && !is_function_key(code) {
             self.combination = None;
             return Some(Outcome::NeedsModifier);
@@ -341,12 +353,19 @@ impl Recorder {
 
     pub fn key_up(&mut self, code: u16) -> Option<Outcome> {
         self.keys.remove(&code);
+        if self.last_key == Some(code) {
+            self.last_key = None;
+        }
         self.finish()
     }
 
     pub fn modifiers_changed(&mut self, held: Held) -> Option<Outcome> {
         self.held = held;
         self.peak = self.peak.union(held);
+        // A modifier added to a key already held, as the menu asks after a bare letter.
+        if let (None, Some(code), false) = (self.combination, self.last_key, held.is_empty()) {
+            self.combination = Some(Hotkey::recorded(held, Some(code)));
+        }
         self.finish()
     }
 
@@ -691,6 +710,32 @@ mod tests {
             recorder.key_up(KEY_F5),
             Some(Outcome::Recorded(hotkey("F5")))
         );
+    }
+
+    #[test]
+    fn a_modifier_added_to_a_held_letter_records_both() {
+        let mut recorder = Recorder::default();
+        assert_eq!(
+            recorder.key_down(KEY_D, false),
+            Some(Outcome::NeedsModifier)
+        );
+        assert_eq!(recorder.modifiers_changed(held(&[], &[COMMAND])), None);
+        assert_eq!(recorder.key_up(KEY_D), None);
+        assert_eq!(
+            recorder.modifiers_changed(Held::default()),
+            Some(Outcome::Recorded(hotkey("RightCmd+D")))
+        );
+    }
+
+    #[test]
+    fn a_click_interrupts_a_lone_modifier() {
+        let mut matcher = Matcher::new(hotkey("RightCmd"), Held::default());
+        matcher.modifiers_changed(held(&[], &[COMMAND]));
+        assert_eq!(matcher.mouse_down(), Some(Signal::Interrupted));
+        assert_eq!(matcher.modifiers_changed(Held::default()), None);
+
+        let mut matcher = Matcher::new(hotkey("Alt+Space"), Held::default());
+        assert_eq!(matcher.mouse_down(), None);
     }
 
     #[test]
