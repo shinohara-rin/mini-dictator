@@ -15,8 +15,8 @@ Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](do
 ## macOS
 
 ```sh
-scripts/fetch-models.sh      # Qwen3-ASR 0.6B (about 1 GB) and Silero VAD into ~/Library/Application Support/Mini Dictator/models
-scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime inside
+scripts/fetch-models.sh      # Qwen3-ASR 0.6B (about 1 GB), Silero VAD, and Gemma 4 E2B (about 3.7 GB) into ~/Library/Application Support/Mini Dictator/models
+scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime and llama.cpp's server inside
 open "target/release/Mini Dictator.app"
 ```
 
@@ -27,6 +27,13 @@ Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the 
 model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite endpoint. Names seen
 on screen in the last few minutes count as well as the current window's; `screen_memory_seconds`
 sets how fast they fade (0 turns the memory off).
+
+The rewrite runs on the Mac by default: the app starts the bundled llama.cpp server with Gemma 4 E2B,
+which reads the transcript and also hears the recording, so it can fix names and words the
+recognizer misheard. It loads at launch, uses about 4 GB of memory while the app runs, and stops
+when the app quits. Set `builtin = false` under `[rewrite]` to send the rewrite to `base_url`
+instead (`send_audio = true` attaches the recording there too), or turn Rewrite off in the menu.
+`fetch-models.sh` with `REWRITER=0` skips the Gemma download.
 
 To see what a dictation did, check Write Debug Log in the menu, or set `debug = true` to have it on
 from launch. It writes `debug.log` next to `config.toml`: the screen text and hotwords, each decode
@@ -52,7 +59,10 @@ The `--model` directory decides the backend. With a transducer such as
 
 Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run
 the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at
-`http://localhost:11434/v1`.
+`http://localhost:11434/v1`. To run the built-in rewriter instead, pass a `llama-server` from a
+[llama.cpp release](https://github.com/ggml-org/llama.cpp/releases) and the Gemma files:
+`--llama-server path/to/llama-server --rewrite-gguf models/gemma-4-E2B-it-Q4_K_M.gguf
+--rewrite-mmproj models/mmproj-gemma-4-E2B-it-Q8_0.gguf`.
 
 ## Develop
 

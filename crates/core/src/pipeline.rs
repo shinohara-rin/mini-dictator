@@ -206,6 +206,7 @@ impl Engine {
 
     pub fn rewrite_request(
         &self,
+        segment: &SpeechSegment,
         transcript: &Transcript,
         session: &SessionContext,
     ) -> RewriteRequest {
@@ -223,6 +224,7 @@ impl Engine {
                 String::new()
             },
             session_text: session.inserted.clone(),
+            audio: segment.samples.clone(),
         }
     }
 
@@ -256,7 +258,7 @@ impl Engine {
         if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
         }
-        let request = self.rewrite_request(&transcript, session);
+        let request = self.rewrite_request(segment, &transcript, session);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
         if self.debug() {

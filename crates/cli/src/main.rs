@@ -4,8 +4,12 @@
 //! md --model <dir> --wav <file> [--vad silero_vad.onnx | --whole] [--ort libonnxruntime.so] [--threads 4]
 //!    [--hotword <phrase>]... [--screen <text file>] [--beam 4] [--boost 1.5]
 //!    [--samples N] [--sigma X] [--no-early-stop] [--seed N]   (defaults depend on the model)
-//!    [--rewrite-url <base url> --rewrite-model <name>]   (API key from MD_API_KEY)
+//!    [--rewrite-url <base url> --rewrite-model <name> [--rewrite-audio]]   (API key from MD_API_KEY)
+//!    [--llama-server <binary> --rewrite-gguf <model.gguf> [--rewrite-mmproj <mmproj.gguf>]]
 //! ```
+//!
+//! `--llama-server` runs the built-in rewriter: llama.cpp's server with a local model such as
+//! Gemma 4 E2B, which also hears each segment when given its audio projector.
 //!
 //! The model directory holds a Qwen3-ASR export or a transducer; `--beam` and `--boost` apply to
 //! transducers.
@@ -41,6 +45,11 @@ struct Args {
     whole: bool,
     rewrite_url: Option<String>,
     rewrite_model: Option<String>,
+    /// Attach each segment's audio to the endpoint request.
+    rewrite_audio: bool,
+    llama_server: Option<PathBuf>,
+    rewrite_gguf: Option<PathBuf>,
+    rewrite_mmproj: Option<PathBuf>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -52,6 +61,8 @@ fn parse() -> Result<Args, String> {
     let mut search = SearchConfig::default();
     let (mut samples, mut sigma, mut seed, mut early_stop) = (None, None, None, true);
     let mut whole = false;
+    let (mut rewrite_audio, mut llama_server, mut rewrite_gguf, mut rewrite_mmproj) =
+        (false, None, None, None);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<f32>().map_err(|e| format!("{flag}: {e}"));
@@ -73,6 +84,10 @@ fn parse() -> Result<Args, String> {
             "--whole" => whole = true,
             "--rewrite-url" => rewrite_url = Some(value()?),
             "--rewrite-model" => rewrite_model = Some(value()?),
+            "--rewrite-audio" => rewrite_audio = true,
+            "--llama-server" => llama_server = Some(PathBuf::from(value()?)),
+            "--rewrite-gguf" => rewrite_gguf = Some(PathBuf::from(value()?)),
+            "--rewrite-mmproj" => rewrite_mmproj = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -92,7 +107,41 @@ fn parse() -> Result<Args, String> {
         whole,
         rewrite_url,
         rewrite_model,
+        rewrite_audio,
+        llama_server,
+        rewrite_gguf,
+        rewrite_mmproj,
     })
+}
+
+#[cfg(unix)]
+fn builtin_rewriter(args: &Args) -> Result<Option<Box<dyn Rewriter>>, String> {
+    use mini_dictator_core::rewrite::{Builtin, LlamaServer};
+    let Some(binary) = &args.llama_server else {
+        return Ok(None);
+    };
+    let model = args
+        .rewrite_gguf
+        .clone()
+        .ok_or("--llama-server needs --rewrite-gguf")?;
+    let started = Instant::now();
+    let rewriter = Builtin::new(LlamaServer {
+        binary: binary.clone(),
+        model,
+        mmproj: args.rewrite_mmproj.clone(),
+        log: Some(std::env::temp_dir().join("md-llama-server.log")),
+    });
+    rewriter.start().map_err(|e| e.to_string())?;
+    eprintln!("started llama-server in {}", ms(started.elapsed()));
+    Ok(Some(Box::new(rewriter)))
+}
+
+#[cfg(not(unix))]
+fn builtin_rewriter(args: &Args) -> Result<Option<Box<dyn Rewriter>>, String> {
+    match args.llama_server {
+        Some(_) => Err("the built-in rewriter needs a Unix system".into()),
+        None => Ok(None),
+    }
 }
 
 fn read_wav(path: &PathBuf) -> Result<AudioChunk, String> {
@@ -142,7 +191,7 @@ fn main() {
     let args = match parse() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
+            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME [--rewrite-audio]] [--llama-server BIN --rewrite-gguf GGUF [--rewrite-mmproj GGUF]]");
             std::process::exit(2);
         }
     };
@@ -168,9 +217,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             api_key: std::env::var("MD_API_KEY").ok(),
             model: model.clone(),
             timeout: Duration::from_secs(20),
+            send_audio: args.rewrite_audio,
         }),
-        _ => Box::new(PassThrough),
+        _ => match builtin_rewriter(&args)? {
+            Some(rewriter) => rewriter,
+            None => Box::new(PassThrough),
+        },
     };
+    let rewrites = args.rewrite_url.is_some() || args.llama_server.is_some();
     let mut monte_carlo = recognizer.monte_carlo();
     monte_carlo.samples = args.samples.unwrap_or(monte_carlo.samples);
     monte_carlo.relative_sigma = args.sigma.unwrap_or(monte_carlo.relative_sigma);
@@ -282,8 +336,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         };
         println!("  plain:  {}", transcript.reference.text());
         println!("  marked: {}", transcript.marked);
-        if args.rewrite_url.is_some() {
-            let request = engine.rewrite_request(&transcript, &session);
+        if rewrites {
+            let request = engine.rewrite_request(segment, &transcript, &session);
             let started = Instant::now();
             match engine.rewriter.rewrite(&request) {
                 Ok(text) => {
