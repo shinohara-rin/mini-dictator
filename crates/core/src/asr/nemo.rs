@@ -773,8 +773,9 @@ impl EncoderStream for NemoStream<'_> {
             return Ok(());
         }
         self.finished = true;
-        // Pad with silence so that the last window covers every frame of the audio, and drop the
-        // windows that would hold only padding.
+        // Pad with silence so that the last window covers every frame of the audio, then run one
+        // more chunk, where the model writes the tokens of the audio's end (see `take`). Later
+        // windows would hold only padding.
         let meta = self.model.meta.clone();
         let real = self.model.fbank.frame_count(self.sample_count());
         let last_window = real.saturating_sub(meta.window).div_ceil(meta.shift) * meta.shift;
@@ -782,7 +783,7 @@ impl EncoderStream for NemoStream<'_> {
             self.samples.len() + (meta.window + meta.shift) * FEATURE_SHIFT,
             0.0,
         );
-        self.advance(last_window + meta.window)
+        self.advance(last_window + meta.window + meta.shift)
     }
 
     fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput> {
