@@ -107,6 +107,11 @@ pub struct Hotkey {
 }
 
 impl Hotkey {
+    /// Whether the hotkey is modifiers alone, so a press may turn out to be part of a shortcut.
+    pub fn is_modifier_only(&self) -> bool {
+        self.key.is_none()
+    }
+
     /// What the recorder saw: Option and Command keep their side, Control and Shift match
     /// either, since few keyboards tell those apart by feel.
     fn recorded(held: Held, key: Option<u16>) -> Self {

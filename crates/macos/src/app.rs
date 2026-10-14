@@ -295,6 +295,8 @@ pub fn run() {
     let mut listener: Option<Listener> = None;
     // Whether the hotkey press still held down started the dictation.
     let mut started_by_press = false;
+    // Whether the lone-modifier press still held down stops the dictation once it is let go.
+    let mut stop_on_release = false;
 
     let vad_path = config
         .vad_model
@@ -360,6 +362,7 @@ pub fn run() {
             Event::UserEvent(AppEvent::HotKey(signal)) if capture.is_none() => {
                 let Some(ui) = &ui else { return };
                 let by_press = std::mem::take(&mut started_by_press);
+                let pending_stop = std::mem::take(&mut stop_on_release);
                 match (signal, &dictation) {
                     (Signal::Pressed, None) if !busy => {
                         if let Some(engine) = &engine {
@@ -368,7 +371,13 @@ pub fn run() {
                             started_by_press = busy;
                         }
                     }
+                    // A lone modifier may be the start of a shortcut such as Command-C, so it
+                    // stops only when let go without one.
+                    (Signal::Pressed, Some(_)) if hotkey.is_modifier_only() => {
+                        stop_on_release = true;
+                    }
                     (Signal::Pressed, Some(_)) => stop(&mut dictation, ui),
+                    (Signal::Released, Some(_)) if pending_stop => stop(&mut dictation, ui),
                     (Signal::Released, Some(current))
                         if current.pressed_at.elapsed() >= HOLD_THRESHOLD =>
                     {
