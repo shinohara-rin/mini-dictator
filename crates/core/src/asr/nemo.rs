@@ -807,13 +807,17 @@ impl EncoderStream for NemoStream<'_> {
         let frames = self.slice(start.max(self.taken), end);
         self.taken = end;
         // Later segments start at `taken` or after it.
+        self.discard(end);
+        Some(frames)
+    }
+
+    fn discard(&mut self, before: u64) {
         let (dim, frame_samples) = (self.encoder_dim(), self.model.meta.frame_samples() as u64);
         let done = (self.dropped_frames..self.encoder_frames())
-            .take_while(|&i| self.frame_start(i) + frame_samples <= self.taken)
+            .take_while(|&i| self.frame_start(i) + frame_samples <= before)
             .count();
         self.frames.drain(..done * dim);
         self.dropped_frames += done;
-        Some(frames)
     }
 }
 

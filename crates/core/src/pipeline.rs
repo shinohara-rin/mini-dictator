@@ -501,6 +501,9 @@ pub fn run_dictation<V: VoiceActivityDetector>(
             sink,
             events,
         )?;
+        if let (Some(s), true) = (stream.as_deref_mut(), waiting.is_empty()) {
+            s.discard(segmenter.earliest_start());
+        }
     }
     waiting.extend(segmenter.finish());
     feed(&mut stream, |s| s.finish(), events);

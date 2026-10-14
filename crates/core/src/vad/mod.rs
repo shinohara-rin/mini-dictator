@@ -135,6 +135,15 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
         segments
     }
 
+    /// The first sample that a segment still to come can start at: the open utterance's start,
+    /// or the oldest pre-roll sample.
+    pub fn earliest_start(&self) -> u64 {
+        match &self.state {
+            State::Speech { start_sample, .. } => *start_sample,
+            State::Silence => self.processed - self.pre_roll.len() as u64,
+        }
+    }
+
     /// Ends the dictation. Speech in progress becomes a segment if it is long enough.
     pub fn finish(&mut self) -> Option<SpeechSegment> {
         let tail = std::mem::take(&mut self.pending);
@@ -326,6 +335,15 @@ mod tests {
         assert_eq!(segment.start_sample, 28 * 160);
         // 2 pre-roll frames, 35 frames of speech and pause, 1 post-roll frame.
         assert_eq!(segment.samples.len(), (2 + 35 + 1) * 160);
+    }
+
+    #[test]
+    fn earliest_start_trails_by_the_pre_roll_or_holds_the_open_utterance() {
+        let mut segmenter = Segmenter::new(Scripted, config());
+        segmenter.push(&audio(&[(0.0, 30)]));
+        assert_eq!(segmenter.earliest_start(), 28 * 160);
+        segmenter.push(&audio(&[(1.0, 5), (0.0, 1)]));
+        assert_eq!(segmenter.earliest_start(), 28 * 160);
     }
 
     #[test]

@@ -141,6 +141,10 @@ pub trait EncoderStream {
     /// sound, so the frames run past the segment's end, and the next segment's frames begin
     /// where these end. Segments come in order.
     fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput>;
+    /// No segment will start before sample `before`, so the stream may drop what lies there.
+    fn discard(&mut self, before: u64) {
+        let _ = before;
+    }
 }
 
 /// Loads the recognizer in a sherpa-onnx model directory: Qwen3-ASR when the directory has its
