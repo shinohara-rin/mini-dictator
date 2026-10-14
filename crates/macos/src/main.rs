@@ -14,6 +14,8 @@ mod icons;
 #[cfg(target_os = "macos")]
 mod paste;
 #[cfg(target_os = "macos")]
+mod permissions;
+#[cfg(target_os = "macos")]
 mod sound;
 #[cfg(target_os = "macos")]
 mod switches;
