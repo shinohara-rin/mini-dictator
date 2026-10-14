@@ -769,15 +769,26 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
-    let text = |id: u32| String::from_utf8_lossy(tokenizer.bytes(id)).into_owned();
-    let punctuation = |id: u32| {
-        let text = text(id);
-        !text.trim().is_empty() && text.trim().chars().all(is_punctuation)
+    let ids: Vec<u32> = row.iter().map(|(id, _)| *id).collect();
+    // Only punctuation, which can take several tokens, even for one character.
+    let punctuation = |ids: &[u32]| {
+        let bytes: Vec<u8> = ids
+            .iter()
+            .flat_map(|id| tokenizer.bytes(*id).iter().copied())
+            .collect();
+        std::str::from_utf8(&bytes)
+            .is_ok_and(|text| !text.trim().is_empty() && text.trim().chars().all(is_punctuation))
     };
-    // Punctuation, then the reference's word: the punctuation goes in front of the word.
-    if row.len() == 2 && punctuation(row[0].0) && reference.get(start) == Some(&last) {
-        row.pop();
-        return Some(Some(start));
+    // Punctuation where the reference has a word: the token after it shows whether the row puts
+    // it in front of that word, an insertion.
+    if reference.get(start).is_some_and(|r| !punctuation(&[*r])) {
+        if ids.len() >= 2 && punctuation(&ids[..ids.len() - 1]) && reference[start] == last {
+            row.pop();
+            return Some(Some(start));
+        }
+        if punctuation(&ids) && ids.len() < LOCAL_TOKENS {
+            return None;
+        }
     }
     // Back on the reference: two tokens in a row match it, or one whole word does at most one
     // reference word on, as when the row skips a comma or reads two characters as one word. One
@@ -806,15 +817,8 @@ fn stretch_end(
             .collect();
         std::str::from_utf8(&bytes).is_ok()
     };
-    // Punctuation where the reference has a word: the token after it shows whether the row puts
-    // it in front of that word.
-    if row.len() == 1 && punctuation(last) && reference.get(start).is_some_and(|r| !punctuation(*r))
-    {
-        return None;
-    }
     // The word ended when the next one begins: the row's word stands for the reference's. A
     // character split over tokens shows whether it begins a word only once its last byte is in.
-    let ids: Vec<u32> = row.iter().map(|(id, _)| *id).collect();
     let next = (ids.len().saturating_sub(4).max(1)..ids.len()).find(|k| {
         starts_word(tokenizer, Some(ids[*k - 1]), ids[*k], &ids[*k + 1..]) && whole(&row[..*k])
     });
@@ -1212,6 +1216,20 @@ mod tests {
             Some(Some(1))
         );
         assert_eq!(inserted, row(&[comma]));
+        // Also punctuation split over tokens, or more than one mark.
+        let wide = ids("，");
+        assert_eq!(wide.len(), 3);
+        let mut inserted = row(&[wide[0], wide[1], wide[2], 257]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &reference, 1),
+            Some(Some(1))
+        );
+        assert_eq!(inserted, row(&wide));
+        let mut inserted = row(&[comma, comma, 257]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &reference, 1),
+            Some(Some(1))
+        );
         let mut ended = row(&[comma, 300]);
         assert_eq!(
             stretch_end(&t, &stops, &mut ended, &reference, 1),
