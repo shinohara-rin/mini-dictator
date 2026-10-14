@@ -32,6 +32,13 @@ hotkey up ─► Segmenter::finish() flushes the last utterance
 channel and drops the sender on hotkey up. The context snapshot happens before anything is decoded,
 so a slow accessibility read costs no audio: blocks wait in the channel.
 
+The channel is unbounded and nothing is dropped, because the audio callback must not block. A device
+slower than realtime instead sheds work: a segment that reaches the recognizer more than
+`max_lag_seconds` (2 s) after its audio ended skips the noisy decodes, and the tray says it is
+catching up. A segment that keeps up arrives about half a second after its audio ends, so the check
+comes back as soon as the backlog is gone. The clean decode always runs. Each block carries the time
+it was recorded, so the lag also counts audio that waited while the worker loaded the VAD.
+
 ## Modules
 
 | Module | Role | Main types |
@@ -128,6 +135,7 @@ This costs much more than for a transducer, because each noisy decode reruns the
 4-core container, a 6 s utterance takes about 0.5 s to encode and 3 to 4 s to decode (a 1.4 s prompt
 pass, then about 80 ms per token), and 4 noisy decodes take 10 to 14 s. Apple silicon should be
 several times faster; measure there before tuning, and set `samples = 0` to turn the check off.
+When the device falls behind, late segments skip the check (see above).
 
 ### Active context
 

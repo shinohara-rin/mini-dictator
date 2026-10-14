@@ -6,9 +6,10 @@
 //! slow accessibility read delays nothing: audio waits in the channel.
 
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 use crate::asr::{Asr, Bias, Hypothesis};
-use crate::audio::{AudioChunk, Resampler};
+use crate::audio::{AudioChunk, Resampler, SAMPLE_RATE};
 use crate::context::{rank_terms, ContextProvider, ScreenContext};
 use crate::rewrite::{RewriteRequest, Rewriter};
 use crate::uncertainty::{self, format_for_llm, MonteCarloConfig, Uncertainty};
@@ -32,6 +33,9 @@ pub enum Event {
         plain: String,
         marked: String,
         unclear_spans: usize,
+        /// Set when the segment reached the recognizer this many seconds after its audio ended,
+        /// later than [`EngineConfig::max_lag_seconds`], and skipped the uncertainty check.
+        behind_seconds: Option<f32>,
     },
     Inserted {
         text: String,
@@ -45,6 +49,11 @@ pub enum Event {
 pub struct EngineConfig {
     pub segmenter: SegmenterConfig,
     pub monte_carlo: MonteCarloConfig,
+    /// A segment that reaches the recognizer more than this many seconds after its audio ended
+    /// skips the uncertainty check. On a device slower than realtime the noisy decodes would
+    /// otherwise make each segment wait longer than the last; skipping them lets it catch up, and
+    /// the check runs again once it has. Audio is never dropped.
+    pub max_lag_seconds: f32,
     /// Screen terms used as hotwords and shown to the rewrite model.
     pub max_hotwords: usize,
     /// Send focused-field text to the rewrite model. Hotwords are sent either way.
@@ -58,6 +67,8 @@ impl Default for EngineConfig {
         Self {
             segmenter: SegmenterConfig::default(),
             monte_carlo: MonteCarloConfig::default(),
+            // A segment that keeps up arrives about `min_silence_ms` after its audio ends.
+            max_lag_seconds: 2.0,
             max_hotwords: 100,
             share_screen_text: true,
             preceding_chars: 400,
@@ -109,19 +120,29 @@ impl Engine {
         }
     }
 
+    /// Decodes one segment, with the uncertainty check when `check` is true.
     pub fn transcribe(
         &self,
         segment: &SpeechSegment,
         session: &SessionContext,
+        check: bool,
     ) -> Result<Transcript> {
         let encoder = self.asr.encode(&segment.samples)?;
         let reference = self.asr.decode_one(&encoder, &session.bias)?;
+        let unchecked = MonteCarloConfig {
+            samples: 0,
+            ..self.config.monte_carlo.clone()
+        };
         let uncertainty = uncertainty::estimate(
             self.asr.as_ref(),
             &encoder,
             &reference,
             &session.bias,
-            &self.config.monte_carlo,
+            if check {
+                &self.config.monte_carlo
+            } else {
+                &unchecked
+            },
         )?;
         let marked = format_for_llm(&reference, &uncertainty.analysis.spans);
         Ok(Transcript {
@@ -153,20 +174,24 @@ impl Engine {
         }
     }
 
-    /// Decodes, rewrites, and inserts one segment. Returns the inserted text, if any.
+    /// Decodes, rewrites, and inserts one segment. `lag_seconds` is how long ago its audio ended.
+    /// Returns the inserted text, if any.
     pub fn process(
         &self,
         segment: &SpeechSegment,
+        lag_seconds: f32,
         session: &mut SessionContext,
         sink: &mut dyn TextSink,
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<String>> {
-        let transcript = self.transcribe(segment, session)?;
+        let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
+        let transcript = self.transcribe(segment, session, behind_seconds.is_none())?;
         let plain = transcript.reference.text();
         events(Event::Transcribed {
             plain: plain.clone(),
             marked: transcript.marked.clone(),
             unclear_spans: transcript.uncertainty.analysis.spans.len(),
+            behind_seconds,
         });
         if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
@@ -198,6 +223,14 @@ impl Engine {
     }
 }
 
+/// How long ago a segment's last sample was recorded: the age of the latest block plus the audio
+/// after the segment. Timing each block keeps this right when the worker starts after the
+/// microphone, or capture starts late.
+fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
+    let end = segment.start_sample + segment.samples.len() as u64;
+    captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
+}
+
 fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF)
 }
@@ -216,14 +249,18 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     });
     let mut segmenter = Segmenter::new(vad, engine.config.segmenter.clone());
     let mut resampler = Resampler::default();
+    // Samples heard so far, and when the last of them was recorded.
+    let mut clock = (0, Instant::now());
 
     for chunk in audio {
-        for segment in segmenter.push(&chunk.to_model_input(&mut resampler)) {
-            engine.process(&segment, &mut session, sink, events)?;
+        let samples = chunk.to_model_input(&mut resampler);
+        clock = (clock.0 + samples.len() as u64, chunk.captured);
+        for segment in segmenter.push(&samples) {
+            engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
         }
     }
     if let Some(segment) = segmenter.finish() {
-        engine.process(&segment, &mut session, sink, events)?;
+        engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
     }
     events(Event::Finished);
     Ok(session.inserted)
@@ -231,6 +268,8 @@ pub fn run_dictation<V: VoiceActivityDetector>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::asr::{EncoderOutput, Recognizer, SearchConfig, SymbolTable, TransducerModel};
     use crate::context::{ContextSource, Region, TextBlock};
@@ -295,11 +334,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dictates_each_utterance_into_the_sink() {
+    fn engine() -> Engine {
         let symbols =
             SymbolTable::from_lines(["<blk> 0", "▁HELLO 1", "▁KITTY 2"].map(String::from));
-        let engine = Engine {
+        Engine {
             asr: Box::new(Recognizer::new(
                 LoudnessModel,
                 symbols,
@@ -311,13 +349,18 @@ mod tests {
             context: Box::new(Screen),
             rewriter: Box::new(PassThrough),
             config: EngineConfig::default(),
-        };
+        }
+    }
+
+    fn tone(seconds: f32) -> Vec<f32> {
+        (0..(48_000.0 * seconds) as usize)
+            .map(|i| 0.3 * (i as f32 * 0.05).sin())
+            .collect()
+    }
+
+    /// Two utterances, all recorded at `captured`.
+    fn speech(captured: Instant) -> Receiver<AudioChunk> {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let tone = |seconds: f32| {
-            (0..(48_000.0 * seconds) as usize)
-                .map(|i| 0.3 * (i as f32 * 0.05).sin())
-                .collect::<Vec<f32>>()
-        };
         for samples in [
             vec![0.0; 24_000],
             tone(1.0),
@@ -330,17 +373,22 @@ mod tests {
                     samples,
                     sample_rate: 48_000,
                     channels: 1,
+                    captured,
                 })
                 .unwrap();
         }
-        drop(sender);
+        receiver
+    }
 
+    #[test]
+    fn dictates_each_utterance_into_the_sink() {
+        let engine = engine();
         let mut sink = Collect(Vec::new());
         let mut events = Vec::new();
         let text = run_dictation(
             &engine,
             crate::vad::EnergyVad::default(),
-            receiver,
+            speech(Instant::now()),
             &mut sink,
             &mut |e| events.push(e),
         )
@@ -351,5 +399,84 @@ mod tests {
             matches!(events[0], Event::Listening { hotwords: 1 }),
             "{events:?}"
         );
+        // The audio was all recorded just now, so no segment came in late.
+        assert!(events.iter().all(|e| !matches!(
+            e,
+            Event::Transcribed {
+                behind_seconds: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn lag_counts_from_when_the_audio_was_recorded() {
+        // The microphone records while the worker still loads the VAD, so audio can wait before
+        // the dictation starts.
+        let mut behind = Vec::new();
+        run_dictation(
+            &engine(),
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now() - Duration::from_secs(5)),
+            &mut Collect(Vec::new()),
+            &mut |e| {
+                if let Event::Transcribed { behind_seconds, .. } = e {
+                    behind.push(behind_seconds);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(behind.len(), 2);
+        assert!(
+            behind.iter().all(|b| b.is_some_and(|s| s > 5.0)),
+            "{behind:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_segment_skips_the_uncertainty_check() {
+        let engine = engine();
+        let mut session = engine.prepare(&mut |_| {});
+        let segment = SpeechSegment {
+            samples: AudioChunk {
+                samples: tone(1.0),
+                sample_rate: 48_000,
+                channels: 1,
+                captured: Instant::now(),
+            }
+            .to_model_input(&mut Resampler::default()),
+            start_sample: 0,
+            truncated: false,
+        };
+        assert!(!engine
+            .transcribe(&segment, &session, true)
+            .unwrap()
+            .uncertainty
+            .samples
+            .is_empty());
+        assert!(engine
+            .transcribe(&segment, &session, false)
+            .unwrap()
+            .uncertainty
+            .samples
+            .is_empty());
+
+        let mut behind = Vec::new();
+        for lag in [0.5, 5.0] {
+            engine
+                .process(
+                    &segment,
+                    lag,
+                    &mut session,
+                    &mut Collect(Vec::new()),
+                    &mut |e| {
+                        if let Event::Transcribed { behind_seconds, .. } = e {
+                            behind.push(behind_seconds);
+                        }
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(behind, [None, Some(5.0)]);
     }
 }

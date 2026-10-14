@@ -2,6 +2,7 @@
 //! not `Send` on every backend, and dropping it stops capture.
 
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
@@ -25,6 +26,7 @@ pub fn start(sender: Sender<AudioChunk>) -> Result<Stream, String> {
                     samples: data.to_vec(),
                     sample_rate,
                     channels,
+                    captured: Instant::now(),
                 });
             },
             error,
@@ -38,6 +40,7 @@ pub fn start(sender: Sender<AudioChunk>) -> Result<Stream, String> {
                     samples,
                     sample_rate,
                     channels,
+                    captured: Instant::now(),
                 });
             },
             error,
