@@ -1,0 +1,54 @@
+# Mini Dictator
+
+A minimal AI dictation app: a tray icon, a hotkey, and your words in the focused app.
+
+The core does VAD gating, speech recognition biased toward the terms on your screen (Qwen3-ASR 0.6B
+by default, about 30 languages; sherpa-onnx transducers also work), uncertainty estimation by Monte
+Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](docs/architecture.md).
+
+## Status
+
+- `crates/core`: the platform-independent core.
+- `crates/cli`: runs the core on a WAV file.
+- `crates/macos`: the macOS menu bar app.
+
+## macOS
+
+```sh
+scripts/fetch-models.sh      # Qwen3-ASR 0.6B (about 1 GB) and Silero VAD into ~/Library/Application Support/Mini Dictator/models
+scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime inside
+open "target/release/Mini Dictator.app"
+```
+
+Press ⌥Space to start and again to stop, or hold it while you speak. The first run asks for
+microphone and accessibility permission; accessibility is needed both to read names from the
+focused window and to paste. Settings live in `~/Library/Application Support/Mini Dictator/config.toml`
+(the menu opens it): the model, the hotkey, the uncertainty samples, and the rewrite endpoint.
+
+## Try the core on a WAV file
+
+```sh
+# Qwen3-ASR (or any sherpa-onnx offline transducer), Silero VAD, and ONNX Runtime 1.31
+scripts/fetch-models.sh models
+# ONNX Runtime: https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0
+
+cargo run --release -p mini-dictator-cli -- \
+  --ort path/to/libonnxruntime.so \
+  --model models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25 \
+  --vad models/silero_vad.onnx \
+  --wav models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ru1.wav
+```
+
+The `--model` directory decides the backend. With a transducer such as
+`sherpa-onnx-zipformer-en-2023-06-26`, `--beam` and `--boost` tune the hotword search.
+
+Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run
+the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at
+`http://localhost:11434/v1`.
+
+## Develop
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features
+```

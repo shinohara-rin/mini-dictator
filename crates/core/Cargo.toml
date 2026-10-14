@@ -1,0 +1,23 @@
+[package]
+name = "mini-dictator-core"
+version = "0.1.0"
+description = "Platform-independent dictation core: VAD gating, ASR (Qwen3-ASR and transducers), hotword biasing, uncertainty, and LLM rewrite"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Runs sherpa-onnx transducer and Qwen3-ASR models and Silero VAD through ONNX Runtime, loaded at run time.
+onnx = ["dep:ort", "dep:fancy-regex", "dep:unicode-normalization", "dep:serde_json"]
+# Rewrites transcripts with an OpenAI-compatible chat completions endpoint.
+http = ["dep:ureq", "dep:serde", "dep:serde_json"]
+
+[dependencies]
+thiserror.workspace = true
+ort = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+fancy-regex = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
