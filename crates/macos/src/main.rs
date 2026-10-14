@@ -12,7 +12,11 @@ mod context;
 #[cfg(target_os = "macos")]
 mod debug_log;
 #[cfg(target_os = "macos")]
+mod hotkey;
+#[cfg(target_os = "macos")]
 mod icons;
+#[cfg(target_os = "macos")]
+mod keyboard;
 #[cfg(target_os = "macos")]
 mod paste;
 #[cfg(target_os = "macos")]
