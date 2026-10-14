@@ -265,7 +265,10 @@ impl Matcher {
             Some(_) => (None, false),
             None => {
                 self.keys.insert(code);
-                self.armed = false;
+                // A key typed with a modifier down makes that press part of a shortcut.
+                if !self.held.is_empty() {
+                    self.armed = false;
+                }
                 if std::mem::take(&mut self.active) {
                     (Some(Signal::Interrupted), false)
                 } else {
@@ -280,7 +283,9 @@ impl Matcher {
         if self.hotkey.key.is_some() {
             return None;
         }
-        self.armed = false;
+        if !self.held.is_empty() {
+            self.armed = false;
+        }
         std::mem::take(&mut self.active).then_some(Signal::Interrupted)
     }
 
@@ -664,6 +669,18 @@ mod tests {
         // Letting go of Shift first does not make it fire again.
         assert_eq!(matcher.modifiers_changed(held(&[], &[COMMAND])), None);
         assert_eq!(matcher.modifiers_changed(Held::default()), None);
+    }
+
+    #[test]
+    fn typing_and_clicking_alone_leave_a_lone_modifier_ready() {
+        let mut matcher = Matcher::new(hotkey("RightCmd"), Held::default());
+        matcher.key_down(KEY_D, false);
+        matcher.key_up(KEY_D);
+        assert_eq!(matcher.mouse_down(), None);
+        assert_eq!(
+            matcher.modifiers_changed(held(&[], &[COMMAND])),
+            Some(Signal::Pressed)
+        );
     }
 
     #[test]
