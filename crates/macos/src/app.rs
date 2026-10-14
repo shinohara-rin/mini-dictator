@@ -24,8 +24,9 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::config::{config_path, support_dir, Config, APP_NAME};
+use crate::config::{config_path, debug_log_path, support_dir, Config, APP_NAME};
 use crate::context::{is_trusted, AccessibilityReader};
+use crate::debug_log;
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
 use crate::sound::{self, Cue};
@@ -130,6 +131,7 @@ struct Ui {
     last: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
+    debug: CheckMenuItem,
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
@@ -148,6 +150,7 @@ impl Ui {
             None,
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
+        let debug = CheckMenuItem::new("Write Debug Log", true, config.debug, None);
         let open_config = MenuItem::new("Open Settings File…", true, None);
         let open_folder = MenuItem::new("Open Models Folder…", true, None);
         let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, None);
@@ -160,6 +163,7 @@ impl Ui {
             &separator,
             &rewrite,
             &screen,
+            &debug,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_folder,
@@ -180,6 +184,7 @@ impl Ui {
             last,
             rewrite,
             screen,
+            debug,
             open_config,
             open_folder,
             quit,
@@ -220,6 +225,7 @@ pub fn run() {
             Config::default()
         }
     };
+    debug_log::init(debug_log_path(), config.debug);
 
     let mut event_loop = EventLoopBuilder::<AppEvent>::with_user_event().build();
     // A menu bar app: no Dock icon, no app menu.
@@ -278,6 +284,10 @@ pub fn run() {
                 let Some(ui) = &ui else { return };
                 match result {
                     Ok((loaded, found)) => {
+                        debug_log::write(&format!(
+                            "loaded {}",
+                            Config::resolve(&config.model_dir).display()
+                        ));
                         engine = Some(loaded);
                         switches = Some(found);
                         ui.toggle.set_enabled(true);
@@ -285,6 +295,7 @@ pub fn run() {
                     }
                     Err(error) => {
                         eprintln!("model: {error}");
+                        debug_log::write(&format!("model: {error}"));
                         ui.show(State::Error, &shorten(&format!("Model: {error}"), 60));
                     }
                 }
@@ -326,6 +337,8 @@ pub fn run() {
                     if let Some(s) = &switches {
                         s.screen.store(ui.screen.is_checked(), Ordering::Relaxed);
                     }
+                } else if event.id == ui.debug.id() {
+                    debug_log::set_enabled(ui.debug.is_checked());
                 } else if event.id == ui.open_config.id() {
                     open(&config_path());
                 } else if event.id == ui.open_folder.id() {
@@ -362,10 +375,12 @@ pub fn run() {
                         .set_text(format!("Last: {}", shorten(text.trim(), 40))),
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
+                        debug_log::write(&format!("warning: {warning}"));
                         ui.last
                             .set_text(shorten(&format!("Warning: {warning}"), 60));
                     }
-                    CoreEvent::Finished => {}
+                    // The worker writes these to the log itself.
+                    CoreEvent::Debug(_) | CoreEvent::Finished => {}
                 }
             }
             Event::UserEvent(AppEvent::Done(error)) => {
@@ -379,6 +394,7 @@ pub fn run() {
                 match error {
                     Some(error) => {
                         eprintln!("dictation: {error}");
+                        debug_log::write(&format!("dictation failed: {error}"));
                         ui.show(State::Error, &shorten(&format!("Error: {error}"), 60));
                     }
                     None => ui.show(State::Idle, "Ready"),
@@ -410,9 +426,14 @@ fn start(
     std::thread::spawn(move || {
         let mut sink = PasteSink;
         let events = proxy.clone();
-        let mut forward = move |event: CoreEvent| {
-            let _ = events.send_event(AppEvent::Core(event));
+        let mut forward = move |event: CoreEvent| match event {
+            // Written here, so long screen text never passes through the event loop.
+            CoreEvent::Debug(text) => debug_log::write(&text),
+            event => {
+                let _ = events.send_event(AppEvent::Core(event));
+            }
         };
+        debug_log::write("dictation started");
         let result = match vad_path.map(|p| SileroVad::load(&p)) {
             Some(Ok(vad)) => run_dictation(&engine, vad, receiver, &mut sink, &mut forward),
             Some(Err(error)) => {
@@ -435,6 +456,9 @@ fn start(
                 &mut forward,
             ),
         };
+        if let Ok(text) = &result {
+            debug_log::write(&format!("dictation finished, inserted {text:?}"));
+        }
         let _ = proxy.send_event(AppEvent::Done(result.err().map(|e| e.to_string())));
     });
     Some(Dictation {

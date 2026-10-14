@@ -10,6 +10,8 @@ mod config;
 #[cfg(target_os = "macos")]
 mod context;
 #[cfg(target_os = "macos")]
+mod debug_log;
+#[cfg(target_os = "macos")]
 mod icons;
 #[cfg(target_os = "macos")]
 mod paste;
