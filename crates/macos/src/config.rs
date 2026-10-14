@@ -24,6 +24,10 @@ pub struct Config {
     pub share_screen_text: bool,
     /// Play a short sound when the microphone opens and closes.
     pub beep: bool,
+    /// Write `debug.log` next to this file: the screen text and hotwords, each decode and its
+    /// uncertainty check, the rewrite prompt and reply, and timings. The menu turns it on and off
+    /// until the app quits.
+    pub debug: bool,
     pub uncertainty: Uncertainty,
     pub rewrite: Rewrite,
 }
@@ -63,6 +67,7 @@ impl Default for Config {
             read_screen: true,
             share_screen_text: true,
             beep: true,
+            debug: false,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
         }
@@ -90,6 +95,10 @@ pub fn support_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     support_dir().join("config.toml")
+}
+
+pub fn debug_log_path() -> PathBuf {
+    support_dir().join("debug.log")
 }
 
 impl Config {

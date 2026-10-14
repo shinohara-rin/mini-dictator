@@ -17,7 +17,7 @@ use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::audio::{AudioChunk, Resampler};
 use mini_dictator_core::context::{rank_terms, ContextSource, Region, ScreenContext, TextBlock};
-use mini_dictator_core::pipeline::{Engine, EngineConfig, SessionContext, Transcript};
+use mini_dictator_core::pipeline::{Engine, EngineConfig, SessionContext, Timings, Transcript};
 use mini_dictator_core::rewrite::{OpenAiCompatible, PassThrough, Rewriter};
 use mini_dictator_core::uncertainty;
 use mini_dictator_core::vad::{
@@ -273,6 +273,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             reference,
             uncertainty,
             marked,
+            timings: Timings {
+                encode: encoded,
+                decode: searched - encoded,
+                check: total - searched,
+            },
         };
         println!("  plain:  {}", transcript.reference.text());
         println!("  marked: {}", transcript.marked);

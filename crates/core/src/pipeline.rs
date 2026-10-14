@@ -5,13 +5,16 @@
 //! (or presses it again). The context snapshot is taken first, before any speech is decoded, so a
 //! slow accessibility read delays nothing: audio waits in the channel.
 
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::asr::{Asr, Bias, Hypothesis};
 use crate::audio::{AudioChunk, Resampler, SAMPLE_RATE};
 use crate::context::{rank_terms, ContextProvider, ScreenContext};
-use crate::rewrite::{RewriteRequest, Rewriter};
+use crate::rewrite::{user_prompt, RewriteRequest, Rewriter};
 use crate::uncertainty::{self, format_for_llm, MonteCarloConfig, Uncertainty};
 use crate::vad::{Segmenter, SegmenterConfig, SpeechSegment, VoiceActivityDetector};
 use crate::{Error, Result};
@@ -42,6 +45,10 @@ pub enum Event {
     },
     /// A step failed. The dictation goes on when it can: a failed rewrite inserts the plain transcript.
     Warning(String),
+    /// What one step read, produced, and how long it took, for a debug log: the screen text and
+    /// hotwords, each decode, the uncertainty check, and the rewrite prompt and reply.
+    /// Emitted only while [`EngineConfig::debug`] is set.
+    Debug(String),
     Finished,
 }
 
@@ -60,6 +67,8 @@ pub struct EngineConfig {
     pub share_screen_text: bool,
     /// Characters of focused-field text the rewrite model reads.
     pub preceding_chars: usize,
+    /// Emit [`Event::Debug`]. A shell flips it while dictations run; off, nothing is formatted.
+    pub debug: Arc<AtomicBool>,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +81,7 @@ impl Default for EngineConfig {
             max_hotwords: 100,
             share_screen_text: true,
             preceding_chars: 400,
+            debug: Arc::default(),
         }
     }
 }
@@ -91,6 +101,16 @@ pub struct Transcript {
     pub reference: Hypothesis,
     pub uncertainty: Uncertainty,
     pub marked: String,
+    pub timings: Timings,
+}
+
+/// Time spent on each step of [`Engine::transcribe`].
+#[derive(Debug, Clone, Default)]
+pub struct Timings {
+    pub encode: Duration,
+    pub decode: Duration,
+    /// The noisy decodes of the uncertainty check.
+    pub check: Duration,
 }
 
 pub struct Engine {
@@ -101,17 +121,31 @@ pub struct Engine {
 }
 
 impl Engine {
+    fn debug(&self) -> bool {
+        self.config.debug.load(Ordering::Relaxed)
+    }
+
     /// Reads the screen and prepares its terms as hotwords. A failed read gives an empty context.
-    pub fn prepare(&self, warn: &mut dyn FnMut(Event)) -> SessionContext {
+    pub fn prepare(&self, events: &mut dyn FnMut(Event)) -> SessionContext {
+        let started = Instant::now();
         let screen = self.context.snapshot().unwrap_or_else(|error| {
-            warn(Event::Warning(error.to_string()));
+            events(Event::Warning(error.to_string()));
             ScreenContext::empty()
         });
+        let read = started.elapsed();
         let hotwords: Vec<String> = rank_terms(&screen, self.config.max_hotwords)
             .into_iter()
             .map(|t| t.phrase)
             .collect();
         let bias = self.asr.bias(&hotwords);
+        if self.debug() {
+            events(Event::Debug(describe_context(
+                &screen,
+                &hotwords,
+                read,
+                started.elapsed() - read,
+            )));
+        }
         SessionContext {
             screen,
             hotwords,
@@ -127,8 +161,11 @@ impl Engine {
         session: &SessionContext,
         check: bool,
     ) -> Result<Transcript> {
+        let started = Instant::now();
         let encoder = self.asr.encode(&segment.samples)?;
+        let encoded = started.elapsed();
         let reference = self.asr.decode_one(&encoder, &session.bias)?;
+        let decoded = started.elapsed();
         let unchecked = MonteCarloConfig {
             samples: 0,
             ..self.config.monte_carlo.clone()
@@ -144,11 +181,17 @@ impl Engine {
                 &unchecked
             },
         )?;
+        let timings = Timings {
+            encode: encoded,
+            decode: decoded - encoded,
+            check: started.elapsed() - decoded,
+        };
         let marked = format_for_llm(&reference, &uncertainty.analysis.spans);
         Ok(Transcript {
             reference,
             uncertainty,
             marked,
+            timings,
         })
     }
 
@@ -187,6 +230,14 @@ impl Engine {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
         let transcript = self.transcribe(segment, session, behind_seconds.is_none())?;
         let plain = transcript.reference.text();
+        if self.debug() {
+            events(Event::Debug(describe_transcript(
+                segment,
+                lag_seconds,
+                behind_seconds.is_some(),
+                &transcript,
+            )));
+        }
         events(Event::Transcribed {
             plain: plain.clone(),
             marked: transcript.marked.clone(),
@@ -197,7 +248,20 @@ impl Engine {
             return Ok(None);
         }
         let request = self.rewrite_request(&transcript, session);
-        let text = match self.rewriter.rewrite(&request) {
+        let started = Instant::now();
+        let rewritten = self.rewriter.rewrite(&request);
+        if self.debug() {
+            events(Event::Debug(format!(
+                "rewrite in {}\n  prompt:\n{}\n  reply: {}",
+                ms(started.elapsed()),
+                indent(&user_prompt(&request), "    "),
+                match &rewritten {
+                    Ok(text) => format!("{text:?}"),
+                    Err(error) => format!("failed: {error}"),
+                }
+            )));
+        }
+        let text = match rewritten {
             Ok(text) => text,
             Err(error) => {
                 events(Event::Warning(error.to_string()));
@@ -229,6 +293,96 @@ impl Engine {
 fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
     let end = segment.start_sample + segment.samples.len() as u64;
     captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
+}
+
+fn ms(duration: Duration) -> String {
+    format!("{} ms", duration.as_millis())
+}
+
+fn indent(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The screen snapshot and the hotwords taken from it, for the debug log.
+fn describe_context(
+    screen: &ScreenContext,
+    hotwords: &[String],
+    read: Duration,
+    ranked: Duration,
+) -> String {
+    let mut text = format!(
+        "context from {:?} in {} (hotwords in {}), app {:?}, {} blocks, {} characters",
+        screen.source,
+        ms(read),
+        ms(ranked),
+        screen.app.as_deref().unwrap_or("unknown"),
+        screen.blocks.len(),
+        screen.text_len(),
+    );
+    for block in &screen.blocks {
+        let _ = write!(text, "\n  {:?}: {:?}", block.region, block.text);
+    }
+    let _ = write!(
+        text,
+        "\n  hotwords ({}): {}",
+        hotwords.len(),
+        hotwords.join(", ")
+    );
+    text
+}
+
+/// One decoded segment with its uncertainty check, for the debug log.
+fn describe_transcript(
+    segment: &SpeechSegment,
+    lag_seconds: f32,
+    behind: bool,
+    transcript: &Transcript,
+) -> String {
+    let Timings {
+        encode,
+        decode,
+        check,
+    } = &transcript.timings;
+    let uncertainty = &transcript.uncertainty;
+    let mut text = format!(
+        "segment at {:.2} s, {:.2} s long{}, {lag_seconds:.2} s behind: encode {}, decode {}\n  plain:  {:?}",
+        segment.start_sample as f32 / SAMPLE_RATE as f32,
+        segment.duration_seconds(),
+        if segment.truncated { " (truncated)" } else { "" },
+        ms(*encode),
+        ms(*decode),
+        transcript.reference.text(),
+    );
+    if behind {
+        text.push_str("\n  uncertainty check skipped to catch up");
+    } else if uncertainty.samples.is_empty() {
+        text.push_str("\n  uncertainty check off");
+    } else {
+        let _ = write!(
+            text,
+            "\n  {} noisy decodes in {}{}",
+            uncertainty.samples.len(),
+            ms(*check),
+            if uncertainty.stopped_early {
+                " (stopped early)"
+            } else {
+                ""
+            }
+        );
+        for (i, sample) in uncertainty.samples.iter().enumerate() {
+            let _ = write!(text, "\n    {}: {:?}", i + 1, sample.text());
+        }
+    }
+    let _ = write!(
+        text,
+        "\n  {} unclear spans, marked: {:?}",
+        uncertainty.analysis.spans.len(),
+        transcript.marked
+    );
+    text
 }
 
 fn is_cjk(c: char) -> bool {
@@ -399,6 +553,8 @@ mod tests {
             matches!(events[0], Event::Listening { hotwords: 1 }),
             "{events:?}"
         );
+        // Debug logging is off.
+        assert!(events.iter().all(|e| !matches!(e, Event::Debug(_))));
         // The audio was all recorded just now, so no segment came in late.
         assert!(events.iter().all(|e| !matches!(
             e,
@@ -407,6 +563,34 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn debug_events_show_the_context_the_decodes_and_the_rewrite() {
+        let engine = engine();
+        engine.config.debug.store(true, Ordering::Relaxed);
+        let mut debug = Vec::new();
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now()),
+            &mut Collect(Vec::new()),
+            &mut |e| {
+                if let Event::Debug(text) = e {
+                    debug.push(text);
+                }
+            },
+        )
+        .unwrap();
+        // The context, then a decode and a rewrite for each utterance.
+        assert_eq!(debug.len(), 5, "{debug:#?}");
+        assert!(debug[0].contains("app \"Notes\""), "{}", debug[0]);
+        assert!(debug[0].contains("Focused: \"Meeting with Hello Kitty\""));
+        assert!(debug[0].contains("hotwords (1): Kitty"), "{}", debug[0]);
+        assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
+        assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
+        assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
+        assert!(debug[2].contains("reply: \"HELLO\""), "{}", debug[2]);
     }
 
     #[test]
