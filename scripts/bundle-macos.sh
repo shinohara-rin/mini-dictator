@@ -27,8 +27,18 @@ if [ ! -f "$CACHE/lib/libonnxruntime.$ORT_VERSION.dylib" ]; then
 fi
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 cp "$ROOT/target/release/mini-dictator" "$APP/Contents/MacOS/"
+
+# The app icon, every size iconutil wants, scaled down from the 1024 px master.
+ICONSET="$ROOT/target/AppIcon.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  sips -z $size $size "$ROOT/assets/icon/AppIcon.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  sips -z $((size * 2)) $((size * 2)) "$ROOT/assets/icon/AppIcon.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 cp "$CACHE/lib/libonnxruntime.$ORT_VERSION.dylib" "$APP/Contents/Frameworks/libonnxruntime.dylib"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -40,6 +50,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Mini Dictator</string>
   <key>CFBundleIdentifier</key><string>dev.shinohara-rin.mini-dictator</string>
   <key>CFBundleExecutable</key><string>mini-dictator</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION%%-*}</string>
   <key>CFBundleVersion</key><string>1</string>
