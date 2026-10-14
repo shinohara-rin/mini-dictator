@@ -25,7 +25,20 @@ const MODIFIERS: [(&str, &[&str]); 4] = [
     ("Ctrl", &["ctrl", "control"]),
     ("Alt", &["alt", "option", "opt"]),
     ("Shift", &["shift"]),
-    ("Cmd", &["cmd", "command", "super", "meta"]),
+    // global-hotkey's CmdOrCtrl means Command on macOS.
+    (
+        "Cmd",
+        &[
+            "cmd",
+            "command",
+            "super",
+            "meta",
+            "cmdorctrl",
+            "cmdorcontrol",
+            "commandorctrl",
+            "commandorcontrol",
+        ],
+    ),
 ];
 const CONTROL: usize = 0;
 #[cfg(test)]
@@ -559,6 +572,7 @@ mod tests {
         assert_eq!(hotkey("right option").to_string(), "RightAlt");
         assert_eq!(hotkey("Cmd+Left").to_string(), "Cmd+Left");
         assert_eq!(hotkey("super+Digit1").to_string(), "Cmd+1");
+        assert_eq!(hotkey("CommandOrControl+Space").to_string(), "Cmd+Space");
         assert!("Ctrl+Ctrl+D".parse::<Hotkey>().is_err());
         assert!("Ctrl+D+E".parse::<Hotkey>().is_err());
         assert!("Ctrl+Nope".parse::<Hotkey>().is_err());
