@@ -769,6 +769,13 @@ fn stretch_end(
         row.pop();
         return Some(None);
     }
+    let whole = |tokens: &[(u32, f32)]| {
+        let bytes: Vec<u8> = tokens
+            .iter()
+            .flat_map(|(id, _)| tokenizer.bytes(*id).iter().copied())
+            .collect();
+        std::str::from_utf8(&bytes).is_ok()
+    };
     let ids: Vec<u32> = row.iter().map(|(id, _)| *id).collect();
     // Only punctuation, which can take several tokens, even for one character.
     let punctuation = |ids: &[u32]| {
@@ -779,15 +786,21 @@ fn stretch_end(
         std::str::from_utf8(&bytes)
             .is_ok_and(|text| !text.trim().is_empty() && text.trim().chars().all(is_punctuation))
     };
-    // Punctuation where the reference has a word: the token after it shows whether the row puts
-    // it in front of that word, an insertion.
-    if reference.get(start).is_some_and(|r| !punctuation(&[*r])) {
-        if ids.len() >= 2 && punctuation(&ids[..ids.len() - 1]) && reference[start] == last {
-            row.pop();
-            return Some(Some(start));
-        }
-        if punctuation(&ids) && ids.len() < LOCAL_TOKENS {
+    // Punctuation where the reference has a word: the tokens after it show whether the row puts
+    // it in front of that word, an insertion, once they make whole characters.
+    if reference.get(start).is_some_and(|r| !punctuation(&[*r])) && ids.len() < LOCAL_TOKENS {
+        if punctuation(&ids) {
             return None;
+        }
+        if let Some(marks) = (1..ids.len()).rev().find(|k| punctuation(&ids[..*k])) {
+            let after = &ids[marks..];
+            if reference[start..].starts_with(after) {
+                if !whole(&row[marks..]) {
+                    return None;
+                }
+                row.truncate(marks);
+                return Some(Some(start));
+            }
         }
     }
     // Back on the reference: two tokens in a row match it, or one whole word does at most one
@@ -810,13 +823,6 @@ fn stretch_end(
     if let Some(j) = matched {
         return Some(Some(j + 1));
     }
-    let whole = |tokens: &[(u32, f32)]| {
-        let bytes: Vec<u8> = tokens
-            .iter()
-            .flat_map(|(id, _)| tokenizer.bytes(*id).iter().copied())
-            .collect();
-        std::str::from_utf8(&bytes).is_ok()
-    };
     // The word ended when the next one begins: the row's word stands for the reference's. A
     // character split over tokens shows whether it begins a word only once its last byte is in.
     let next = (ids.len().saturating_sub(4).max(1)..ids.len()).find(|k| {
@@ -1228,6 +1234,19 @@ mod tests {
         let mut inserted = row(&[comma, comma, 257]);
         assert_eq!(
             stretch_end(&t, &stops, &mut inserted, &reference, 1),
+            Some(Some(1))
+        );
+        // A character split over tokens has to match all of it.
+        let han = ids("中");
+        let split_reference = [256, han[0], han[1], han[2]];
+        let mut partial = row(&[comma, han[0]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut partial, &split_reference, 1),
+            None
+        );
+        let mut inserted = row(&[comma, han[0], han[1], han[2]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut inserted, &split_reference, 1),
             Some(Some(1))
         );
         let mut ended = row(&[comma, 300]);
