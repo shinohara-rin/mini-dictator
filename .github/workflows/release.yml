@@ -35,11 +35,16 @@ jobs:
             echo "::error::$TAG is not a version tag such as v0.2.0 or v0.2.0-rc.1"
             exit 1
           fi
-          # gh prints the error body to stdout when the tag doesn't exist, so go by its exit status.
-          if tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha 2>/dev/null) \
-            && [ "$tagged" != "$GITHUB_SHA" ]; then
-            echo "::error::$TAG points at $tagged, not the commit being built ($GITHUB_SHA). Run the workflow on $TAG instead."
-            exit 1
+          # matching-refs answers an empty list for a missing tag, so any failure here is a real
+          # error and stops the run instead of passing for "no such tag".
+          found=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq "map(select(.ref == \"refs/tags/$TAG\")) | length")
+          if [ "$found" != 0 ]; then
+            tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)
+            if [ "$tagged" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG points at $tagged, not the commit being built ($GITHUB_SHA). Run the workflow on $TAG instead."
+              exit 1
+            fi
           fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
