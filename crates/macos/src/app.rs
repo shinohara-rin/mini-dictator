@@ -84,6 +84,10 @@ fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
         rewriter: Box::new(rewriter),
         config: EngineConfig {
             monte_carlo,
+            max_lag_seconds: config
+                .uncertainty
+                .max_lag_seconds
+                .unwrap_or(EngineConfig::default().max_lag_seconds),
             share_screen_text: config.share_screen_text,
             ..EngineConfig::default()
         },
@@ -337,16 +341,21 @@ pub fn run() {
                         State::Listening,
                         &format!("Listening ({hotwords} names on screen)"),
                     ),
-                    CoreEvent::Transcribed { unclear_spans, .. } => {
+                    CoreEvent::Transcribed {
+                        unclear_spans,
+                        behind_seconds,
+                        ..
+                    } => {
                         let state = if dictation.is_some() {
                             State::Listening
                         } else {
                             State::Working
                         };
-                        ui.show(
-                            state,
-                            &format!("Transcribed, {unclear_spans} unclear spans"),
-                        );
+                        let status = match behind_seconds {
+                            Some(seconds) => format!("Catching up, {seconds:.0} s behind"),
+                            None => format!("Transcribed, {unclear_spans} unclear spans"),
+                        };
+                        ui.show(state, &status);
                     }
                     CoreEvent::Inserted { text } => ui
                         .last

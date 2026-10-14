@@ -35,6 +35,9 @@ pub struct Uncertainty {
     pub samples: Option<usize>,
     /// Noise as a fraction of each encoder dimension's spread. Empty means the model's default.
     pub sigma: Option<f32>,
+    /// A segment that reaches the recognizer this many seconds after it was spoken skips the
+    /// check, so a slow Mac catches up. Empty means 2.
+    pub max_lag_seconds: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
