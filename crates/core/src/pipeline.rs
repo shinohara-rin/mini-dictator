@@ -66,7 +66,7 @@ pub struct EngineConfig {
     pub max_hotwords: usize,
     /// Send focused-field text to the rewrite model. Hotwords are sent either way.
     pub share_screen_text: bool,
-    /// Characters of focused-field text the rewrite model reads.
+    /// Characters of focused-field text, and of text dictated so far, the rewrite model reads.
     pub preceding_chars: usize,
     /// How segments split by a pause join into sentences.
     pub join: JoinConfig,
@@ -222,7 +222,7 @@ impl Engine {
             } else {
                 String::new()
             },
-            session_text: session.inserted.clone(),
+            session_text: tail(&session.inserted, self.config.preceding_chars),
             pause_seconds,
         }
     }
@@ -332,6 +332,12 @@ impl Engine {
 fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
     let end = segment.start_sample + segment.samples.len() as u64;
     captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
+}
+
+/// The last `max_chars` characters of `text`.
+fn tail(text: &str, max_chars: usize) -> String {
+    let skip = text.chars().count().saturating_sub(max_chars);
+    text.chars().skip(skip).collect()
 }
 
 fn ms(duration: Duration) -> String {

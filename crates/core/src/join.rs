@@ -64,9 +64,13 @@ impl Joiner {
     /// sentence, a separating space, and the piece without its own final period.
     pub fn join(&mut self, typed: &str, piece: &Piece, config: &JoinConfig) -> String {
         let (body, held) = split_final_period(piece.text.trim());
+        let body = body.as_str();
         let continues = piece.pause_seconds.is_some_and(|pause| {
-            let first = body.chars().next();
-            if first.is_some_and(is_joining_punctuation) || first.is_some_and(char::is_lowercase) {
+            // An opening quote or bracket says nothing; the letter after it does.
+            let first = body.chars().find(|&c| !is_opening_punctuation(c));
+            if body.chars().next().is_some_and(is_joining_punctuation)
+                || first.is_some_and(char::is_lowercase)
+            {
                 true
             } else if piece.rewritten
                 && first.is_some_and(char::is_uppercase)
@@ -128,20 +132,32 @@ fn speech_span(segment: &SpeechSegment, config: &SegmenterConfig) -> (u64, u64) 
 }
 
 /// Splits off a final period, Latin or CJK. An ellipsis stays, and so do `?` and `!`, which the
-/// recognizer rarely adds where a sentence goes on.
-fn split_final_period(text: &str) -> (&str, &str) {
+/// recognizer rarely adds where a sentence goes on. A period inside closing quotes or brackets
+/// moves outside them: `“fast.”` keeps `“fast”` and holds the period.
+fn split_final_period(text: &str) -> (String, &'static str) {
+    let inner = text.trim_end_matches(is_closing_punctuation);
+    let closing = &text[inner.len()..];
     for period in [".", "。", "．"] {
-        if let Some(body) = text.strip_suffix(period) {
-            if !body.ends_with(['.', '。', '．', '…']) && !body.is_empty() {
-                return (body.trim_end(), period);
+        if let Some(body) = inner.strip_suffix(period) {
+            if !body.ends_with(['.', '。', '．', '…']) && !body.trim().is_empty() {
+                return (format!("{}{closing}", body.trim_end()), period);
             }
         }
     }
-    (text, "")
+    (text.to_owned(), "")
+}
+
+/// Punctuation that closes a quote or an aside.
+fn is_closing_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\'' | '”' | '’' | ')' | ']' | '»' | '」' | '』' | '）'
+    )
 }
 
 fn first_word(text: &str) -> &str {
-    text.split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
+    text.trim_start_matches(is_opening_punctuation)
+        .split(|c: char| c.is_whitespace() || (c.is_ascii_punctuation() && c != '\''))
         .next()
         .unwrap_or("")
 }
@@ -169,13 +185,21 @@ fn lowercase_first_word(text: &str, names: &[String]) -> String {
     let Some(first) = word.chars().next() else {
         return text.to_owned();
     };
-    if !first.is_uppercase() || keeps_capital(word, names) {
+    if !first.is_uppercase() || keeps_capital(word, names) || !text.starts_with(word) {
         return text.to_owned();
     }
     first
         .to_lowercase()
         .chain(text[first.len_utf8()..].chars())
         .collect()
+}
+
+/// Punctuation that opens a quote, an aside, or a list item.
+fn is_opening_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '\'' | '“' | '‘' | '(' | '[' | '«' | '「' | '『' | '（' | '-' | '*' | '•'
+    )
 }
 
 /// Punctuation that attaches to the word before it.
@@ -282,6 +306,14 @@ mod tests {
             ),
             "I think Rin can help. ONNX works."
         );
+        // An opening quote does not hide the capital after it.
+        assert_eq!(
+            dictate(
+                &[(0.0, "That works."), (0.7, "“Next step,” he said.")],
+                true
+            ),
+            "That works. “Next step,” he said."
+        );
         // A reply that opens with punctuation attaches to the text before it.
         assert_eq!(
             dictate(&[(0.0, "Apples."), (0.7, ", pears, and plums.")], true),
@@ -302,6 +334,11 @@ mod tests {
         assert_eq!(joiner.join("", &piece("Ready?"), &config), "Ready?");
         assert_eq!(joiner.join("", &piece("Well..."), &config), "Well...");
         assert_eq!(joiner.join("", &piece("Done."), &config), "Done");
+        assert_eq!(joiner.finish(), ".");
+        assert_eq!(
+            joiner.join("", &piece("He called it “fast.”"), &config),
+            "He called it “fast”"
+        );
         assert_eq!(joiner.finish(), ".");
         assert_eq!(joiner.finish(), "");
     }

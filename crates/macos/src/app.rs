@@ -395,9 +395,11 @@ pub fn run() {
                         };
                         ui.show(state, &status);
                     }
-                    CoreEvent::Inserted { text } => ui
+                    // The period typed when a dictation ends keeps the preview of its text.
+                    CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => ui
                         .last
                         .set_text(format!("Last: {}", shorten(text.trim(), 40))),
+                    CoreEvent::Inserted { .. } => {}
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
                         debug_log::write(&format!("warning: {warning}"));
