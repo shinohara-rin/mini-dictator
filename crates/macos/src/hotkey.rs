@@ -800,7 +800,7 @@ mod tests {
         recorder.key_up(KEY_D);
         assert_eq!(
             recorder.modifiers_changed(Held::default()),
-            Some(Outcome::Recorded(hotkey("Cmd+D")))
+            Some(Outcome::Recorded(hotkey("LeftCmd+D")))
         );
         // Only letting go of them records nothing.
         let mut recorder = Recorder::new(held(&[COMMAND], &[]));
