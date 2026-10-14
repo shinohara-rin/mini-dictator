@@ -19,7 +19,8 @@ pub enum Level {
     Off,
     /// A sound when the microphone opens and closes.
     Minimal,
-    /// Also a sound for each segment heard, unclear words, catching up, text typed, and errors.
+    /// Also a sound for each segment heard, unclear words, nothing heard, catching up, text typed,
+    /// and errors.
     Verbose,
 }
 
@@ -73,11 +74,10 @@ impl Sounds {
         if let Some(sound) = NSSound::soundNamed(&NSString::from_str(name)) {
             sound.setVolume(VOLUME);
             sound.play();
-            self.limiter.borrow_mut().note(Instant::now());
         }
     }
 
-    /// Plays in the verbose set only, unless the limiter holds it back.
+    /// Plays in the verbose set only, unless the same cue just played.
     pub fn jingle(&self, jingle: Jingle) {
         if self.level.get() != Level::Verbose
             || !self.limiter.borrow_mut().allow(jingle, Instant::now())

@@ -28,7 +28,7 @@ pub struct Config {
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
     /// `"off"`, `"minimal"` (a sound when the microphone opens and closes), or `"verbose"` (also a
-    /// cue for each segment heard, unclear words, catching up, text typed, and errors). The menu
+    /// cue for each segment heard, unclear words, nothing heard, catching up, text typed, and errors). The menu
     /// changes it until the app quits.
     // A config written before this field keeps its own setting, not the new default.
     #[serde(default)]

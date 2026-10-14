@@ -449,14 +449,18 @@ pub fn run() {
                     ),
                     CoreEvent::Heard { .. } => ui.jingle(Jingle::Heard),
                     CoreEvent::Transcribed {
+                        plain,
                         unclear_spans,
                         behind_seconds,
                         ..
                     } => {
                         if behind_seconds.is_some() {
                             ui.jingle(Jingle::CatchingUp);
-                        } else if unclear_spans > 0 {
+                        }
+                        if unclear_spans > 0 {
                             ui.jingle(Jingle::Unclear);
+                        } else if plain.trim().is_empty() {
+                            ui.jingle(Jingle::Nothing);
                         }
                         let state = if dictation.is_some() {
                             State::Listening

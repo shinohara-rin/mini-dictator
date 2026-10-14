@@ -1,6 +1,6 @@
 //! The verbose cues, drawn here as tiny WAV files when the app starts: no sound files to ship or
-//! license, and each cue is a few kilobytes in memory. Also the limiter that keeps a burst of
-//! events from turning into a burst of noise.
+//! license, and each cue is a few kilobytes in memory. Also the limiter that merges a burst of
+//! the same cue.
 
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,8 @@ pub enum Jingle {
     Heard,
     /// The uncertainty check found unclear words: a wobbly "hm-hm?".
     Unclear,
+    /// A segment was decoded to nothing, so nothing will be typed: a deflating "pfff".
+    Nothing,
     /// Segments are queueing up and the check is skipped: a "zip-zip-zip" speeding up.
     CatchingUp,
     /// Text was typed: a bell sparkle.
@@ -26,10 +28,11 @@ pub enum Jingle {
 }
 
 impl Jingle {
-    pub const ALL: [Jingle; 7] = [
+    pub const ALL: [Jingle; 8] = [
         Jingle::Ready,
         Jingle::Heard,
         Jingle::Unclear,
+        Jingle::Nothing,
         Jingle::CatchingUp,
         Jingle::Typed,
         Jingle::Warning,
@@ -63,6 +66,12 @@ impl Jingle {
                 };
                 voice(&mut out, hm(0.0, 440.0, 400.0));
                 voice(&mut out, hm(170.0, 470.0, 720.0).ms(220.0));
+            }
+            Jingle::Nothing => {
+                let pfff = Voice::new(0.0, 260.0, 520.0)
+                    .glide(160.0)
+                    .wave(Wave::Triangle);
+                voice(&mut out, pfff.vibrato(0.02, 23.0).decay(4.0));
             }
             Jingle::CatchingUp => {
                 for (i, at) in [0.0, 60.0, 105.0, 140.0].into_iter().enumerate() {
@@ -224,22 +233,19 @@ fn wav(samples: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Drops a cue that would land on top of the one before, or repeat one that just played, so a
-/// queue of segments decoding back to back makes a few sounds rather than a wall of them.
+/// Merges repeats of one cue, so a queue of segments decoding back to back makes one gulp rather
+/// than a wall of them. Different cues always play, even on top of each other: each one tells a
+/// different state, and the sounds are the app's only window into the pipeline.
 pub struct Limiter {
-    last: Option<Instant>,
     last_of: Vec<(Jingle, Instant)>,
 }
 
-/// No two verbose cues closer than this.
-const MIN_GAP: Duration = Duration::from_millis(150);
 /// The same cue no more often than this.
-const SAME_GAP: Duration = Duration::from_millis(700);
+const SAME_GAP: Duration = Duration::from_millis(500);
 
 impl Limiter {
     pub fn new() -> Self {
         Limiter {
-            last: None,
             last_of: Vec::new(),
         }
     }
@@ -247,31 +253,17 @@ impl Limiter {
     /// True when `jingle` may play at `now`, which then counts as its last play. Errors always
     /// play: they are rare, and the one that matters.
     pub fn allow(&mut self, jingle: Jingle, now: Instant) -> bool {
-        if jingle != Jingle::Error {
-            if self
-                .last
-                .is_some_and(|at| now.saturating_duration_since(at) < MIN_GAP)
-            {
-                return false;
-            }
-            if self
+        if jingle != Jingle::Error
+            && self
                 .last_of
                 .iter()
                 .any(|(j, at)| *j == jingle && now.saturating_duration_since(*at) < SAME_GAP)
-            {
-                return false;
-            }
+        {
+            return false;
         }
-        self.last = Some(now);
         self.last_of.retain(|(j, _)| *j != jingle);
         self.last_of.push((jingle, now));
         true
-    }
-
-    /// Counts a sound played outside the limiter, such as the microphone cue, so a verbose cue
-    /// does not land on top of it.
-    pub fn note(&mut self, now: Instant) {
-        self.last = Some(now);
     }
 }
 
@@ -324,22 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn limiter_spaces_out_cues_and_lets_errors_through() {
+    fn limiter_merges_repeats_only() {
         let t0 = Instant::now();
         let ms = |n| t0 + Duration::from_millis(n);
         let mut limiter = Limiter::new();
         assert!(limiter.allow(Jingle::Heard, ms(0)));
-        // Too close to the last cue.
-        assert!(!limiter.allow(Jingle::Typed, ms(100)));
-        assert!(limiter.allow(Jingle::Typed, ms(200)));
-        // The same cue again too soon, though the gap since any cue is fine.
-        assert!(!limiter.allow(Jingle::Heard, ms(400)));
-        assert!(limiter.allow(Jingle::Heard, ms(800)));
-        assert!(limiter.allow(Jingle::Error, ms(810)));
-        assert!(limiter.allow(Jingle::Error, ms(820)));
-        // The microphone cue holds back the next verbose one.
-        limiter.note(ms(2000));
-        assert!(!limiter.allow(Jingle::Unclear, ms(2050)));
-        assert!(limiter.allow(Jingle::Unclear, ms(2200)));
+        // A different cue plays at once.
+        assert!(limiter.allow(Jingle::Unclear, ms(10)));
+        assert!(limiter.allow(Jingle::Typed, ms(20)));
+        // The same cue again too soon is merged into the first.
+        assert!(!limiter.allow(Jingle::Heard, ms(300)));
+        assert!(limiter.allow(Jingle::Heard, ms(600)));
+        assert!(limiter.allow(Jingle::Error, ms(610)));
+        assert!(limiter.allow(Jingle::Error, ms(620)));
     }
 }

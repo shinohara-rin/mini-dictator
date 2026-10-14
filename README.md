@@ -22,10 +22,11 @@ open "target/release/Mini Dictator.app"
 
 Press ⌥Space to start and again to stop, or hold it while you speak. A soft tick plays when the
 microphone opens and a pop when it closes. With Sounds set to Every Step (`sounds = "verbose"`, the
-default for a new config), each step gets a little cue too: a gulp as a segment goes to the
-recognizer, a puzzled "hm-hm?" when it finds unclear words, a zip when it is catching up, a sparkle
-when text is typed, and an "uh-oh" or a bonk when something fails. Cues that would pile up are
-skipped. The first run asks for microphone and accessibility
+default for a new config), each step gets a little cue too, which also shows what the pipeline is
+doing without a window: a gulp as a segment goes to the recognizer, a puzzled "hm-hm?" when it
+finds unclear words, a deflating "pfff" when it heard nothing, a zip when it is catching up, a
+sparkle when text is typed, and an "uh-oh" or a bonk when something fails. A cue repeated within
+half a second plays once. The first run asks for microphone and accessibility
 permission; accessibility is needed both to read names from the focused window and to paste.
 Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens it): the
 model, the hotkey, the sounds (`sounds`: `off`, `minimal` or `verbose`), the uncertainty samples, and the rewrite endpoint. Names seen
