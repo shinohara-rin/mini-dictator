@@ -223,6 +223,14 @@ impl Engine {
     }
 }
 
+/// How long ago a segment's last sample was recorded: the age of the latest block plus the audio
+/// after the segment. Timing each block keeps this right when the worker starts after the
+/// microphone, or capture starts late.
+fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
+    let end = segment.start_sample + segment.samples.len() as u64;
+    captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
+}
+
 fn is_cjk(c: char) -> bool {
     matches!(c as u32, 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF)
 }
@@ -235,27 +243,24 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     sink: &mut dyn TextSink,
     events: &mut dyn FnMut(Event),
 ) -> Result<String> {
-    // The shell starts the microphone just before this, so audio time and wall time share an
-    // origin, and a segment's lag is how long its audio waited in the channel and the segmenter.
-    let started = Instant::now();
-    let lag = |segment: &SpeechSegment| {
-        let end = segment.start_sample + segment.samples.len() as u64;
-        started.elapsed().as_secs_f32() - end as f32 / SAMPLE_RATE as f32
-    };
     let mut session = engine.prepare(events);
     events(Event::Listening {
         hotwords: session.hotwords.len(),
     });
     let mut segmenter = Segmenter::new(vad, engine.config.segmenter.clone());
     let mut resampler = Resampler::default();
+    // Samples heard so far, and when the last of them was recorded.
+    let mut clock = (0, Instant::now());
 
     for chunk in audio {
-        for segment in segmenter.push(&chunk.to_model_input(&mut resampler)) {
-            engine.process(&segment, lag(&segment), &mut session, sink, events)?;
+        let samples = chunk.to_model_input(&mut resampler);
+        clock = (clock.0 + samples.len() as u64, chunk.captured);
+        for segment in segmenter.push(&samples) {
+            engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
         }
     }
     if let Some(segment) = segmenter.finish() {
-        engine.process(&segment, lag(&segment), &mut session, sink, events)?;
+        engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
     }
     events(Event::Finished);
     Ok(session.inserted)
@@ -263,6 +268,8 @@ pub fn run_dictation<V: VoiceActivityDetector>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::asr::{EncoderOutput, Recognizer, SearchConfig, SymbolTable, TransducerModel};
     use crate::context::{ContextSource, Region, TextBlock};
@@ -351,9 +358,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn dictates_each_utterance_into_the_sink() {
-        let engine = engine();
+    /// Two utterances, all recorded at `captured`.
+    fn speech(captured: Instant) -> Receiver<AudioChunk> {
         let (sender, receiver) = std::sync::mpsc::channel();
         for samples in [
             vec![0.0; 24_000],
@@ -367,17 +373,22 @@ mod tests {
                     samples,
                     sample_rate: 48_000,
                     channels: 1,
+                    captured,
                 })
                 .unwrap();
         }
-        drop(sender);
+        receiver
+    }
 
+    #[test]
+    fn dictates_each_utterance_into_the_sink() {
+        let engine = engine();
         let mut sink = Collect(Vec::new());
         let mut events = Vec::new();
         let text = run_dictation(
             &engine,
             crate::vad::EnergyVad::default(),
-            receiver,
+            speech(Instant::now()),
             &mut sink,
             &mut |e| events.push(e),
         )
@@ -388,7 +399,7 @@ mod tests {
             matches!(events[0], Event::Listening { hotwords: 1 }),
             "{events:?}"
         );
-        // The audio was all queued at once, so no segment came in late.
+        // The audio was all recorded just now, so no segment came in late.
         assert!(events.iter().all(|e| !matches!(
             e,
             Event::Transcribed {
@@ -396,6 +407,30 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn lag_counts_from_when_the_audio_was_recorded() {
+        // The microphone records while the worker still loads the VAD, so audio can wait before
+        // the dictation starts.
+        let mut behind = Vec::new();
+        run_dictation(
+            &engine(),
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now() - Duration::from_secs(5)),
+            &mut Collect(Vec::new()),
+            &mut |e| {
+                if let Event::Transcribed { behind_seconds, .. } = e {
+                    behind.push(behind_seconds);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(behind.len(), 2);
+        assert!(
+            behind.iter().all(|b| b.is_some_and(|s| s > 5.0)),
+            "{behind:?}"
+        );
     }
 
     #[test]
@@ -407,6 +442,7 @@ mod tests {
                 samples: tone(1.0),
                 sample_rate: 48_000,
                 channels: 1,
+                captured: Instant::now(),
             }
             .to_model_input(&mut Resampler::default()),
             start_sample: 0,

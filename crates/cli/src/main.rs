@@ -116,6 +116,7 @@ fn read_wav(path: &PathBuf) -> Result<AudioChunk, String> {
         samples,
         sample_rate: spec.sample_rate,
         channels: spec.channels,
+        captured: Instant::now(),
     })
 }
 

@@ -36,7 +36,8 @@ The channel is unbounded and nothing is dropped, because the audio callback must
 slower than realtime instead sheds work: a segment that reaches the recognizer more than
 `max_lag_seconds` (2 s) after its audio ended skips the noisy decodes, and the tray says it is
 catching up. A segment that keeps up arrives about half a second after its audio ends, so the check
-comes back as soon as the backlog is gone. The clean decode always runs.
+comes back as soon as the backlog is gone. The clean decode always runs. Each block carries the time
+it was recorded, so the lag also counts audio that waited while the worker loaded the VAD.
 
 ## Modules
 

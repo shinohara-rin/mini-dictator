@@ -1,6 +1,8 @@
 //! Audio plumbing shared by the shells and the core. The core works on mono `f32` samples in
 //! `[-1, 1]` at [`SAMPLE_RATE`].
 
+use std::time::Instant;
+
 /// The sample rate of every model in the core.
 pub const SAMPLE_RATE: u32 = 16_000;
 
@@ -10,6 +12,9 @@ pub struct AudioChunk {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub channels: u16,
+    /// When the block's last sample was recorded. The core measures how far behind it is from
+    /// this.
+    pub captured: Instant,
 }
 
 impl AudioChunk {
