@@ -42,7 +42,9 @@ pub struct Piece<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct Joiner {
     /// The final period of the last piece, not typed yet.
-    held: String,
+    held: &'static str,
+    /// Closing quotes or brackets after that period, typed whether or not the sentence goes on.
+    closing: String,
     /// The sample where the speech of the last typed piece ended.
     speech_end: Option<u64>,
 }
@@ -63,8 +65,7 @@ impl Joiner {
     /// The text to type for `piece` after `typed`: a held period when the piece starts a new
     /// sentence, a separating space, and the piece without its own final period.
     pub fn join(&mut self, typed: &str, piece: &Piece, config: &JoinConfig) -> String {
-        let (body, held) = split_final_period(piece.text.trim());
-        let body = body.as_str();
+        let (body, period, closing) = split_final_period(piece.text.trim());
         let continues = piece.pause_seconds.is_some_and(|pause| {
             // An opening quote or bracket says nothing; the letter after it does.
             let first = body.chars().find(|&c| !is_opening_punctuation(c));
@@ -84,11 +85,12 @@ impl Joiner {
             }
         });
         let mut text = if continues {
-            String::new()
+            std::mem::take(&mut self.closing)
         } else {
-            std::mem::take(&mut self.held)
+            self.finish()
         };
-        self.held = held.to_owned();
+        self.held = period;
+        self.closing = closing.to_owned();
         let body = if continues && !piece.rewritten {
             lowercase_first_word(body, piece.names)
         } else {
@@ -110,9 +112,10 @@ impl Joiner {
         text
     }
 
-    /// The held period, typed when the dictation ends.
+    /// The held period and the closing quotes after it, typed when the dictation ends.
     pub fn finish(&mut self) -> String {
-        std::mem::take(&mut self.held)
+        let closing = std::mem::take(&mut self.closing);
+        format!("{}{closing}", std::mem::take(&mut self.held))
     }
 }
 
@@ -131,20 +134,36 @@ fn speech_span(segment: &SpeechSegment, config: &SegmenterConfig) -> (u64, u64) 
     (start, end)
 }
 
-/// Splits off a final period, Latin or CJK. An ellipsis stays, and so do `?` and `!`, which the
-/// recognizer rarely adds where a sentence goes on. A period inside closing quotes or brackets
-/// moves outside them: `“fast.”` keeps `“fast”` and holds the period.
-fn split_final_period(text: &str) -> (String, &'static str) {
+/// Splits off a final period, Latin or CJK, with any closing quotes or brackets after it:
+/// `He said “fast.”` gives `He said “fast` and `.`, `”`. An ellipsis stays, and so does the period
+/// of an abbreviation like "Dr.", and `?` and `!`, which the recognizer rarely adds where a
+/// sentence goes on.
+fn split_final_period(text: &str) -> (&str, &'static str, &str) {
     let inner = text.trim_end_matches(is_closing_punctuation);
     let closing = &text[inner.len()..];
     for period in [".", "。", "．"] {
         if let Some(body) = inner.strip_suffix(period) {
-            if !body.ends_with(['.', '。', '．', '…']) && !body.trim().is_empty() {
-                return (format!("{}{closing}", body.trim_end()), period);
+            let last_word = body.rsplit(char::is_whitespace).next().unwrap_or("");
+            if !body.ends_with(['.', '。', '．', '…'])
+                && !body.trim().is_empty()
+                && !is_abbreviation(last_word)
+            {
+                return (body.trim_end(), period, closing);
             }
         }
     }
-    (text.to_owned(), "")
+    (text, "", "")
+}
+
+/// Words whose period belongs to them, not to the sentence.
+fn is_abbreviation(word: &str) -> bool {
+    const ABBREVIATIONS: [&str; 16] = [
+        "mr", "mrs", "ms", "dr", "prof", "st", "jr", "sr", "vs", "etc", "e.g", "i.e", "inc", "ltd",
+        "co", "no",
+    ];
+    ABBREVIATIONS
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(word.trim_start_matches(is_opening_punctuation)))
 }
 
 /// Punctuation that closes a quote or an aside.
@@ -253,6 +272,22 @@ mod tests {
     }
 
     #[test]
+    fn closing_quotes_stay_after_a_held_period() {
+        assert_eq!(
+            dictate(
+                &[(0.0, "He called it “fast.”"), (0.7, "and reliable.")],
+                false
+            ),
+            "He called it “fast” and reliable."
+        );
+        assert_eq!(
+            dictate(&[(0.0, "He called it “fast.”"), (2.0, "Then left.")], false),
+            "He called it “fast.” Then left."
+        );
+        assert_eq!(dictate(&[(0.0, "「速い。」")], false), "「速い。」");
+    }
+
+    #[test]
     fn a_long_pause_ends_the_sentence() {
         assert_eq!(
             dictate(&[(0.0, "That works."), (2.0, "Next, the icon.")], false),
@@ -337,9 +372,10 @@ mod tests {
         assert_eq!(joiner.finish(), ".");
         assert_eq!(
             joiner.join("", &piece("He called it “fast.”"), &config),
-            "He called it “fast”"
+            "He called it “fast"
         );
-        assert_eq!(joiner.finish(), ".");
+        assert_eq!(joiner.finish(), ".”");
+        assert_eq!(joiner.join("", &piece("Ask Dr."), &config), "Ask Dr.");
         assert_eq!(joiner.finish(), "");
     }
 

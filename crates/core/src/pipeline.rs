@@ -291,11 +291,17 @@ impl Engine {
             pause_seconds,
             names: &session.hotwords,
         };
+        let before = session.joiner.clone();
         let text = session
             .joiner
             .join(&session.inserted, &piece, &self.config.join);
         session.joiner.typed(segment, &self.config.segmenter);
-        self.insert(text, session, sink, events)
+        let inserted = self.insert(text, session, sink, events);
+        if inserted.is_err() {
+            // Nothing was typed, so the period held before is still the one to type at the end.
+            session.joiner = before;
+        }
+        inserted
     }
 
     /// Types the period held back from the last segment. Call it when the dictation ends.
