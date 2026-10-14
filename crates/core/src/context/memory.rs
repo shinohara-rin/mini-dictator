@@ -32,8 +32,10 @@ impl Default for MemoryConfig {
     }
 }
 
-/// Weight below which a term is forgotten: about four half-lives after a single glance.
-const FORGET_WEIGHT: f32 = 0.02;
+/// A term is forgotten below this share of what one full sample (a score of 1 for `max_gap`)
+/// earns. A share rather than a fixed weight, because a sample earns less with a longer
+/// half-life: a single 5 s glance then fades out after about two half-lives at any setting.
+const FORGET_SHARE: f32 = 0.12;
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -64,6 +66,11 @@ impl TermMemory {
             config,
             state: Mutex::default(),
         }
+    }
+
+    /// Weight below which a term is forgotten, 0.02 with the default config.
+    fn forget_weight(&self) -> f32 {
+        FORGET_SHARE * self.config.max_gap.as_secs_f32() / self.config.half_life.as_secs_f32()
     }
 
     fn decay(&self, weight: f32, elapsed: Duration) -> f32 {
@@ -109,7 +116,8 @@ impl TermMemory {
             return;
         }
         let current = |e: &Entry| self.decay(e.weight, now.saturating_duration_since(e.updated));
-        state.entries.retain(|_, e| current(e) >= FORGET_WEIGHT);
+        let forget = self.forget_weight();
+        state.entries.retain(|_, e| current(e) >= forget);
         if state.entries.len() > self.config.max_terms {
             // Exactly the heaviest `max_terms`, even when weights tie at the cut.
             let mut ranked: Vec<(String, f32)> = state
@@ -135,7 +143,7 @@ impl TermMemory {
                 score: self.decay(e.weight, now.saturating_duration_since(e.updated)),
                 form: e.form,
             })
-            .filter(|t| t.score >= FORGET_WEIGHT)
+            .filter(|t| t.score >= self.forget_weight())
             .collect();
         terms.sort_by(|a, b| b.score.total_cmp(&a.score));
         terms
@@ -221,6 +229,23 @@ mod tests {
         let later = memory.recall(start + Duration::from_secs(65))[0].score;
         assert!((later - fresh / 2.0).abs() < 1e-4, "{fresh} {later}");
         assert!(memory.recall(start + Duration::from_secs(600)).is_empty());
+    }
+
+    #[test]
+    fn a_long_half_life_still_remembers_a_glance() {
+        let memory = TermMemory::new(MemoryConfig {
+            half_life: Duration::from_secs(600),
+            ..MemoryConfig::default()
+        });
+        let start = Instant::now();
+        memory.observe(&[], start);
+        // One 5 s sample earns 5 / 600 of the score, below the default config's forget weight.
+        memory.observe(&[term("Airicraft", 1.0)], start + Duration::from_secs(5));
+        assert_eq!(
+            phrases(&memory.recall(start + Duration::from_secs(600))),
+            vec!["Airicraft"]
+        );
+        assert!(memory.recall(start + Duration::from_secs(1800)).is_empty());
     }
 
     #[test]
