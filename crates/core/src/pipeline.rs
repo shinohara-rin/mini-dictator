@@ -441,17 +441,24 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     // Samples heard so far, and when the last of them was recorded.
     let mut clock = (0, Instant::now());
 
-    for chunk in audio {
-        let samples = chunk.to_model_input(&mut resampler);
-        clock = (clock.0 + samples.len() as u64, chunk.captured);
-        for segment in segmenter.push(&samples) {
+    let dictate = || -> Result<()> {
+        for chunk in audio {
+            let samples = chunk.to_model_input(&mut resampler);
+            clock = (clock.0 + samples.len() as u64, chunk.captured);
+            for segment in segmenter.push(&samples) {
+                engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
+            }
+        }
+        if let Some(segment) = segmenter.finish() {
             engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
         }
-    }
-    if let Some(segment) = segmenter.finish() {
-        engine.process(&segment, lag(&segment, clock), &mut session, sink, events)?;
-    }
-    engine.finish(&mut session, sink, events)?;
+        Ok(())
+    };
+    let dictated = dictate();
+    // Text already typed keeps its final period when a later segment fails.
+    let finished = engine.finish(&mut session, sink, events);
+    dictated?;
+    finished?;
     events(Event::Finished);
     Ok(session.inserted)
 }

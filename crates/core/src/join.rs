@@ -70,8 +70,10 @@ impl Joiner {
                 true
             } else if piece.rewritten
                 && first.is_some_and(char::is_uppercase)
-                && !is_i(first_word(body))
+                && !keeps_capital(first_word(body), piece.names)
             {
+                // "I", a name, or an acronym keeps its capital mid-sentence, so only the pause
+                // can tell.
                 false
             } else {
                 pause < config.sentence_pause_seconds
@@ -149,23 +151,25 @@ fn is_i(word: &str) -> bool {
     word == "I" || word.starts_with("I'") || word.starts_with("I’")
 }
 
-/// Lowercases the first letter unless the word is "I", one of `names`, or has other capitals
-/// (an acronym or a name like "iPhone" or "McDonald").
-fn lowercase_first_word(text: &str, names: &[String]) -> String {
-    let word = first_word(text);
-    let mut chars = word.chars();
-    let Some(first) = chars.next() else {
-        return text.to_owned();
-    };
-    let keep = !first.is_uppercase()
-        || is_i(word)
-        || chars.any(char::is_uppercase)
+/// True when a capitalized word keeps its capital mid-sentence: "I", one of `names`, or a word
+/// with other capitals (an acronym or a name like "McDonald").
+fn keeps_capital(word: &str, names: &[String]) -> bool {
+    is_i(word)
+        || word.chars().skip(1).any(char::is_uppercase)
         || names.iter().any(|name| {
             name.split_whitespace()
                 .next()
                 .is_some_and(|n| n.eq_ignore_ascii_case(word))
-        });
-    if keep {
+        })
+}
+
+/// Lowercases the first letter unless the word [keeps its capital](keeps_capital).
+fn lowercase_first_word(text: &str, names: &[String]) -> String {
+    let word = first_word(text);
+    let Some(first) = word.chars().next() else {
+        return text.to_owned();
+    };
+    if !first.is_uppercase() || keeps_capital(word, names) {
         return text.to_owned();
     }
     first
@@ -262,10 +266,21 @@ mod tests {
             ),
             "That works. Next, the icon and the menu."
         );
-        // "I" says nothing, so the pause decides.
+        // "I", a name or an acronym says nothing, so the pause decides.
         assert_eq!(
             dictate(&[(0.0, "Sure."), (0.7, "I can.")], true),
             "Sure I can."
+        );
+        assert_eq!(
+            dictate(
+                &[
+                    (0.0, "I think."),
+                    (0.7, "Rin can help."),
+                    (2.0, "ONNX works.")
+                ],
+                true
+            ),
+            "I think Rin can help. ONNX works."
         );
         // A reply that opens with punctuation attaches to the text before it.
         assert_eq!(
