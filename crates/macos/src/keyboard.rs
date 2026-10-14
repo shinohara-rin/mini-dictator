@@ -162,10 +162,7 @@ pub struct Listener {
 
 /// `on_signal` runs on the main thread.
 pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Option<Listener> {
-    let held = Held::from_flags(
-        CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).bits(),
-    );
-    let mut matcher = Matcher::new(hotkey, held);
+    let mut matcher = Matcher::new(hotkey, held_now());
     let tap = Tap::new(
         KEYS | CLICKS,
         Box::new(move |key| {
@@ -184,6 +181,11 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
     Some(Listener { _tap: tap })
 }
 
+/// The modifiers down right now, since a new tap hears of them only once they change.
+fn held_now() -> Held {
+    Held::from_flags(CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).bits())
+}
+
 /// A recording in progress. Dropping it stops recording.
 pub struct Capture {
     _tap: Tap,
@@ -192,7 +194,7 @@ pub struct Capture {
 /// Records the next hotkey, keeping every key from other apps meanwhile. `on_outcome` runs on
 /// the main thread, until it is given a recorded hotkey or a cancel.
 pub fn record(mut on_outcome: impl FnMut(Outcome) + 'static) -> Option<Capture> {
-    let mut recorder = Recorder::default();
+    let mut recorder = Recorder::new(held_now());
     let mut done = false;
     let tap = Tap::new(
         KEYS,

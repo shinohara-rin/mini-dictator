@@ -358,6 +358,15 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Starts with the modifiers already down, as when Command-clicking the menu item, so a key
+    /// pressed with them counts. They alone never become the hotkey unless pressed again.
+    pub fn new(held: Held) -> Self {
+        Self {
+            held,
+            ..Self::default()
+        }
+    }
+
     pub fn key_down(&mut self, code: u16, repeat: bool) -> Option<Outcome> {
         if repeat {
             return None;
@@ -782,6 +791,20 @@ mod tests {
             recorder.modifiers_changed(Held::default()),
             Some(Outcome::Recorded(hotkey("RightCmd+D")))
         );
+    }
+
+    #[test]
+    fn modifiers_held_when_recording_starts_count() {
+        let mut recorder = Recorder::new(held(&[COMMAND], &[]));
+        assert_eq!(recorder.key_down(KEY_D, false), None);
+        recorder.key_up(KEY_D);
+        assert_eq!(
+            recorder.modifiers_changed(Held::default()),
+            Some(Outcome::Recorded(hotkey("Cmd+D")))
+        );
+        // Only letting go of them records nothing.
+        let mut recorder = Recorder::new(held(&[COMMAND], &[]));
+        assert_eq!(recorder.modifiers_changed(Held::default()), None);
     }
 
     #[test]
