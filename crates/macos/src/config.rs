@@ -98,9 +98,10 @@ fn write(text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let path = config_path();
-    let temporary = path.with_extension("toml.tmp");
     std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
+    // A symlinked config, such as one kept in a dotfiles repository, is replaced at its target.
+    let path = std::fs::canonicalize(config_path()).unwrap_or_else(|_| config_path());
+    let temporary = path.with_extension("toml.tmp");
     let written = (|| {
         // A leftover temporary could be open elsewhere with looser permissions, so start fresh:
         // `mode` applies only to a file this call creates.
