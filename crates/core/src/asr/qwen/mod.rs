@@ -774,7 +774,8 @@ fn stretch_end(
     let window = (start + 1)..reference.len().min(start + REJOIN_WINDOW + 1);
     let matched = window.into_iter().find(|j| {
         reference[*j] == last
-            && ((starts_word(tokenizer, last) && tokenizer.bytes(last).len() >= 2)
+            && ((starts_word(tokenizer, reference.get(*j - 1).copied(), last)
+                && tokenizer.bytes(last).len() >= 2)
                 || (row.len() >= 2 && reference[*j - 1] == row[row.len() - 2].0))
     });
     if let Some(j) = matched {
@@ -798,7 +799,8 @@ fn stretch_end(
         return Some(Some(start));
     }
     // The word ended when the next one begins: the row's word stands for the reference's.
-    if row.len() >= 2 && starts_word(tokenizer, last) && whole(&row[..row.len() - 1]) {
+    let previous = row.len().checked_sub(2).map(|k| row[k].0);
+    if row.len() >= 2 && starts_word(tokenizer, previous, last) && whole(&row[..row.len() - 1]) {
         row.pop();
         return Some(Some(next_word(tokenizer, reference, start)));
     }
@@ -809,24 +811,37 @@ fn stretch_end(
 /// The first reference token after `start` that begins a word, or the reference's end.
 fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize {
     ((start + 1)..reference.len())
-        .find(|j| starts_word(tokenizer, reference[*j]))
+        .find(|j| starts_word(tokenizer, Some(reference[*j - 1]), reference[*j]))
         .unwrap_or(reference.len())
 }
 
 /// True when a token begins a word: after a space, or with punctuation or a CJK character,
-/// which are words of their own.
-fn starts_word(tokenizer: &BpeTokenizer, id: u32) -> bool {
+/// which are words of their own, unless it is an apostrophe or hyphen going on from the word in
+/// the `previous` token.
+fn starts_word(tokenizer: &BpeTokenizer, previous: Option<u32>, id: u32) -> bool {
     let bytes = tokenizer.bytes(id);
     if bytes.first() == Some(&b' ') {
         return true;
     }
-    let head = match std::str::from_utf8(bytes) {
+    let first = valid_prefix(bytes).chars().next();
+    // An apostrophe or hyphen right after a letter joins the word, as in `John's`, the way
+    // `split_words` reads it.
+    let joins = matches!(first, Some('\'' | '’' | '-'))
+        && previous.is_some_and(|p| {
+            valid_prefix(tokenizer.bytes(p))
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace() && !is_punctuation(c) && !is_cjk(c))
+        });
+    !joins && first.is_some_and(|c| is_punctuation(c) || is_cjk(c))
+}
+
+/// The bytes up to the first that isn't valid UTF-8, as text.
+fn valid_prefix(bytes: &[u8]) -> &str {
+    match std::str::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap_or(""),
-    };
-    head.chars()
-        .next()
-        .is_some_and(|c| is_punctuation(c) || is_cjk(c))
+    }
 }
 
 /// Tokens a noisy row decodes on its own from reference token `start`, and the reference token it
@@ -1115,6 +1130,18 @@ mod tests {
             Some(Some(1))
         );
         assert_eq!(ended, row(&ids("xy")));
+        // An apostrophe after a letter goes on with the word, as in `John's`.
+        let apostrophe = ids("'")[0];
+        assert_eq!(
+            stretch_end(
+                &t,
+                &stops,
+                &mut row(&[ids("x")[0], apostrophe]),
+                &reference,
+                0
+            ),
+            None
+        );
         // The row stopped.
         let mut stopped = row(&[ids("x")[0], 300]);
         assert_eq!(
