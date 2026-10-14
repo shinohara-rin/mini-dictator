@@ -118,6 +118,18 @@ pub fn is_trusted(prompt: bool) -> bool {
     unsafe { AXIsProcessTrustedWithOptions(Some(options.as_opaque())) }
 }
 
+/// The focused app's name and its focused window's title: a cheap check for whether the screen
+/// changed, two requests instead of a full read.
+pub fn focused_window() -> Option<(String, String)> {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    unsafe { system.set_messaging_timeout(0.1) };
+    let app = element(&system, "AXFocusedApplication")?;
+    let title = element(&app, "AXFocusedWindow")
+        .and_then(|w| string(&w, "AXTitle"))
+        .unwrap_or_default();
+    Some((string(&app, "AXTitle").unwrap_or_default(), title))
+}
+
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
     let name = CFString::from_str(name);
     let mut value: *const CFType = std::ptr::null();

@@ -15,6 +15,7 @@ use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
+use mini_dictator_core::context::{rank_terms, MemoryConfig, TermMemory};
 use mini_dictator_core::pipeline::{run_dictation, Engine, EngineConfig, Event as CoreEvent};
 use mini_dictator_core::rewrite::{OpenAiCompatible, Rewriter};
 use mini_dictator_core::vad::{EnergyVad, SileroVad};
@@ -25,7 +26,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::{config_path, support_dir, Config, APP_NAME};
-use crate::context::{is_trusted, AccessibilityReader};
+use crate::context::{focused_window, is_trusted, AccessibilityReader};
 use crate::icons::{icon, State};
 use crate::paste::PasteSink;
 use crate::permissions;
@@ -37,6 +38,12 @@ const HOLD_THRESHOLD: Duration = Duration::from_millis(350);
 
 /// How often the menu checks permissions, which the user can grant at any time in System Settings.
 const PERMISSION_POLL: Duration = Duration::from_secs(2);
+/// How often the term memory checks the focused window between dictations.
+const MEMORY_SAMPLE: Duration = Duration::from_secs(5);
+/// A full read of an unchanged window, for content that scrolls or updates. Each read briefly
+/// holds up the app being read, so the memory reads again only when the window changes or this
+/// much time has passed.
+const MEMORY_REREAD: Duration = Duration::from_secs(30);
 
 enum AppEvent {
     Menu(MenuEvent),
@@ -86,6 +93,18 @@ fn load_engine(config: &Config) -> Result<(Engine, Switches), String> {
     let engine = Engine {
         asr: recognizer,
         context: Box::new(screen),
+        memory: Arc::new(TermMemory::new(if config.screen_memory_seconds > 0 {
+            MemoryConfig {
+                half_life: Duration::from_secs(config.screen_memory_seconds),
+                max_gap: MEMORY_SAMPLE * 2,
+                ..MemoryConfig::default()
+            }
+        } else {
+            MemoryConfig {
+                max_terms: 0,
+                ..MemoryConfig::default()
+            }
+        })),
         rewriter: Box::new(rewriter),
         config: EngineConfig {
             monte_carlo,
@@ -263,6 +282,8 @@ pub fn run() {
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
+    // Shared with the memory sampler, which pauses while a dictation reads the screen itself.
+    let dictating = Arc::new(AtomicBool::new(false));
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -296,6 +317,9 @@ pub fn run() {
                 let Some(ui) = &ui else { return };
                 match result {
                     Ok((loaded, found)) => {
+                        if config.screen_memory_seconds > 0 {
+                            sample_screen(loaded.clone(), dictating.clone());
+                        }
                         engine = Some(loaded);
                         switches = Some(found);
                         ui.toggle.set_enabled(true);
@@ -314,6 +338,7 @@ pub fn run() {
                         if let Some(engine) = &engine {
                             dictation = start(engine.clone(), vad_path.clone(), proxy.clone(), ui);
                             busy = dictation.is_some();
+                            dictating.store(busy, Ordering::Relaxed);
                         }
                     }
                     (HotKeyState::Pressed, Some(_)) => stop(&mut dictation, ui),
@@ -333,6 +358,7 @@ pub fn run() {
                         (None, Some(engine)) if !busy => {
                             dictation = start(engine.clone(), vad_path.clone(), proxy.clone(), ui);
                             busy = dictation.is_some();
+                            dictating.store(busy, Ordering::Relaxed);
                         }
                         _ => {}
                     }
@@ -343,6 +369,9 @@ pub fn run() {
                 } else if event.id == ui.screen.id() {
                     if let Some(s) = &switches {
                         s.screen.store(ui.screen.is_checked(), Ordering::Relaxed);
+                    }
+                    if let Some(engine) = engine.as_ref().filter(|_| !ui.screen.is_checked()) {
+                        engine.memory.clear();
                     }
                 } else if event.id == ui.open_config.id() {
                     open(&config_path());
@@ -395,6 +424,7 @@ pub fn run() {
             }
             Event::UserEvent(AppEvent::Done(error)) => {
                 busy = false;
+                dictating.store(false, Ordering::Relaxed);
                 let Some(ui) = &ui else { return };
                 // The dictation failed while the microphone was on: stop recording.
                 if dictation.take().is_some() {
@@ -410,6 +440,38 @@ pub fn run() {
                 }
             }
             _ => {}
+        }
+    });
+}
+
+/// Feeds the term memory every [`MEMORY_SAMPLE`] while no dictation runs. An unchanged window
+/// counts its last terms again without a read. The engine's screen reader returns nothing while the
+/// menu switch is off.
+fn sample_screen(engine: Arc<Engine>, dictating: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut last: Option<((String, String), Instant)> = None;
+        let mut terms = Vec::new();
+        loop {
+            std::thread::sleep(MEMORY_SAMPLE);
+            if dictating.load(Ordering::Relaxed) {
+                // The dictation reads the screen itself; read afresh after it.
+                last = None;
+                continue;
+            }
+            let Some(window) = focused_window() else {
+                continue;
+            };
+            let fresh = last
+                .as_ref()
+                .is_some_and(|(seen, read)| *seen == window && read.elapsed() < MEMORY_REREAD);
+            if !fresh {
+                terms = match engine.context.snapshot() {
+                    Ok(screen) => rank_terms(&screen, engine.config.max_hotwords),
+                    Err(_) => Vec::new(),
+                };
+                last = Some((window, Instant::now()));
+            }
+            engine.memory.observe(&terms, Instant::now());
         }
     });
 }
