@@ -63,18 +63,24 @@ impl Tap {
         }));
         // SAFETY: the callback matches the signature CoreGraphics calls, and `state` stays valid
         // until `Tap` drops, which removes the tap first.
-        let port = unsafe {
+        // First where keys enter the window server, ahead of system shortcuts such as the
+        // dictation key's. Apple documents that location as root-only, though trusted apps get it
+        // in practice; failing that, the session, which still sees every key.
+        let port = [
+            CGEventTapLocation::HIDEventTap,
+            CGEventTapLocation::SessionEventTap,
+        ]
+        .into_iter()
+        .find_map(|location| unsafe {
             CGEvent::tap_create(
-                // Where keys enter the window server, ahead of system shortcuts such as the
-                // dictation key's.
-                CGEventTapLocation::HIDEventTap,
+                location,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::Default,
                 mask,
                 Some(on_event),
                 state.cast(),
             )
-        };
+        });
         let source = port
             .as_ref()
             .and_then(|port| CFMachPort::new_run_loop_source(None, Some(port), 0));
