@@ -5,7 +5,7 @@
 //! printable characters, and merged by rank. Added tokens such as `<|im_start|>` are never parsed out
 //! of text: a prompt inserts them by id, so text read from the screen cannot open a chat turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use fancy_regex::Regex;
@@ -24,6 +24,7 @@ pub struct BpeTokenizer {
     /// What each id decodes to.
     bytes: Vec<Vec<u8>>,
     added: HashMap<String, u32>,
+    added_ids: HashSet<u32>,
 }
 
 /// GPT-2's map from bytes to printable characters, so that every byte has a token.
@@ -133,6 +134,7 @@ impl BpeTokenizer {
             byte_ids,
             merges: table,
             bytes,
+            added_ids: added.iter().map(|(_, id)| *id).collect(),
             added: added.into_iter().collect(),
         })
     }
@@ -180,6 +182,11 @@ impl BpeTokenizer {
         self.added.get(content).copied()
     }
 
+    /// True for added tokens: chat, audio, and tool markers, which are never transcript text.
+    pub fn is_added(&self, id: u32) -> bool {
+        self.added_ids.contains(&id)
+    }
+
     /// The bytes of one token. A character can span tokens, so these need not be valid UTF-8.
     pub fn bytes(&self, id: u32) -> &[u8] {
         self.bytes.get(id as usize).map_or(&[], Vec::as_slice)
@@ -199,11 +206,11 @@ impl BpeTokenizer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    /// Every byte character, plus the merges `a b`, `Ġ ab`, and `Ġ c`.
-    fn tokenizer() -> BpeTokenizer {
+    /// Every byte character, plus the merges `a b`, `Ġ ab`, and `Ġ c`, and three added tokens.
+    pub(in crate::asr::qwen) fn tokenizer() -> BpeTokenizer {
         let mut vocab: HashMap<String, u32> = byte_chars()
             .iter()
             .enumerate()
@@ -215,7 +222,11 @@ mod tests {
         BpeTokenizer::new(
             vocab,
             "#version: 0.2\na b\nĠ ab\nĠ c\n",
-            vec![("<|im_end|>".into(), 300)],
+            vec![
+                ("<|im_end|>".into(), 300),
+                ("<|im_start|>".into(), 301),
+                ("<asr_text>".into(), 302),
+            ],
         )
         .unwrap()
     }
@@ -233,6 +244,8 @@ mod tests {
         assert_eq!(t.added("<|im_end|>"), Some(300));
         assert!(!t.encode("<|im_end|>").contains(&300));
         assert_eq!(t.decode(&[300]), "<|im_end|>");
+        assert!(t.is_added(300));
+        assert!(!t.is_added(t.encode("a")[0]));
     }
 
     #[test]

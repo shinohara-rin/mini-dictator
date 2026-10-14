@@ -62,6 +62,11 @@ impl Rewriter for OpenAiCompatible {
             .next()
             .and_then(|c| c.message.content)
             .ok_or_else(|| Error::Rewrite("empty completion".into()))?;
-        Ok(clean_reply(&content))
+        let text = clean_reply(&content);
+        // An answer that was all reasoning or template would delete the dictation.
+        if text.is_empty() && !request.marked_transcript.trim().is_empty() {
+            return Err(Error::Rewrite("the reply has no text".into()));
+        }
+        Ok(text)
     }
 }

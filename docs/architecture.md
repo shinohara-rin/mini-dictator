@@ -61,8 +61,9 @@ languages and Chinese dialects, with punctuation and casing. The core runs the s
   100-frame chunks, and the encoder with a mask of the valid audio tokens (12.5 per second).
 - A chat prompt with hotwords in the system turn and one `<|audio_pad|>` per audio token. The decoder
   replaces those with the audio features and returns the key/value entries of the tokens it read; the
-  core keeps the cache and decodes greedily, stopping at `<|im_end|>` or a repetition loop, and strips
-  the `language X<asr_text>` header.
+  core keeps the cache and decodes greedily, stopping at `<|im_end|>`, `<|endoftext|>`, or a
+  repetition loop. It strips the `language X<asr_text>` header and every added token, since the
+  model sometimes opens its answer with another `<|im_start|>`.
 - `BpeTokenizer` is Qwen2's byte-level BPE (NFC, the Qwen2 split pattern, merges by rank), matching
   Hugging Face on the test strings. Chat tokens go into the prompt by id and are never parsed from
   text, so screen text cannot open a chat turn.
@@ -148,7 +149,9 @@ goes to the rewrite model only when `share_screen_text` is on.
 `rewrite::SYSTEM_PROMPT` tells the model to fix recognition errors, punctuation, and fillers without
 adding content, to resolve `[unclear: ...]` spans from context and screen terms, and to reply with
 the final text only. `OpenAiCompatible` talks to any chat completions endpoint (hosted, OpenRouter,
-Ollama, llama.cpp). A failed rewrite inserts the plain transcript and reports a warning.
+Ollama, llama.cpp). The reply loses a leading `<think>` block and any chat template tokens a server
+lets through. A failed rewrite, or one with no text left, inserts the plain transcript and reports a
+warning.
 
 ## Platform shell contract
 

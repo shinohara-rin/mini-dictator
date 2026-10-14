@@ -80,9 +80,29 @@ pub fn user_prompt(request: &RewriteRequest) -> String {
     prompt
 }
 
-/// Removes a wrapping that some models add despite the instructions.
+/// Removes what some models and servers add around the answer: chat template tokens that leak
+/// through (`<|im_start|>assistant`, `<|im_end|>`), a reasoning block (`<think>...</think>`), a
+/// `<transcript>` wrapping, or quotes. A reasoning block that never closes leaves nothing.
 pub fn clean_reply(reply: &str) -> String {
-    let trimmed = reply.trim();
+    let mut text = reply.trim();
+    // A role line and a reasoning block can come in either order.
+    loop {
+        if let Some(rest) = text.strip_prefix("<|im_start|>") {
+            text = rest.split_once('\n').map_or("", |(_, answer)| answer);
+        } else if let Some(rest) = text.strip_prefix("<think>") {
+            text = rest.split_once("</think>").map_or("", |(_, answer)| answer);
+        } else {
+            break;
+        }
+        text = text.trim_start();
+    }
+    // The end of the turn, or a new turn the model started on its own.
+    for end in ["<|im_end|>", "<|endoftext|>", "<|im_start|>"] {
+        if let Some((answer, _)) = text.split_once(end) {
+            text = answer;
+        }
+    }
+    let trimmed = text.trim();
     let unwrapped = trimmed
         .strip_prefix("<transcript>")
         .and_then(|s| s.strip_suffix("</transcript>"))
@@ -123,5 +143,32 @@ mod tests {
         assert_eq!(clean_reply("\"Hello there.\"\n"), "Hello there.");
         assert_eq!(clean_reply("<transcript>\nHi\n</transcript>"), "Hi");
         assert_eq!(clean_reply("He said \"hi\""), "He said \"hi\"");
+    }
+
+    #[test]
+    fn strips_chat_tokens_and_reasoning_from_replies() {
+        assert_eq!(
+            clean_reply("<|im_start|>assistant\nHello.<|im_end|>"),
+            "Hello."
+        );
+        assert_eq!(
+            clean_reply("Hello.<|im_end|>\n<|im_start|>user\nmore"),
+            "Hello."
+        );
+        assert_eq!(clean_reply("Hello.<|im_start|>assistant\nagain"), "Hello.");
+        assert_eq!(
+            clean_reply("<think>\nfix the name\n</think>\n\nHello."),
+            "Hello."
+        );
+        assert_eq!(clean_reply("<think>\n\n</think>\n\n\"Hello.\""), "Hello.");
+        assert_eq!(clean_reply("<think>still thinking"), "");
+        assert_eq!(
+            clean_reply("<think>fix it</think>\n<|im_start|>assistant\nFixed.<|im_end|>"),
+            "Fixed."
+        );
+        assert_eq!(
+            clean_reply("<|im_start|>assistant\n<think>fix it</think>\nFixed.<|im_end|>"),
+            "Fixed."
+        );
     }
 }
