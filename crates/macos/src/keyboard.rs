@@ -11,7 +11,7 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventMask, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
-    CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType,
+    CGEventTapOptions, CGEventTapPlacement, CGEventTapProxy, CGEventType, CGMouseButton,
 };
 
 use crate::hotkey::{Held, Hotkey, Matcher, Outcome, Recorder, Signal};
@@ -169,7 +169,10 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
             let (signal, swallow) = match key {
                 Key::Down { code, repeat } => matcher.key_down(code, repeat),
                 Key::Up { code } => matcher.key_up(code),
-                Key::Modifiers(held) => (matcher.modifiers_changed(held), false),
+                Key::Modifiers(held) => {
+                    matcher.set_button_down(button_down());
+                    (matcher.modifiers_changed(held), false)
+                }
                 Key::Click => (matcher.mouse_down(), false),
             };
             if let Some(signal) = signal {
@@ -184,6 +187,17 @@ pub fn listen(hotkey: Hotkey, mut on_signal: impl FnMut(Signal) + 'static) -> Op
 /// The modifiers down right now, since a new tap hears of them only once they change.
 fn held_now() -> Held {
     Held::from_flags(CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).bits())
+}
+
+/// Whether any mouse button is down right now. Asked rather than tracked, since a missed button-up
+/// would otherwise keep the hotkey from firing.
+fn button_down() -> bool {
+    (0..3).any(|button| {
+        CGEventSource::button_state(
+            CGEventSourceStateID::CombinedSessionState,
+            CGMouseButton(button),
+        )
+    })
 }
 
 /// A recording in progress. Dropping it stops recording.

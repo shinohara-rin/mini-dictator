@@ -242,6 +242,8 @@ pub struct Matcher {
     /// Whether a modifier-only hotkey may fire: not after another modifier joined, until every
     /// modifier is up again.
     armed: bool,
+    /// Whether a mouse button is down, as when Option turns a drag into a copy.
+    button_down: bool,
 }
 
 impl Matcher {
@@ -252,6 +254,7 @@ impl Matcher {
             keys: HashSet::new(),
             active: false,
             armed: held.is_empty(),
+            button_down: false,
         }
     }
 
@@ -305,6 +308,11 @@ impl Matcher {
         (None, false)
     }
 
+    /// A modifier-only hotkey does not fire while a mouse button is down.
+    pub fn set_button_down(&mut self, down: bool) {
+        self.button_down = down;
+    }
+
     pub fn modifiers_changed(&mut self, held: Held) -> Option<Signal> {
         self.held = held;
         if self.hotkey.key.is_some() {
@@ -323,7 +331,12 @@ impl Matcher {
             self.active = false;
             return Some(Signal::Released);
         }
-        if !self.active && self.armed && self.keys.is_empty() && self.hotkey.matches(held) {
+        if !self.active
+            && self.armed
+            && self.keys.is_empty()
+            && !self.button_down
+            && self.hotkey.matches(held)
+        {
             self.active = true;
             return Some(Signal::Pressed);
         }
@@ -711,6 +724,19 @@ mod tests {
         assert_eq!(matcher.mouse_down(), None);
         assert_eq!(
             matcher.modifiers_changed(held(&[], &[COMMAND])),
+            Some(Signal::Pressed)
+        );
+    }
+
+    #[test]
+    fn a_lone_modifier_does_not_fire_during_a_drag() {
+        let mut matcher = Matcher::new(hotkey("RightAlt"), Held::default());
+        matcher.set_button_down(true);
+        assert_eq!(matcher.modifiers_changed(held(&[], &[OPTION])), None);
+        matcher.modifiers_changed(Held::default());
+        matcher.set_button_down(false);
+        assert_eq!(
+            matcher.modifiers_changed(held(&[], &[OPTION])),
             Some(Signal::Pressed)
         );
     }
