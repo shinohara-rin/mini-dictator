@@ -96,7 +96,12 @@ impl Joiner {
         };
         self.held = period;
         self.closing = closing.to_owned();
-        let body = if continues && !piece.rewritten {
+        // After "Dr." or "Mr." comes a name.
+        let after_title = typed
+            .strip_suffix('.')
+            .and_then(|t| t.rsplit(char::is_whitespace).next())
+            .is_some_and(is_abbreviation);
+        let body = if continues && !piece.rewritten && !after_title {
             lowercase_first_word(body, piece.names)
         } else {
             body.to_owned()
@@ -229,7 +234,24 @@ fn is_opening_punctuation(c: char) -> bool {
 fn is_joining_punctuation(c: char) -> bool {
     matches!(
         c,
-        ',' | ';' | ':' | '.' | '!' | '?' | ')' | '…' | '，' | '、' | '；' | '：' | '）'
+        ',' | ';'
+            | ':'
+            | '.'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '”'
+            | '’'
+            | '»'
+            | '…'
+            | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '）'
+            | '」'
+            | '』'
     )
 }
 
@@ -390,6 +412,14 @@ mod tests {
         assert_eq!(joiner.finish(), ".”");
         assert_eq!(joiner.join("", &piece("Ask Dr."), &config), "Ask Dr.");
         assert_eq!(joiner.finish(), "");
+        assert_eq!(
+            dictate(&[(0.0, "Ask Dr."), (0.7, "Smith.")], false),
+            "Ask Dr. Smith."
+        );
+        assert_eq!(
+            dictate(&[(0.0, "He said “hello."), (0.7, "” and left.")], false),
+            "He said “hello” and left."
+        );
     }
 
     #[test]
