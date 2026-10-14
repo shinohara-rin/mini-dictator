@@ -470,6 +470,8 @@ const KEYS: &[(u16, &str)] = &[
     (0x07, "X"),
     (0x08, "C"),
     (0x09, "V"),
+    // The extra key beside left Shift on ISO keyboards.
+    (0x0a, "IntlBackslash"),
     (0x0b, "B"),
     (0x0c, "Q"),
     (0x0d, "W"),
