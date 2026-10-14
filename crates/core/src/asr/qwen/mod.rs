@@ -443,7 +443,7 @@ impl QwenAsr {
                     }
                 }
                 for ((b, row), end) in open.into_iter().zip(ends) {
-                    let end = end.unwrap_or(Some((i + row.len()).min(length)));
+                    let end = end.unwrap_or(Some(next_word(&self.tokenizer, reference, i)));
                     finished.push((
                         b,
                         Stretch {
@@ -782,35 +782,20 @@ fn stretch_end(
     {
         return Some(Some(start));
     }
-    // One whole-word token in place of a reference token before the next word: a word for a
-    // word, with no need to decode on.
-    let next_starts_word = reference
-        .get(start + 1)
-        .is_none_or(|id| starts_word(tokenizer, *id));
-    // A token that begins the reference's word, as " Mon" begins " Monroe", likely goes on.
-    let begins_reference = |id: u32| {
-        let ours = text(id).to_lowercase();
-        let theirs = reference
-            .get(start)
-            .map_or(String::new(), |r| text(*r).to_lowercase());
-        theirs.len() > ours.len() && theirs.starts_with(&ours)
-    };
-    if row.len() == 1
-        && starts_word(tokenizer, last)
-        && whole(row)
-        && next_starts_word
-        && !begins_reference(last)
-    {
-        return Some(Some(start + 1));
-    }
+    // The word ended when the next one begins: the row's word stands for the reference's.
     if row.len() >= 2 && starts_word(tokenizer, last) && whole(&row[..row.len() - 1]) {
         row.pop();
-        let next_word = ((start + 1)..reference.len())
-            .find(|j| starts_word(tokenizer, reference[*j]))
-            .unwrap_or(reference.len());
-        return Some(Some(next_word));
+        return Some(Some(next_word(tokenizer, reference, start)));
     }
-    (row.len() >= LOCAL_TOKENS).then(|| Some((start + row.len()).min(reference.len())))
+    // A word too long to finish here: it stands for the reference's word all the same.
+    (row.len() >= LOCAL_TOKENS).then(|| Some(next_word(tokenizer, reference, start)))
+}
+
+/// The first reference token after `start` that begins a word, or the reference's end.
+fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize {
+    ((start + 1)..reference.len())
+        .find(|j| starts_word(tokenizer, reference[*j]))
+        .unwrap_or(reference.len())
 }
 
 /// True when a token begins a word: after a space, or with punctuation or a CJK character,
@@ -1092,20 +1077,22 @@ mod tests {
         let reference = ids("ab ab ab");
         assert_eq!(reference, vec![256, 257, 257]);
 
-        // Inside a word, and a token that begins the reference's word, both go on.
+        // Inside a word, and a token that may begin a longer word, both go on.
         assert_eq!(
             stretch_end(&t, &stops, &mut row(&ids("x")), &reference, 0),
             None
         );
         assert_eq!(
-            stretch_end(&t, &stops, &mut row(&[space]), &reference, 1),
+            stretch_end(&t, &stops, &mut row(&[258]), &reference, 1),
             None
         );
-        // A word for a word.
+        // A word for a word, once the next word begins.
+        let mut swapped = row(&[258, space]);
         assert_eq!(
-            stretch_end(&t, &stops, &mut row(&[258]), &reference, 1),
+            stretch_end(&t, &stops, &mut swapped, &reference, 1),
             Some(Some(2))
         );
+        assert_eq!(swapped, row(&[258]));
         // Its word ended: the next word's first token goes, and the reference's next word follows.
         let mut ended = row(&[ids("x")[0], ids("y")[0], space]);
         assert_eq!(
@@ -1120,11 +1107,11 @@ mod tests {
             Some(None)
         );
         assert_eq!(stopped, row(&ids("x")));
-        // Out of tokens.
+        // Out of tokens: the long word stands for one reference word, not for as many tokens.
         let long = row(&ids("xxxxxxxx"));
         assert_eq!(
             stretch_end(&t, &stops, &mut long.clone(), &reference, 0),
-            Some(Some(3))
+            Some(Some(1))
         );
         // A comma before a word comes in front of it.
         assert_eq!(
