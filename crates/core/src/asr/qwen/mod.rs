@@ -840,7 +840,7 @@ fn next_word(tokenizer: &BpeTokenizer, reference: &[u32], start: usize) -> usize
         .unwrap_or(reference.len())
 }
 
-/// True when a token begins a word: after a space, or with punctuation or a CJK character,
+/// True when a token begins a word: after whitespace, or with punctuation or a CJK character,
 /// which are words of their own, unless it is an apostrophe or hyphen going on from the word in
 /// the `previous` token. The `following` tokens complete a character the token only begins.
 fn starts_word(
@@ -849,25 +849,25 @@ fn starts_word(
     id: u32,
     following: &[u32],
 ) -> bool {
-    let bytes = tokenizer.bytes(id);
-    if bytes.first() == Some(&b' ') {
-        return true;
-    }
-    let mut head = bytes.to_vec();
+    let mut head = tokenizer.bytes(id).to_vec();
     for id in following.iter().take(3) {
         head.extend_from_slice(tokenizer.bytes(*id));
     }
     let first = valid_prefix(&head).chars().next();
     // An apostrophe or hyphen right after a letter joins the word, as in `John's`, the way
-    // `split_words` reads it.
+    // `split_words` reads it. A previous token ending inside a character, as the last byte of
+    // `é` can, ends inside a word.
     let joins = matches!(first, Some('\'' | '’' | '-'))
         && previous.is_some_and(|p| {
-            valid_prefix(tokenizer.bytes(p))
+            String::from_utf8_lossy(tokenizer.bytes(p))
                 .chars()
                 .next_back()
-                .is_some_and(|c| !c.is_whitespace() && !is_punctuation(c) && !is_cjk(c))
+                .is_some_and(|c| {
+                    c == char::REPLACEMENT_CHARACTER
+                        || !(c.is_whitespace() || is_punctuation(c) || is_cjk(c))
+                })
         });
-    !joins && first.is_some_and(|c| is_punctuation(c) || is_cjk(c))
+    !joins && first.is_some_and(|c| c.is_whitespace() || is_punctuation(c) || is_cjk(c))
 }
 
 /// The bytes up to the first that isn't valid UTF-8, as text.
@@ -1175,6 +1175,17 @@ mod tests {
                 0
             ),
             None
+        );
+        // Also after a letter split over tokens.
+        let accent = ids("é");
+        assert_eq!(accent.len(), 2);
+        let mut split = row(&[accent[0], accent[1], apostrophe]);
+        assert_eq!(stretch_end(&t, &stops, &mut split, &reference, 0), None);
+        // A newline ends the word like a space.
+        let mut newline = row(&[ids("x")[0], ids("y")[0], ids("\n")[0]]);
+        assert_eq!(
+            stretch_end(&t, &stops, &mut newline, &reference, 0),
+            Some(Some(1))
         );
         // The row stopped.
         let mut stopped = row(&[ids("x")[0], 300]);
