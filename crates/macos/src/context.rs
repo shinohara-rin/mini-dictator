@@ -1,9 +1,15 @@
 //! Reads the focused window through the macOS accessibility API.
 //!
 //! The reader collects the focused field's text before the cursor, the window title, and the text
-//! of other elements, breadth first, within an element, character, and time budget. Electron apps
-//! build their accessibility tree only when asked, so the reader sets `AXManualAccessibility` on
-//! the focused app first.
+//! of other elements within an element, character, and time budget. Web content comes first, in
+//! document order, since that is where a page's names are; the rest of the window follows breadth
+//! first. Each element costs one request for all the attributes it needs, because every request is
+//! a round trip to the app.
+//!
+//! Chromium browsers and Electron apps build their accessibility tree only when asked, so the reader
+//! sets `AXManualAccessibility` on the focused app first. When a web area still has no content, the
+//! app either ignores that attribute or is building its tree just now: the reader sets
+//! `AXEnhancedUserInterface`, which is what VoiceOver sets, and waits a moment for the content.
 
 use std::collections::VecDeque;
 use std::ptr::NonNull;
@@ -14,8 +20,8 @@ use mini_dictator_core::context::{
 };
 use mini_dictator_core::{Error, Result};
 use objc2_application_services::{
-    kAXTrustedCheckOptionPrompt, AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions,
-    AXUIElement, AXValue, AXValueType,
+    kAXTrustedCheckOptionPrompt, AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted,
+    AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
 };
 use objc2_core_foundation::{
     CFArray, CFBoolean, CFDictionary, CFRange, CFRetained, CFString, CFType,
@@ -25,15 +31,80 @@ pub struct AccessibilityReader {
     pub max_elements: usize,
     pub max_chars: usize,
     pub budget: Duration,
+    /// Longest wait for a web area that has no content yet.
+    pub web_wait: Duration,
 }
 
 impl Default for AccessibilityReader {
     fn default() -> Self {
         Self {
-            max_elements: 800,
+            max_elements: 1500,
             max_chars: 20_000,
             budget: Duration::from_millis(150),
+            web_wait: Duration::from_millis(300),
         }
+    }
+}
+
+/// The attributes read from each element, in one request. The first text attribute present is the
+/// element's text.
+const NODE_ATTRIBUTES: [&str; 5] = [
+    "AXRole",
+    "AXChildren",
+    "AXValue",
+    "AXTitle",
+    "AXDescription",
+];
+
+struct Node {
+    role: Option<String>,
+    text: Option<String>,
+    children: Vec<CFRetained<AXUIElement>>,
+}
+
+fn non_empty(value: &CFType) -> Option<String> {
+    let text = value.downcast_ref::<CFString>()?.to_string();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn element_array(value: CFRetained<CFType>) -> Vec<CFRetained<AXUIElement>> {
+    let Ok(array) = value.downcast::<CFArray>() else {
+        return Vec::new();
+    };
+    let array: &CFArray<CFType> = unsafe { array.cast_unchecked() };
+    array
+        .iter()
+        .filter_map(|child| child.downcast::<AXUIElement>().ok())
+        .collect()
+}
+
+/// Reads an element's role, children, and text. A missing attribute comes back as an error value,
+/// which is neither a string nor an array, so it is skipped.
+fn node(element: &AXUIElement, names: &CFArray<CFString>) -> Node {
+    let mut values: *const CFArray = std::ptr::null();
+    let error = unsafe {
+        element.copy_multiple_attribute_values(
+            names.as_opaque(),
+            AXCopyMultipleAttributeOptions(0),
+            NonNull::from(&mut values),
+        )
+    };
+    let values = (error == AXError::Success)
+        .then(|| NonNull::new(values as *mut CFArray))
+        .flatten()
+        .map(|ptr| unsafe { CFRetained::from_raw(ptr) });
+    let Some(values) = values else {
+        return Node {
+            role: None,
+            text: None,
+            children: Vec::new(),
+        };
+    };
+    let values: &CFArray<CFType> = unsafe { values.cast_unchecked() };
+    Node {
+        role: values.get(0).as_deref().and_then(non_empty),
+        children: values.get(1).map(element_array).unwrap_or_default(),
+        text: (2..NODE_ATTRIBUTES.len()).find_map(|i| values.get(i).as_deref().and_then(non_empty)),
     }
 }
 
@@ -58,9 +129,7 @@ fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
 }
 
 fn string(element: &AXUIElement, name: &str) -> Option<String> {
-    let value = attribute(element, name)?;
-    let text = value.downcast_ref::<CFString>()?.to_string();
-    (!text.trim().is_empty()).then_some(text)
+    non_empty(&*attribute(element, name)?)
 }
 
 fn element(element: &AXUIElement, name: &str) -> Option<CFRetained<AXUIElement>> {
@@ -68,17 +137,13 @@ fn element(element: &AXUIElement, name: &str) -> Option<CFRetained<AXUIElement>>
 }
 
 fn children(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
-    let Some(value) = attribute(element, "AXChildren") else {
-        return Vec::new();
-    };
-    let Ok(array) = value.downcast::<CFArray>() else {
-        return Vec::new();
-    };
-    let array: &CFArray<CFType> = unsafe { array.cast_unchecked() };
-    array
-        .iter()
-        .filter_map(|child| child.downcast::<AXUIElement>().ok())
-        .collect()
+    attribute(element, "AXChildren")
+        .map(element_array)
+        .unwrap_or_default()
+}
+
+fn set_true(element: &AXUIElement, name: &str) -> AXError {
+    unsafe { element.set_attribute_value(&CFString::from_str(name), CFBoolean::new(true).as_ref()) }
 }
 
 /// The focused field's text before the cursor. `AXSelectedTextRange` counts UTF-16 units.
@@ -117,12 +182,12 @@ impl ContextProvider for AccessibilityReader {
         let app = element(&system, "AXFocusedApplication")
             .ok_or_else(|| Error::Context("no focused application".into()))?;
         // Electron and Chromium build their tree on request. Other apps ignore the attribute.
-        unsafe {
-            app.set_attribute_value(
-                &CFString::from_str("AXManualAccessibility"),
-                CFBoolean::new(true).as_ref(),
-            )
-        };
+        set_true(&app, "AXManualAccessibility");
+        let names: Vec<CFRetained<CFString>> = NODE_ATTRIBUTES
+            .iter()
+            .map(|n| CFString::from_str(n))
+            .collect();
+        let names = CFArray::from_retained_objects(&names);
 
         let mut blocks = Vec::new();
         let focused = element(&system, "AXFocusedUIElement");
@@ -141,12 +206,23 @@ impl ContextProvider for AccessibilityReader {
         }
 
         let mut chars = blocks.iter().map(|b| b.text.chars().count()).sum::<usize>();
+        // The window breadth first, until a web area turns up; its content then goes first, depth
+        // first in document order.
+        let mut web: Vec<CFRetained<AXUIElement>> = Vec::new();
         let mut queue: VecDeque<CFRetained<AXUIElement>> = window.into_iter().collect();
         let mut visited = 0;
-        while let Some(current) = queue.pop_front() {
+        let mut waited = Duration::ZERO;
+        loop {
+            let (current, in_web) = match web.pop() {
+                Some(current) => (current, true),
+                None => match queue.pop_front() {
+                    Some(current) => (current, false),
+                    None => break,
+                },
+            };
             if visited >= self.max_elements
                 || chars >= self.max_chars
-                || started.elapsed() >= self.budget
+                || started.elapsed() >= self.budget + waited
             {
                 break;
             }
@@ -155,17 +231,32 @@ impl ContextProvider for AccessibilityReader {
             if focused.as_deref().is_some_and(|f| f == &*current) {
                 continue;
             }
-            for name in ["AXValue", "AXTitle", "AXDescription"] {
-                if let Some(text) = string(&current, name) {
-                    chars += text.chars().count();
-                    blocks.push(TextBlock {
-                        region: Region::Window,
-                        text,
-                    });
-                    break;
+            let mut node = node(&current, &names);
+            let web_area = node.role.as_deref() == Some("AXWebArea");
+            // A page's own web area, not an empty frame inside it, with no content: still being
+            // built, or the app waits for the switch VoiceOver uses. The wait does not count
+            // against the budget, and only a page whose tree was off pays it.
+            if web_area && !in_web && node.children.is_empty() && waited.is_zero() {
+                let waiting = Instant::now();
+                set_true(&app, "AXEnhancedUserInterface");
+                while node.children.is_empty() && waiting.elapsed() < self.web_wait {
+                    std::thread::sleep(Duration::from_millis(30));
+                    node.children = children(&current);
                 }
+                waited = waiting.elapsed();
             }
-            queue.extend(children(&current));
+            if let Some(text) = node.text {
+                chars += text.chars().count();
+                blocks.push(TextBlock {
+                    region: Region::Window,
+                    text,
+                });
+            }
+            if in_web || web_area {
+                web.extend(node.children.into_iter().rev());
+            } else {
+                queue.extend(node.children);
+            }
         }
 
         Ok(ScreenContext {

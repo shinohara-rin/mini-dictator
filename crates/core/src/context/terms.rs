@@ -3,11 +3,15 @@
 //! Adapted from AIRI's conversation term extraction (`stage-ui/libs/voice/transcription-bias.ts`).
 //! A term qualifies when its written form marks it as specific: a quoted or bracketed span,
 //! CamelCase, an acronym, a word with digits or joiners such as `Node.js`, or a run of capitalized
-//! words inside a sentence. Plain lowercase words do not qualify, because nothing in their form
-//! separates a name from ordinary speech. Screen text adds one form that chat text lacks: a short
-//! CJK element on its own, such as a contact, a channel, or a file name.
+//! words inside a sentence. Screen text adds forms that chat text lacks: a short element on its own,
+//! such as a page title, a heading, a contact, a channel, or a file name. A short CJK element counts
+//! whole. A Latin word counts at a sentence start or in a short element when it is rare, that is
+//! when the recognizer's vocabulary has no whole token for it: `Airicraft` and `Zustand` are rare,
+//! `Settings` and `Minecraft` are not. Otherwise a plain lowercase word does not qualify, because
+//! nothing in its form separates a name from ordinary speech.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use super::{ScreenContext, TextBlock};
 
@@ -15,6 +19,11 @@ const PHRASE_CHARS: usize = 32;
 const PHRASE_WORDS: usize = 4;
 /// A CJK label longer than this is a sentence, not a name.
 const LABEL_CJK_CHARS: usize = 12;
+/// Shorter words are too often abbreviations to call rare.
+const RARE_MIN_LETTERS: usize = 4;
+
+/// Lowercase words with a whole token in the Qwen tokenizer, from `scripts/common-words.py`.
+const COMMON_WORDS: &str = include_str!("common_words.txt");
 
 const COMMON_CAPITALIZED: &[&str] = &[
     "I", "I'm", "I'll", "I've", "I'd", "OK", "Okay", "Yes", "No", "Oh", "Hi", "Hello", "Hey",
@@ -60,6 +69,7 @@ pub fn rank_terms(context: &ScreenContext, limit: usize) -> Vec<Term> {
         if let Some(label) = cjk_label(text) {
             found.push((label, TermForm::Label));
         }
+        found.extend(rare_lowercase_labels(text));
         for (phrase, form) in found {
             let key = phrase.to_lowercase();
             let entry = scores.entry(key).or_insert_with(|| {
@@ -100,6 +110,52 @@ fn cjk_label(text: &str) -> Option<String> {
             .chars()
             .any(|c| c.is_whitespace() || "，。！？；：,.!?;:".contains(c)))
     .then(|| text.to_owned())
+}
+
+fn common_words() -> &'static HashSet<&'static str> {
+    static WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    WORDS.get_or_init(|| COMMON_WORDS.lines().collect())
+}
+
+/// A word the recognizer has no whole token for, nor for its stem, such as `Airicraft`.
+fn is_rare(word: &str) -> bool {
+    if word.len() < RARE_MIN_LETTERS || !word.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    let common = common_words();
+    let lower = word.to_ascii_lowercase();
+    if common.contains(lower.as_str()) {
+        return false;
+    }
+    // An inflection of a common word is common: `reloading`, `bookmarked`, `stopped`, `saves`.
+    let inflected = [
+        "s", "es", "ed", "d", "ing", "ly", "er", "ers", "est", "ness", "ment",
+    ]
+    .iter()
+    .filter_map(|suffix| lower.strip_suffix(suffix))
+    .filter(|stem| stem.len() >= 2)
+    .any(|stem| {
+        let bytes = stem.as_bytes();
+        let undoubled = (bytes.len() >= 3 && bytes[bytes.len() - 1] == bytes[bytes.len() - 2])
+            .then(|| &stem[..stem.len() - 1]);
+        common.contains(stem)
+            || common.contains(format!("{stem}e").as_str())
+            || undoubled.is_some_and(|s| common.contains(s))
+    });
+    !inflected
+}
+
+/// Rare lowercase words of a short element, such as a repository name in a breadcrumb.
+/// Capitalized ones are already names.
+fn rare_lowercase_labels(text: &str) -> Vec<(String, TermForm)> {
+    if text.split_whitespace().count() > PHRASE_WORDS {
+        return Vec::new();
+    }
+    latin_words(text)
+        .into_iter()
+        .filter(|(_, _, word)| word.starts_with(|c: char| c.is_ascii_lowercase()) && is_rare(word))
+        .map(|(_, _, word)| (word.to_owned(), TermForm::Label))
+        .collect()
 }
 
 fn is_phrase(value: &str) -> bool {
@@ -231,7 +287,7 @@ fn terms_of(text: &str, names: &HashSet<String>) -> Vec<(String, TermForm)> {
             let sentence_start = sentence[..start].trim().is_empty();
             if capitalized
                 && !COMMON_CAPITALIZED.contains(&word)
-                && (!sentence_start || names.contains(&word.to_lowercase()))
+                && (!sentence_start || names.contains(&word.to_lowercase()) || is_rare(word))
             {
                 run.push(word);
                 continue;
@@ -296,6 +352,46 @@ mod tests {
             (Region::Window, "这是一个很长的句子，不是名字。"),
         ]);
         assert_eq!(phrases(&context), vec!["王小明"]);
+    }
+
+    #[test]
+    fn rare_words_count_on_their_own_and_at_a_sentence_start() {
+        // A page title and a heading in Chrome: each word starts its element.
+        let context = screen(&[
+            (Region::WindowTitle, "Airicraft - Google Chrome"),
+            (Region::Window, "Airicraft"),
+            (Region::Window, "Airicraft is a Minecraft agent."),
+            (Region::Window, "shinohara-rin/airicraft"),
+        ]);
+        assert_eq!(
+            phrases(&context),
+            vec!["Airicraft", "Google Chrome", "Minecraft"]
+        );
+    }
+
+    #[test]
+    fn common_words_and_their_inflections_stay_out() {
+        let context = screen(&[
+            (Region::Window, "Settings"),
+            (Region::Window, "Reloading the page"),
+            (Region::Window, "Bookmarked tabs"),
+            (Region::Window, "Minecraft is fun."),
+            (Region::Window, "close tab"),
+        ]);
+        assert!(phrases(&context).is_empty(), "{:?}", phrases(&context));
+        for rare in ["Airicraft", "Zustand", "Hyprland", "Supabase", "airicraft"] {
+            assert!(is_rare(rare), "{rare}");
+        }
+        for common in [
+            "Settings",
+            "Minecraft",
+            "stopped",
+            "saves",
+            "Kubernetes",
+            "github",
+        ] {
+            assert!(!is_rare(common), "{common}");
+        }
     }
 
     #[test]
