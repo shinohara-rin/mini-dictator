@@ -52,12 +52,9 @@ pub struct PasteSink {
 }
 
 impl PasteSink {
-    /// Call when the dictation starts, so the focus it records is the one the user dictates into.
-    pub fn new() -> PasteSink {
-        PasteSink {
-            focus: Focus::now(),
-            held: None,
-        }
+    /// `focus` is what had focus at the hotkey press: what the dictation is typed into.
+    pub fn new(focus: Option<Focus>) -> PasteSink {
+        PasteSink { focus, held: None }
     }
 }
 

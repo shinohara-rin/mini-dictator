@@ -144,6 +144,10 @@ pub struct Focus {
     element: Option<CFRetained<AXUIElement>>,
 }
 
+// SAFETY: an AXUIElement is a CoreFoundation object, retained and released atomically, and the
+// accessibility API takes it on any thread; the screen reader already runs off the main thread.
+unsafe impl Send for Focus {}
+
 /// How far up from the focused element [`Focus::moved_from`] looks for the element focused before.
 const FOCUS_ANCESTORS: usize = 12;
 

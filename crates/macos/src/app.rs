@@ -26,7 +26,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::{debug_log_path, support_dir, Config, APP_NAME};
-use crate::context::{focused_window, is_trusted, AccessibilityReader, FocusedWindow};
+use crate::context::{focused_window, is_trusted, AccessibilityReader, Focus, FocusedWindow};
 use crate::debug_log;
 use crate::hotkey::{Hotkey, Outcome, Signal};
 use crate::icons::{icon, State};
@@ -747,6 +747,8 @@ fn start(
     proxy: EventLoopProxy<AppEvent>,
     ui: &Ui,
 ) -> Option<Dictation> {
+    // Before the microphone starts, which can take a moment the user may spend switching fields.
+    let focus = Focus::now();
     let (sender, receiver) = mpsc::channel();
     let playback = ui.sounds.playback();
     let stream = match crate::audio::start(sender, playback.clone(), ui.echo.is_checked()) {
@@ -771,8 +773,7 @@ fn start(
     ui.cue(Cue::Start);
 
     std::thread::spawn(move || {
-        // First, so the focus it records is the one at the hotkey press.
-        let mut sink = PasteSink::new();
+        let mut sink = PasteSink::new(focus);
         let events = proxy.clone();
         let mut forward = move |event: CoreEvent| match event {
             // Written here, so long screen text never passes through the event loop.
