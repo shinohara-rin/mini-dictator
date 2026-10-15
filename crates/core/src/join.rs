@@ -64,15 +64,6 @@ impl Joiner {
         &self.closing
     }
 
-    /// Whether joining `piece` would type the held period, so a model's judgment of the text
-    /// before could keep it back.
-    pub fn would_type_period(&self, typed: &str, piece: &Piece, config: &JoinConfig) -> bool {
-        let (body, _, _) = split_final_period(piece.text.trim());
-        self.holds_period()
-            && piece.pause_seconds.is_some()
-            && !continues(typed, body, piece, config)
-    }
-
     /// The silence before `segment`'s speech, not counting the audio the segmenter keeps around it.
     pub fn pause_before(&self, segment: &SpeechSegment) -> Option<f32> {
         let start = segment.speech_start();
@@ -106,7 +97,8 @@ impl Joiner {
             .strip_suffix('.')
             .and_then(|t| t.rsplit(char::is_whitespace).next())
             .is_some_and(is_title);
-        let body = if continues && (!piece.rewritten || unfinished) && !after_title {
+        // A rewrite told of the open sentence chose its capital knowing it, so a name keeps its own.
+        let body = if continues && !piece.rewritten && !after_title {
             lowercase_first_word(body, piece.names)
         } else {
             body.to_owned()
@@ -435,31 +427,35 @@ mod tests {
     #[test]
     fn an_unfinished_sentence_keeps_its_period_back() {
         let config = JoinConfig::default();
-        let piece = |text, ends_sentence| Piece {
-            text,
-            pause_seconds: Some(2.0),
-            rewritten: true,
-            names: &[],
-            ends_sentence,
+        let dictate = |second: &str, rewritten| {
+            let piece = |text, pause_seconds, ends_sentence| Piece {
+                text,
+                pause_seconds,
+                rewritten,
+                names: &[],
+                ends_sentence,
+            };
+            let mut joiner = Joiner::default();
+            let mut typed = joiner.join("", &piece("I traveled to.", None, None), &config);
+            assert!(joiner.holds_period());
+            // A long pause and a capital would end the sentence; the model says it is not done.
+            typed += &joiner.join(&typed, &piece(second, Some(2.0), Some(false)), &config);
+            typed += &joiner.join(
+                &typed,
+                &piece("It was fun.", Some(2.0), Some(true)),
+                &config,
+            );
+            typed + &joiner.finish()
         };
-        let mut joiner = Joiner::default();
-        let first = Piece {
-            pause_seconds: None,
-            ..piece("If we can.", None)
-        };
-        let mut typed = joiner.join("", &first, &config);
-        assert!(joiner.would_type_period(&typed, &piece("Use it.", None), &config));
-        assert!(!joiner.would_type_period(&typed, &piece("and more.", None), &config));
-        // A long pause and a capital would end the sentence; the model says it is not done.
-        typed += &joiner.join(
-            &typed,
-            &piece("Use speculative decoding.", Some(false)),
-            &config,
+        // The recognizer's capital goes; the rewrite's stays, since it knew the sentence was open.
+        assert_eq!(
+            dictate("Japan last year.", false),
+            "I traveled to japan last year. It was fun."
         );
-        assert_eq!(typed, "If we can use speculative decoding");
-        typed += &joiner.join(&typed, &piece("It works.", Some(true)), &config);
-        typed += &joiner.finish();
-        assert_eq!(typed, "If we can use speculative decoding. It works.");
+        assert_eq!(
+            dictate("Paris last year.", true),
+            "I traveled to Paris last year. It was fun."
+        );
     }
 
     #[test]

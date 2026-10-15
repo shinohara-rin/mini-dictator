@@ -24,6 +24,8 @@ pub struct RewriteRequest {
     pub session_text: String,
     /// Seconds of silence between `session_text` and this transcript.
     pub pause_seconds: Option<f32>,
+    /// The text before stops mid-sentence, as a model judged it, so the transcript continues it.
+    pub sentence_open: bool,
 }
 
 /// Rewrites a transcript. The HTTP implementation is [`OpenAiCompatible`]; shells can add others.
@@ -100,6 +102,9 @@ pub fn user_prompt(request: &RewriteRequest) -> String {
         ));
         if let Some(pause) = request.pause_seconds {
             prompt.push_str(&format!("Pause before the transcript: {pause:.1} s\n"));
+        }
+        if request.sentence_open {
+            prompt.push_str("The dictated text stops mid-sentence; the transcript continues it.\n");
         }
     }
     prompt.push_str(&format!(

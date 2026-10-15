@@ -2,7 +2,7 @@
 //!
 //! Native fields take the text through the accessibility API, at the cursor in one step. Others,
 //! web pages and Electron apps among them, get it typed as Unicode key events, a few characters per
-//! event, with Return pressed for each line break.
+//! event, with Shift-Return for each line break: chat apps send the message on a plain Return.
 //!
 //! Text is inserted only into what had focus when the dictation started. Once the focus moves, the
 //! rest of the dictation is held, and the menu offers it to copy.
@@ -51,14 +51,19 @@ impl InsertSink {
     }
 }
 
-/// Posts one key press with `text` as the characters it types, or a plain press of `key` when
-/// `text` is empty.
-fn press(source: Option<&CGEventSource>, key: u16, text: &[u16]) -> Result<()> {
+/// Posts one key press with `text` as the characters it types, or a press of `key` with `flags`
+/// when `text` is empty.
+fn press(
+    source: Option<&CGEventSource>,
+    key: u16,
+    flags: CGEventFlags,
+    text: &[u16],
+) -> Result<()> {
     for down in [true, false] {
         let event = CGEvent::new_keyboard_event(source, key, down)
             .ok_or_else(|| Error::Sink("cannot create a key event".into()))?;
-        // No modifiers, whatever the user still holds: Cmd with a letter would be a shortcut.
-        CGEvent::set_flags(Some(&event), CGEventFlags(0));
+        // Only these modifiers, whatever the user still holds: Cmd with a letter is a shortcut.
+        CGEvent::set_flags(Some(&event), flags);
         if !text.is_empty() {
             unsafe {
                 CGEvent::keyboard_set_unicode_string(Some(&event), text.len() as _, text.as_ptr())
@@ -82,7 +87,7 @@ fn type_text(text: &str) -> Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::Private);
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
-            press(source.as_deref(), KEY_RETURN, &[])?;
+            press(source.as_deref(), KEY_RETURN, CGEventFlags::MaskShift, &[])?;
         }
         let units: Vec<u16> = line.trim_end_matches('\r').encode_utf16().collect();
         let mut start = 0;
@@ -93,7 +98,7 @@ fn type_text(text: &str) -> Result<()> {
                 end -= 1;
             }
             // The key code only matters to apps that ignore the Unicode string.
-            press(source.as_deref(), 0, &units[start..end])?;
+            press(source.as_deref(), 0, CGEventFlags(0), &units[start..end])?;
             start = end;
         }
     }

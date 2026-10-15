@@ -252,6 +252,7 @@ impl Engine {
             },
             session_text: tail(&session.inserted, self.config.preceding_chars),
             pause_seconds,
+            sentence_open: false,
         }
     }
 
@@ -289,7 +290,14 @@ impl Engine {
             return Ok(None);
         }
         let pause_seconds = session.joiner.pause_before(segment);
-        let request = self.rewrite_request(&transcript, session, pause_seconds);
+        let mut request = self.rewrite_request(&transcript, session, pause_seconds);
+        // Asked first, so the rewrite knows to continue the sentence and keeps a name's capital.
+        let ends_sentence = if session.joiner.holds_period() && pause_seconds.is_some() {
+            self.ends_sentence(&request, session.joiner.held_closing(), events)
+        } else {
+            None
+        };
+        request.sentence_open = ends_sentence == Some(false);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
         if self.debug() {
@@ -316,20 +324,13 @@ impl Engine {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        let mut piece = Piece {
+        let piece = Piece {
             rewritten,
             text: &text,
             pause_seconds,
             names: &session.hotwords,
-            ends_sentence: None,
+            ends_sentence,
         };
-        if session
-            .joiner
-            .would_type_period(&session.inserted, &piece, &self.config.join)
-        {
-            piece.ends_sentence =
-                self.ends_sentence(&request, session.joiner.held_closing(), events);
-        }
         let before = session.joiner.clone();
         let text = session
             .joiner
@@ -343,8 +344,8 @@ impl Engine {
         inserted
     }
 
-    /// Asks the rewrite model whether the text before the cursor is a complete sentence, before a
-    /// held period is typed. None when no model answers. `closing` is the quotes or
+    /// Asks the rewrite model whether the text before the cursor is a complete sentence, while a
+    /// period is held. None when no model answers. `closing` is the quotes or
     /// brackets held with the period, which close what came before.
     pub fn ends_sentence(
         &self,

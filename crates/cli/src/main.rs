@@ -290,8 +290,15 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let pause_seconds = session.joiner.pause_before(segment);
         let mut text = transcript.reference.text();
         let mut rewritten = false;
-        let request = engine.rewrite_request(&transcript, &session, pause_seconds);
+        let mut request = engine.rewrite_request(&transcript, &session, pause_seconds);
+        let mut ends_sentence = None;
         if args.rewrite_url.is_some() {
+            if session.joiner.holds_period() && pause_seconds.is_some() {
+                ends_sentence =
+                    engine.ends_sentence(&request, session.joiner.held_closing(), &mut |_| {});
+                println!("  complete sentence before: {ends_sentence:?}");
+            }
+            request.sentence_open = ends_sentence == Some(false);
             let started = Instant::now();
             match engine.rewriter.rewrite(&request) {
                 Ok(Some(reply)) => {
@@ -304,22 +311,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !text.trim().is_empty() {
-            let mut piece = Piece {
+            let piece = Piece {
                 rewritten,
                 text: &text,
                 pause_seconds,
                 names: &session.hotwords,
-                ends_sentence: None,
+                ends_sentence,
             };
-            if args.rewrite_url.is_some()
-                && session
-                    .joiner
-                    .would_type_period(&session.inserted, &piece, &engine.config.join)
-            {
-                piece.ends_sentence =
-                    engine.ends_sentence(&request, session.joiner.held_closing(), &mut |_| {});
-                println!("  complete sentence before: {:?}", piece.ends_sentence);
-            }
             let joined = session
                 .joiner
                 .join(&session.inserted, &piece, &engine.config.join);
