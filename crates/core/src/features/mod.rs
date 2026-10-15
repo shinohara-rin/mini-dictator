@@ -27,6 +27,7 @@ pub struct FbankConfig {
     /// Subtract each frame's mean before pre-emphasis, as Kaldi does.
     pub remove_dc_offset: bool,
     pub mel_scale: MelScale,
+    pub log_guard: LogGuard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,24 @@ pub enum MelScale {
     Slaney,
 }
 
+/// How the log of a mel energy avoids zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogGuard {
+    /// Kaldi's: energies below `f32::EPSILON` count as `f32::EPSILON`.
+    Floor,
+    /// NeMo's: 2^-24 is added to every energy, so quiet bins keep their differences.
+    Add,
+}
+
+impl LogGuard {
+    fn log(self, energy: f32) -> f32 {
+        match self {
+            Self::Floor => energy.max(f32::EPSILON).ln(),
+            Self::Add => (energy + 2f32.powi(-24)).ln(),
+        }
+    }
+}
+
 impl Default for FbankConfig {
     fn default() -> Self {
         Self {
@@ -56,13 +75,15 @@ impl Default for FbankConfig {
             window: Window::Povey,
             remove_dc_offset: true,
             mel_scale: MelScale::Kaldi,
+            log_guard: LogGuard::Floor,
         }
     }
 }
 
 impl FbankConfig {
-    /// The features NeMo models read, as sherpa-onnx computes them: no normalization, Hann windows,
-    /// no DC removal, and librosa mel filters from 0 to 8 kHz.
+    /// The features NeMo models read: no normalization, Hann windows, no DC removal, librosa mel
+    /// filters from 0 to 8 kHz, and NeMo's additive log guard (sherpa-onnx floors the energies
+    /// instead, which loses quiet speech).
     pub fn nemo(num_bins: usize) -> Self {
         Self {
             num_bins,
@@ -71,6 +92,7 @@ impl FbankConfig {
             window: Window::Hann,
             remove_dc_offset: false,
             mel_scale: MelScale::Slaney,
+            log_guard: LogGuard::Add,
             ..Self::default()
         }
     }
@@ -191,7 +213,7 @@ impl Fbank {
                     .enumerate()
                     .map(|(k, w)| w * (real[first + k].powi(2) + imag[first + k].powi(2)))
                     .sum();
-                data.push(energy.max(f32::EPSILON).ln());
+                data.push(self.config.log_guard.log(energy));
             }
         }
         Features {
@@ -366,6 +388,15 @@ impl Fft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nemo_log_guard_keeps_quiet_bins_apart() {
+        let (quiet, quieter) = (1e-8, 1e-9);
+        assert_eq!(LogGuard::Floor.log(quiet), LogGuard::Floor.log(quieter));
+        assert!(LogGuard::Add.log(quiet) > LogGuard::Add.log(quieter) + 0.1);
+        // Loud energies come out the same either way.
+        assert!((LogGuard::Add.log(1.0) - LogGuard::Floor.log(1.0)).abs() < 1e-6);
+    }
 
     #[test]
     fn fft_matches_naive_dft() {
