@@ -112,8 +112,10 @@ speaks:
   Speech that comes back first throws it away.
 
 Neither runs while audio is waiting in the channel, so a slow device only loses them. On a 4-core
-container, over a 52 s clip of eight languages with 1.2 s pauses, they cut the wait from the end of
-each phrase to its text from 2.3 s to 1.8 s on average.
+container, over a 52 s clip of eight languages with 1.2 s pauses (two runs each), they cut the wait
+from the end of each phrase to its text from 2.3 s to 1.9 s on average. With the uncertainty check
+on, they gained nothing there: the noisy decodes of one phrase still ran while the next was spoken,
+so drafts rarely found the worker idle.
 
 **Transducers** (sherpa-onnx zipformers) remain as a small, fast fallback for one language.
 
@@ -230,7 +232,8 @@ goes to the rewrite model only when `share_screen_text` is on.
 
 Only the rewrite model reads the uncertainty markers, so without one (`Rewriter::reads_uncertainty`
 is false for `PassThrough` and for the macOS rewrite switch when it is off) the pipeline skips the
-noisy decodes. For Qwen3-ASR they were most of the wait: 3.8 s of a 6 s utterance's 5.7 s.
+noisy decodes. For Qwen3-ASR they were most of the wait: on the 52 s clip above, each phrase's text
+came 4.6 s after its end with them and 2.3 s without.
 
 `rewrite::SYSTEM_PROMPT` tells the model to fix recognition errors, punctuation, and fillers without
 adding content, to resolve `[unclear: ...]` spans from context and screen terms, and to reply with
