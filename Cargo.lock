@@ -1208,6 +1208,7 @@ name = "mini-dictator-core"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "hound",
  "ort",
  "serde",
  "serde_json",

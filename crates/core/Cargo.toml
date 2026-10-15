@@ -21,3 +21,11 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 fancy-regex = { workspace = true, optional = true }
 unicode-normalization = { workspace = true, optional = true }
+
+[dev-dependencies]
+hound.workspace = true
+
+# Runs the whole pipeline on real models; see the file's header.
+[[test]]
+name = "e2e"
+required-features = ["onnx"]

@@ -65,4 +65,5 @@ the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features
+scripts/e2e.sh   # LibriSpeech clips through a mock microphone into the real models (downloads about 1 GB)
 ```
