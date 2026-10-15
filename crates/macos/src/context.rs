@@ -19,6 +19,7 @@ use mini_dictator_core::context::{
     ContextProvider, ContextSource, Region, ScreenContext, TextBlock,
 };
 use mini_dictator_core::{Error, Result};
+use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{
     kAXTrustedCheckOptionPrompt, AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted,
     AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
@@ -131,10 +132,19 @@ pub struct FocusedWindow {
 pub fn focused_window() -> Option<FocusedWindow> {
     let system = unsafe { AXUIElement::new_system_wide() };
     unsafe { system.set_messaging_timeout(0.1) };
-    let app = element(&system, "AXFocusedApplication")?;
+    let app = focused_app(&system)?;
     let element = element(&app, "AXFocusedWindow").unwrap_or(app);
     let title = string(&element, "AXTitle").unwrap_or_default();
     Some(FocusedWindow { element, title })
+}
+
+/// The focused application. The system-wide element does not always answer, as on GitHub's macOS
+/// runners while Chrome is in front, so the frontmost app from AppKit stands in.
+fn focused_app(system: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
+    element(system, "AXFocusedApplication").or_else(|| {
+        let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        Some(unsafe { AXUIElement::new_application(app.processIdentifier()) })
+    })
 }
 
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
@@ -198,8 +208,8 @@ impl ContextProvider for AccessibilityReader {
         let started = Instant::now();
         let system = unsafe { AXUIElement::new_system_wide() };
         unsafe { system.set_messaging_timeout(0.1) };
-        let app = element(&system, "AXFocusedApplication")
-            .ok_or_else(|| Error::Context("no focused application".into()))?;
+        let app =
+            focused_app(&system).ok_or_else(|| Error::Context("no focused application".into()))?;
         // Electron and Chromium build their tree on request. Other apps ignore the attribute.
         set_true(&app, "AXManualAccessibility");
         let names: Vec<CFRetained<CFString>> = NODE_ATTRIBUTES
@@ -209,7 +219,8 @@ impl ContextProvider for AccessibilityReader {
         let names = CFArray::from_retained_objects(&names);
 
         let mut blocks = Vec::new();
-        let focused = element(&system, "AXFocusedUIElement");
+        let focused =
+            element(&system, "AXFocusedUIElement").or_else(|| element(&app, "AXFocusedUIElement"));
         if let Some(text) = focused.as_deref().and_then(text_before_cursor) {
             blocks.push(TextBlock {
                 region: Region::Focused,
@@ -283,5 +294,144 @@ impl ContextProvider for AccessibilityReader {
             blocks,
             source: ContextSource::Accessibility,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mini_dictator_core::context::rank_terms;
+
+    /// Prints the focused window's roles and child counts, to show where the page's content is.
+    fn dump_window() {
+        let system = unsafe { AXUIElement::new_system_wide() };
+        let Some(window) = focused_app(&system).and_then(|app| element(&app, "AXFocusedWindow"))
+        else {
+            println!("no focused window");
+            return;
+        };
+        let names: Vec<CFRetained<CFString>> = NODE_ATTRIBUTES
+            .iter()
+            .map(|n| CFString::from_str(n))
+            .collect();
+        let names = CFArray::from_retained_objects(&names);
+        let mut stack = vec![(window, 0)];
+        let mut shown = 0;
+        while let Some((current, depth)) = stack.pop() {
+            if shown >= 300 {
+                break;
+            }
+            shown += 1;
+            let node = node(&current, &names);
+            println!(
+                "{}{} ({} children) {:?}",
+                "  ".repeat(depth),
+                node.role.as_deref().unwrap_or("?"),
+                node.children.len(),
+                node.text.as_deref().unwrap_or("")
+            );
+            if depth < 14 {
+                stack.extend(node.children.into_iter().rev().map(|c| (c, depth + 1)));
+            }
+        }
+    }
+
+    fn read() -> ScreenContext {
+        let started = Instant::now();
+        let screen = AccessibilityReader::default()
+            .snapshot()
+            .unwrap_or_else(|error| {
+                println!("read failed: {error}");
+                ScreenContext::empty()
+            });
+        println!(
+            "read {} blocks from {:?} in {:?}",
+            screen.blocks.len(),
+            screen.app,
+            started.elapsed()
+        );
+        for block in &screen.blocks {
+            println!("  {:?}: {:?}", block.region, block.text);
+        }
+        screen
+    }
+
+    /// Reads until the page's text shows up or `limit` passes.
+    fn read_until_page(limit: Duration) -> (ScreenContext, Option<Duration>) {
+        let started = Instant::now();
+        loop {
+            let screen = read();
+            if screen.blocks.iter().any(|b| b.text.contains("Airicraft")) {
+                return (screen, Some(started.elapsed()));
+            }
+            if started.elapsed() >= limit {
+                dump_window();
+                return (screen, None);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Reads `tests/data/page.html`, which `scripts/accessibility-e2e.sh` opens in a Chrome with
+    /// its accessibility tree forced on: the reader finds the page, its names, and the focused
+    /// field's text before the cursor.
+    #[test]
+    #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
+    fn reads_names_from_a_chrome_page() {
+        assert!(is_trusted(false), "accessibility permission is not granted");
+        let (page, found) = read_until_page(Duration::from_secs(10));
+        println!("page found after {found:?}");
+        let hotwords: Vec<String> = rank_terms(&page, 100)
+            .into_iter()
+            .map(|t| t.phrase)
+            .collect();
+        println!("hotwords: {}", hotwords.join(", "));
+
+        // AXTitle names the app "Chrome" on some systems and "Google Chrome" on others.
+        assert!(
+            page.app.as_deref().is_some_and(|a| a.contains("Chrome")),
+            "{:?}",
+            page.app
+        );
+        let title = page.blocks.iter().find(|b| b.region == Region::WindowTitle);
+        assert!(
+            title.is_some_and(|b| b.text.contains("Kestrelholm release notes")),
+            "{title:?}"
+        );
+        for name in ["Kestrelholm", "Airicraft", "Thessaly Varga", "Quillon"] {
+            assert!(
+                hotwords.iter().any(|h| h == name),
+                "{name} is not among the hotwords"
+            );
+        }
+        assert_eq!(
+            page.focused_tail(400).as_deref(),
+            Some("Dear Quillon, the next build is")
+        );
+    }
+
+    /// Whether the reader gets a plain Chrome, started without forced accessibility, to build the
+    /// page's tree, as the app must on a user's Mac. If its own switches do not, it also tries
+    /// AXEnhancedUserInterface up front, to show whether that would.
+    #[test]
+    #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
+    fn turns_on_chromes_tree() {
+        assert!(is_trusted(false), "accessibility permission is not granted");
+        let (_, found) = read_until_page(Duration::from_secs(10));
+        if found.is_none() {
+            let system = unsafe { AXUIElement::new_system_wide() };
+            let app = focused_app(&system).expect("no focused app");
+            println!(
+                "the reader's switches did not bring up the page; AXEnhancedUserInterface: {:?}",
+                set_true(&app, "AXEnhancedUserInterface")
+            );
+            let (_, after) = read_until_page(Duration::from_secs(10));
+            println!("page found {after:?} after AXEnhancedUserInterface");
+        }
+        assert!(
+            found.is_some(),
+            "the reader's switches did not make Chrome build the page's tree"
+        );
+        println!("page found after {found:?}");
     }
 }
