@@ -96,6 +96,27 @@ languages and Chinese dialects, with punctuation and casing. The core runs the s
 The int8 decoder quantizes activations per call, so a row's result depends slightly on the other rows
 of its batch. The clean decode therefore runs alone, and noisy decodes batch among themselves.
 
+Qwen3-ASR cannot read audio as it arrives, so the pipeline gets ahead in two ways while the user
+speaks:
+
+- **Drafts.** Each time the utterance in progress has grown by `partial_ms` (1 s), or by twice what
+  the last draft took if that is more, the pipeline decodes it again and shows the text
+  (`Event::Partial`). Two drafts in a row agree on their first words; `Asr::agreed_prefix` keeps the
+  shared ids up to a word boundary, minus the last shared word, since two drafts of audio cut inside
+  the same word can agree on a wrong reading of it ("schein" for "scheint"). The next draft, and the
+  decode when the utterance ends, read those ids with the prompt in one call
+  (`Asr::decode_after`) and generate only the rest.
+- **Early commit.** Once a pause has lasted `early_commit_ms` (250 ms), the pipeline transcribes the
+  utterance as the pause would end it (`Segmenter::preview`). When the pause reaches
+  `min_silence_ms` and the segment closes with the same samples, that transcript goes out at once.
+  Speech that comes back first throws it away.
+
+Neither runs while audio is waiting in the channel, so a slow device only loses them. On a 4-core
+container, over a 52 s clip of eight languages with 1.2 s pauses (two runs each), they cut the wait
+from the end of each phrase to its text from 2.3 s to 1.9 s on average. With the uncertainty check
+on, they gained nothing there: the noisy decodes of one phrase still ran while the next was spoken,
+so drafts rarely found the worker idle.
+
 **Transducers** (sherpa-onnx zipformers) remain as a small, fast fallback for one language.
 
 **Nemotron ASR Streaming** (`sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11`,
@@ -213,6 +234,11 @@ goes to the rewrite model only when `share_screen_text` is on.
 
 ### Rewrite
 
+Only the rewrite model reads the uncertainty markers, so without one (`Rewriter::reads_uncertainty`
+is false for `PassThrough` and for the macOS rewrite switch when it is off) the pipeline skips the
+noisy decodes. For Qwen3-ASR they were most of the wait: on the 52 s clip above, each phrase's text
+came 4.6 s after its end with them and 2.3 s without.
+
 `rewrite::SYSTEM_PROMPT` tells the model to fix recognition errors, punctuation, and fillers without
 adding content, to resolve `[unclear: ...]` spans from context and screen terms, and to reply with
 the final text only. `OpenAiCompatible` talks to any chat completions endpoint (hosted, OpenRouter,
@@ -251,8 +277,9 @@ A shell provides:
 2. **Cheaper uncertainty for the LLM.** Feed the clean transcript to each noisy decode in one pass
    (teacher forcing) and only decode freely where a sample disagrees, which removes most decoder steps.
    The CoreML execution provider may also speed up the prompt pass.
-3. **Streaming.** Nemotron encodes while the user speaks. Next: decode while they speak too, show
-   the partial text, and run the noisy decodes as parallel streams, as AIRI's live probe does.
+3. **Streaming.** Nemotron encodes while the user speaks, and Qwen3-ASR drafts while they speak.
+   Next: show Nemotron's partial text too, and run the noisy decodes as parallel streams, as AIRI's
+   live probe does.
 4. **Phonetic suggestions.** Port AIRI's phonetic matcher (pinyin and ARPAbet adapters) to suggest
    screen terms for spans the hotwords missed.
 5. **Untranscribed speech.** Port AIRI's syllable nucleus detection to mark syllables that no token

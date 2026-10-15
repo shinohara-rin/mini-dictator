@@ -174,6 +174,52 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
         }
     }
 
+    /// The utterance in progress: its first sample, its samples so far, and the silence at its
+    /// end in milliseconds.
+    pub fn open(&self) -> Option<(u64, usize, u32)> {
+        match &self.state {
+            State::Speech {
+                samples,
+                start_sample,
+                silence_frames,
+                ..
+            } => Some((
+                *start_sample,
+                samples.len(),
+                (*silence_frames * self.vad.frame_size() * 1000 / SAMPLE_RATE as usize) as u32,
+            )),
+            State::Silence => None,
+        }
+    }
+
+    /// The segment the utterance in progress would make if its pause went on until it ended:
+    /// the same samples, as long as no speech comes first.
+    pub fn preview(&self) -> Option<SpeechSegment> {
+        let State::Speech {
+            samples,
+            start_sample,
+            speech_frames,
+            part_speech_frames,
+            silence_frames,
+            pre_roll,
+        } = &self.state
+        else {
+            return None;
+        };
+        self.close(
+            samples.clone(),
+            *start_sample,
+            *speech_frames,
+            *part_speech_frames,
+            *silence_frames,
+            false,
+        )
+        .map(|segment| SpeechSegment {
+            pre_roll: *pre_roll,
+            ..segment
+        })
+    }
+
     /// Ends the dictation. Speech in progress becomes a segment if it is long enough.
     pub fn finish(&mut self) -> Option<SpeechSegment> {
         let tail = std::mem::take(&mut self.pending);
@@ -186,7 +232,10 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 silence_frames,
                 pre_roll,
             } => {
-                samples.extend_from_slice(&tail);
+                // In a pause, the samples too few for a frame are more of it, beyond the post-roll.
+                if silence_frames == 0 {
+                    samples.extend_from_slice(&tail);
+                }
                 self.close(
                     samples,
                     start_sample,
@@ -422,6 +471,20 @@ mod tests {
         assert_eq!(segmenter.earliest_start(), 28 * 160);
         segmenter.push(&audio(&[(1.0, 5), (0.0, 1)]));
         assert_eq!(segmenter.earliest_start(), 28 * 160);
+    }
+
+    #[test]
+    fn the_preview_of_an_utterance_is_the_segment_its_pause_ends() {
+        let mut segmenter = Segmenter::new(Scripted, config());
+        assert!(segmenter.preview().is_none());
+        segmenter.push(&audio(&[(0.0, 5), (1.0, 20), (0.0, 3)]));
+        assert_eq!(segmenter.open().map(|(_, _, silence)| silence), Some(30));
+        let preview = segmenter.preview().expect("an utterance in progress");
+        let segments = segmenter.push(&audio(&[(0.0, 30)]));
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_sample, preview.start_sample);
+        assert_eq!(segments[0].samples, preview.samples);
+        assert_eq!(segments[0].pre_roll, preview.pre_roll);
     }
 
     #[test]

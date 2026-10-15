@@ -572,6 +572,9 @@ pub fn run() {
                         }
                     }
                     CoreEvent::Inserted { .. } => {}
+                    CoreEvent::Partial { text } => ui
+                        .last
+                        .set_text(format!("Hearing: {}", shorten(text.trim(), 40))),
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
                         debug_log::write(&format!("warning: {warning}"));

@@ -134,6 +134,27 @@ pub trait Asr: Send + Sync {
         Ok(decoded.pop().unwrap_or_default())
     }
 
+    /// Decodes like [`Self::decode_one`], with the output starting with `prefix`: ids that
+    /// [`Self::agreed_prefix`] took from earlier decodes of the start of this audio. Only the rest
+    /// is generated. A backend that can't continue a decode ignores the prefix.
+    fn decode_after(
+        &self,
+        encoder: &EncoderOutput,
+        bias: &Bias,
+        prefix: &[u32],
+    ) -> Result<Hypothesis> {
+        let _ = prefix;
+        self.decode_one(encoder, bias)
+    }
+
+    /// The ids at the start of `earlier` and `later`, two decodes of a growing utterance, that a
+    /// later decode can keep: the ids both share, ending where a word ends. Empty for a backend
+    /// that can't continue a decode.
+    fn agreed_prefix(&self, earlier: &Hypothesis, later: &Hypothesis) -> Vec<u32> {
+        let _ = (earlier, later);
+        Vec::new()
+    }
+
     /// An encoder that reads audio as it arrives, for models that can. `None` makes the pipeline
     /// encode each segment once it ends.
     fn stream(&self) -> Option<Box<dyn EncoderStream + '_>> {
