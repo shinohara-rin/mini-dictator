@@ -31,7 +31,7 @@ profile=$(mktemp -d)
 "$CHROME" --user-data-dir="$profile" --no-first-run --no-default-browser-check \
   --disable-search-engine-choice-screen --new-window "file://$PAGE" > /dev/null 2>&1 &
 chrome=$!
-trap 'kill $chrome 2>/dev/null || true; rm -rf "$profile"' EXIT
+trap 'kill $chrome 2>/dev/null || true; rm -rf "$profile" 2>/dev/null || true' EXIT
 sleep 8
 osascript -e 'tell application "Google Chrome" to activate' || true
 sleep 2

@@ -373,6 +373,20 @@ mod tests {
         println!("after two seconds:");
         let later = read();
         dump_window();
+        // Which switch makes Chrome build the page's tree: the reader sets AXManualAccessibility on
+        // every read, and AXEnhancedUserInterface only once it finds an empty web area.
+        let system = unsafe { AXUIElement::new_system_wide() };
+        if let Some(app) = focused_app(&system) {
+            println!(
+                "AXManualAccessibility: {:?}, AXEnhancedUserInterface: {:?}",
+                set_true(&app, "AXManualAccessibility"),
+                set_true(&app, "AXEnhancedUserInterface")
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            println!("a second after AXEnhancedUserInterface:");
+            read();
+            dump_window();
+        }
         let hotwords: Vec<String> = rank_terms(&first, 100)
             .into_iter()
             .map(|t| t.phrase)
