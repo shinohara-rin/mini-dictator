@@ -90,6 +90,9 @@ fn parse() -> Result<Args, String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
+    if whole && live {
+        return Err("--whole and --live do not go together: live mode always uses a VAD".into());
+    }
     Ok(Args {
         model: model.ok_or("--model is required")?,
         wav: wav.ok_or("--wav is required")?,

@@ -579,7 +579,10 @@ pub fn run_dictation<V: VoiceActivityDetector>(
             }
         }
         waiting.extend(segmenter.finish());
-        feed(&mut stream, |s| s.finish(), events);
+        // Finishing pads and encodes another chunk, which only a waiting segment needs.
+        if !waiting.is_empty() {
+            feed(&mut stream, |s| s.finish(), events);
+        }
         drain(
             engine,
             &mut stream,
@@ -864,6 +867,8 @@ mod tests {
         lag: u64,
         /// `(start, end, samples heard)` of each segment taken.
         taken: Arc<std::sync::Mutex<Vec<(u64, u64, u64)>>>,
+        /// Whether a stream was finished.
+        finished: Arc<AtomicBool>,
     }
 
     struct LaggingStream<'a> {
@@ -879,6 +884,7 @@ mod tests {
         }
         fn finish(&mut self) -> Result<()> {
             self.finished = true;
+            self.asr.finished.store(true, Ordering::Relaxed);
             Ok(())
         }
         fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput> {
@@ -916,8 +922,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_streaming_recognizer_decodes_each_segment_once_its_frames_are_ready() {
+    /// An engine whose recognizer streams with `lag`, with what its stream records.
+    #[allow(clippy::type_complexity)]
+    fn streaming_engine(
+        lag: u64,
+    ) -> (
+        Engine,
+        Arc<std::sync::Mutex<Vec<(u64, u64, u64)>>>,
+        Arc<AtomicBool>,
+    ) {
         let Engine {
             asr,
             context,
@@ -925,19 +938,26 @@ mod tests {
             config,
             memory,
         } = engine();
-        let lag = 16_000;
-        let taken = Arc::default();
+        let (taken, finished) = (Arc::default(), Arc::default());
         let engine = Engine {
             asr: Box::new(Streaming {
                 inner: asr,
                 lag,
                 taken: Arc::clone(&taken),
+                finished: Arc::clone(&finished),
             }),
             context,
             rewriter,
             config,
             memory,
         };
+        (engine, taken, finished)
+    }
+
+    #[test]
+    fn a_streaming_recognizer_decodes_each_segment_once_its_frames_are_ready() {
+        let lag = 16_000;
+        let (engine, taken, finished) = streaming_engine(lag);
         let mut sink = Collect(Vec::new());
         run_dictation(
             &engine,
@@ -955,6 +975,34 @@ mod tests {
         assert!(taken[0].2 >= taken[0].1 + lag, "{taken:?}");
         assert!(taken[1].2 < taken[1].1 + lag, "{taken:?}");
         assert!(taken[0].1 <= taken[1].0, "{taken:?}");
+        assert!(finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_stream_with_no_segment_waiting_is_not_finished() {
+        let (engine, taken, finished) = streaming_engine(16_000);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(AudioChunk {
+                samples: vec![0.0; 96_000],
+                sample_rate: 48_000,
+                channels: 1,
+                captured: Instant::now(),
+                sound_playing: false,
+            })
+            .unwrap();
+        drop(sender);
+        let text = run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            receiver,
+            &mut Collect(Vec::new()),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(text, "");
+        assert!(taken.lock().unwrap().is_empty());
+        assert!(!finished.load(Ordering::Relaxed));
     }
 
     /// Writes every segment as the sentence "Hello.".
