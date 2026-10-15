@@ -25,6 +25,10 @@ pub struct Config {
     pub hotkey: String,
     /// Read the focused window for hotwords.
     pub read_screen: bool,
+    /// Record through macOS voice processing, which takes the app's own cues out of the
+    /// microphone, so they are not dictated and words spoken over them are kept. It also turns
+    /// down other apps' audio while recording. The menu changes it for the next dictation.
+    pub echo_cancellation: bool,
     /// Remember names seen on screen for about this long (the half-life of their weight), sampling
     /// the focused window every few seconds between dictations. 0 turns the memory off.
     pub screen_memory_seconds: u64,
@@ -83,6 +87,7 @@ impl Default for Config {
             onnxruntime: None,
             hotkey: "Alt+Space".into(),
             read_screen: true,
+            echo_cancellation: true,
             screen_memory_seconds: 60,
             share_screen_text: true,
             sounds: Some(Level::Verbose),

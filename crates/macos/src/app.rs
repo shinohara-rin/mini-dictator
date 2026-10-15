@@ -156,7 +156,7 @@ fn performance_cores() -> usize {
 
 struct Dictation {
     /// Dropping it stops the microphone and ends the dictation.
-    stream: Option<cpal::Stream>,
+    stream: Option<crate::audio::Capture>,
     pressed_at: Instant,
 }
 
@@ -168,6 +168,7 @@ struct Ui {
     permissions: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
+    echo: CheckMenuItem,
     change_hotkey: MenuItem,
     debug: CheckMenuItem,
     /// Off, minimal, and verbose, checked like radio buttons.
@@ -192,6 +193,7 @@ impl Ui {
             None,
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
+        let echo = CheckMenuItem::new("Cancel Echo", true, config.echo_cancellation, None);
         let change_hotkey = MenuItem::new(change_label(&config.hotkey), true, None);
         let debug = CheckMenuItem::new("Write Debug Log", true, config.debug, None);
         let level = config.sound_level();
@@ -220,6 +222,7 @@ impl Ui {
             &separator,
             &rewrite,
             &screen,
+            &echo,
             &change_hotkey,
             &debug,
             &sounds_menu,
@@ -244,6 +247,7 @@ impl Ui {
             permissions,
             rewrite,
             screen,
+            echo,
             change_hotkey,
             debug,
             sound_levels,
@@ -627,6 +631,7 @@ pub fn run() {
                 dictating.store(false, Ordering::Relaxed);
                 let Some(ui) = &ui else { return };
                 // The dictation failed while the microphone was on: stop recording.
+                ui.sounds.set_echo_output(None);
                 if dictation.take().is_some() {
                     ui.toggle.set_text(start_label(&ui.hotkey));
                     ui.cue(Cue::Stop);
@@ -695,8 +700,17 @@ fn start(
 ) -> Option<Dictation> {
     let (sender, receiver) = mpsc::channel();
     let playback = ui.sounds.playback();
-    let stream = match crate::audio::start(sender, playback.clone()) {
-        Ok(stream) => stream,
+    let stream = match crate::audio::start(sender, playback.clone(), ui.echo.is_checked()) {
+        Ok((stream, fallback)) => {
+            if let Some(error) = fallback {
+                eprintln!("echo cancellation: {error}");
+                debug_log::write(&format!("echo cancellation off: {error}"));
+                ui.last
+                    .set_text(shorten(&format!("Echo cancellation off: {error}"), 60));
+            }
+            ui.sounds.set_echo_output(stream.echo_output());
+            stream
+        }
         Err(error) => {
             ui.show(State::Error, &shorten(&format!("Microphone: {error}"), 60));
             ui.jingle(Jingle::Error);
@@ -757,6 +771,7 @@ fn start(
 
 fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
     if let Some(mut current) = dictation.take() {
+        ui.sounds.set_echo_output(None);
         current.stream.take();
         ui.cue(Cue::Stop);
         ui.toggle.set_text(start_label(&ui.hotkey));

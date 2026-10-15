@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-const RATE: u32 = 44_100;
+pub const RATE: u32 = 44_100;
 
 /// A pipeline moment with a sound of its own in the verbose set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,7 +55,8 @@ impl Jingle {
         wav(&self.samples())
     }
 
-    fn samples(self) -> Vec<f32> {
+    /// Mono samples at [`RATE`].
+    pub fn samples(self) -> Vec<f32> {
         let mut out = Vec::new();
         match self {
             Jingle::Ready => {

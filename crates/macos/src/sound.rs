@@ -12,6 +12,7 @@ use objc2_app_kit::NSSound;
 use objc2_foundation::{NSData, NSString};
 use serde::{Deserialize, Serialize};
 
+use crate::audio::{EchoOutput, CUE_RATE};
 pub use crate::synth::Jingle;
 use crate::synth::Limiter;
 
@@ -80,8 +81,11 @@ impl Playback {
 pub struct Sounds {
     level: Cell<Level>,
     jingles: Vec<(Jingle, Retained<NSSound>)>,
+    /// The same cues as samples, for an engine that cancels them from the microphone.
+    samples: Vec<(Jingle, Vec<f32>)>,
     limiter: RefCell<Limiter>,
     playback: Playback,
+    echo: RefCell<Option<EchoOutput>>,
 }
 
 impl Sounds {
@@ -95,16 +99,30 @@ impl Sounds {
                 Some((jingle, sound))
             })
             .collect();
+        let samples = Jingle::ALL
+            .into_iter()
+            .map(|jingle| {
+                let samples = jingle.samples().iter().map(|s| s * JINGLE_VOLUME).collect();
+                (jingle, samples)
+            })
+            .collect();
         Sounds {
             level: Cell::new(level),
             jingles,
+            samples,
             limiter: RefCell::new(Limiter::new()),
             playback: Playback::new(),
+            echo: RefCell::new(None),
         }
     }
 
     pub fn playback(&self) -> Playback {
         self.playback.clone()
+    }
+
+    /// While set, the cues play through this output, which cancels them from the microphone.
+    pub fn set_echo_output(&self, output: Option<EchoOutput>) {
+        *self.echo.borrow_mut() = output;
     }
 
     pub fn set_level(&self, level: Level) {
@@ -134,6 +152,15 @@ impl Sounds {
             || !self.limiter.borrow_mut().allow(jingle, Instant::now())
         {
             return;
+        }
+        let echo = self.echo.borrow().clone();
+        if let (Some(output), Some((_, samples))) =
+            (echo, self.samples.iter().find(|(j, _)| *j == jingle))
+        {
+            // Cancelled from the microphone, so nothing needs marking.
+            if output.play(samples, CUE_RATE) {
+                return;
+            }
         }
         if let Some((_, sound)) = self.jingles.iter().find(|(j, _)| *j == jingle) {
             // A sound still playing ignores `play`; start it over instead.
