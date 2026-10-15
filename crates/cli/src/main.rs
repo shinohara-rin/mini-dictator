@@ -139,6 +139,8 @@ fn builtin_rewriter(args: &Args) -> Result<Option<Box<dyn Rewriter>>, String> {
 
 #[cfg(not(unix))]
 fn builtin_rewriter(args: &Args) -> Result<Option<Box<dyn Rewriter>>, String> {
+    // The model flags only mean something with the server, which needs Unix.
+    let _ = (&args.rewrite_gguf, &args.rewrite_mmproj);
     match args.llama_server {
         Some(_) => Err("the built-in rewriter needs a Unix system".into()),
         None => Ok(None),
