@@ -305,13 +305,6 @@ fn change_label(hotkey: &str) -> String {
     format!("Change Hotkey ({hotkey})…")
 }
 
-/// A transcript with nothing but full stops, which the recognizer gives for a cough or a breath.
-fn heard_nothing(plain: &str) -> bool {
-    plain
-        .chars()
-        .all(|c| c.is_whitespace() || matches!(c, '.' | '。'))
-}
-
 fn shorten(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
@@ -551,7 +544,7 @@ pub fn run() {
                         cued_segment = true;
                         if unclear_spans > 0 {
                             ui.jingle(Jingle::Unclear);
-                        } else if heard_nothing(&plain) {
+                        } else if mini_dictator_core::pipeline::is_nothing(&plain) {
                             ui.jingle(Jingle::Nothing);
                         } else {
                             cued_segment = false;
@@ -776,20 +769,5 @@ fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
         ui.cue(Cue::Stop);
         ui.toggle.set_text(start_label(&ui.hotkey));
         ui.show(State::Working, "Finishing…");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::heard_nothing;
-
-    #[test]
-    fn a_lone_full_stop_is_heard_as_nothing() {
-        for plain in ["", " ", ".", "。", " . ", "。。"] {
-            assert!(heard_nothing(plain), "{plain:?}");
-        }
-        for plain in ["Hi.", "はい。", "?", "..a"] {
-            assert!(!heard_nothing(plain), "{plain:?}");
-        }
     }
 }

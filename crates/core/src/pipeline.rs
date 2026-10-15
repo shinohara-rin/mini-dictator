@@ -270,7 +270,7 @@ impl Engine {
             unclear_spans: transcript.uncertainty.analysis.spans.len(),
             behind_seconds,
         });
-        if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
+        if is_nothing(&plain) && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
         }
         let pause_seconds = session.joiner.pause_before(segment);
@@ -351,6 +351,13 @@ impl Engine {
 /// How long ago a segment's last sample was recorded: the age of the latest block plus the audio
 /// after the segment. Timing each block keeps this right when the worker starts after the
 /// microphone, or capture starts late.
+/// A transcript with nothing but full stops, which the recognizer gives for a cough or a breath.
+pub fn is_nothing(plain: &str) -> bool {
+    plain
+        .chars()
+        .all(|c| c.is_whitespace() || matches!(c, '.' | '。'))
+}
+
 fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
     let end = segment.start_sample + segment.samples.len() as u64;
     captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
@@ -561,8 +568,13 @@ mod tests {
     }
 
     fn engine() -> Engine {
+        engine_hearing("▁HELLO")
+    }
+
+    /// An engine whose recognizer hears `token` in each utterance.
+    fn engine_hearing(token: &str) -> Engine {
         let symbols =
-            SymbolTable::from_lines(["<blk> 0", "▁HELLO 1", "▁KITTY 2"].map(String::from));
+            SymbolTable::from_lines(["<blk> 0".into(), format!("{token} 1"), "▁KITTY 2".into()]);
         Engine {
             asr: Box::new(Recognizer::new(
                 LoudnessModel,
@@ -625,6 +637,40 @@ mod tests {
                 .unwrap();
         }
         receiver
+    }
+
+    #[test]
+    fn a_lone_full_stop_is_not_typed() {
+        for token in [".", "。"] {
+            let engine = engine_hearing(token);
+            let mut sink = Collect(Vec::new());
+            let mut events = Vec::new();
+            run_dictation(
+                &engine,
+                crate::vad::EnergyVad::default(),
+                speech(Instant::now()),
+                &mut sink,
+                &mut |e| events.push(e),
+            )
+            .unwrap();
+            assert!(sink.0.is_empty(), "{token}: {:?}", sink.0);
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::Transcribed { plain, .. } if plain == token)),
+                "{token}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_stops_alone_are_nothing() {
+        for plain in ["", " ", ".", "。", " . ", "。。"] {
+            assert!(is_nothing(plain), "{plain:?}");
+        }
+        for plain in ["Hi.", "はい。", "?", "..a"] {
+            assert!(!is_nothing(plain), "{plain:?}");
+        }
     }
 
     #[test]
