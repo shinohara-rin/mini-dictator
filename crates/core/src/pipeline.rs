@@ -215,6 +215,7 @@ impl Engine {
     /// `pause_seconds` is the silence since the last inserted segment.
     pub fn rewrite_request(
         &self,
+        segment: &SpeechSegment,
         transcript: &Transcript,
         session: &SessionContext,
         pause_seconds: Option<f32>,
@@ -234,6 +235,7 @@ impl Engine {
             },
             session_text: tail(&session.inserted, self.config.preceding_chars),
             pause_seconds,
+            audio: segment.samples.clone(),
         }
     }
 
@@ -268,7 +270,7 @@ impl Engine {
             return Ok(None);
         }
         let pause_seconds = session.joiner.pause_before(segment);
-        let request = self.rewrite_request(&transcript, session, pause_seconds);
+        let request = self.rewrite_request(segment, &transcript, session, pause_seconds);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
         if self.debug() {

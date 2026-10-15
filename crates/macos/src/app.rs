@@ -17,7 +17,7 @@ use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::context::{rank_terms, MemoryConfig, TermMemory};
 use mini_dictator_core::join::JoinConfig;
 use mini_dictator_core::pipeline::{run_dictation, Engine, EngineConfig, Event as CoreEvent};
-use mini_dictator_core::rewrite::{OpenAiCompatible, Rewriter};
+use mini_dictator_core::rewrite::{Builtin, LlamaServer, OpenAiCompatible, Rewriter};
 use mini_dictator_core::vad::{EnergyVad, SileroVad};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -25,7 +25,7 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-use crate::config::{debug_log_path, support_dir, Config, APP_NAME};
+use crate::config::{debug_log_path, llama_log_path, support_dir, Config, APP_NAME};
 use crate::context::{focused_window, is_trusted, AccessibilityReader, FocusedWindow};
 use crate::debug_log;
 use crate::hotkey::{Hotkey, Outcome, Signal};
@@ -81,15 +81,7 @@ fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switc
         .sigma
         .unwrap_or(monte_carlo.relative_sigma);
 
-    let rewriter: Option<Box<dyn Rewriter>> = (!config.rewrite.model.is_empty()).then(|| {
-        Box::new(OpenAiCompatible {
-            base_url: config.rewrite.base_url.clone(),
-            api_key: Some(config.rewrite.api_key.clone()).filter(|k| !k.is_empty()),
-            model: config.rewrite.model.clone(),
-            timeout: Duration::from_secs(config.rewrite.timeout_seconds),
-        }) as Box<dyn Rewriter>
-    });
-    let rewriter = Switchable::new(rewriter, config.rewrite.enabled);
+    let rewriter = Switchable::new(rewriter(config), config.rewrite.enabled);
     let screen = Switchable::new(AccessibilityReader::default(), config.read_screen);
     let switches = Switches {
         rewrite: rewriter.enabled.clone(),
@@ -130,6 +122,41 @@ fn load_engine(config: &Config, debug: Arc<AtomicBool>) -> Result<(Engine, Switc
         },
     };
     Ok((engine, switches))
+}
+
+/// The built-in model, or the configured endpoint. A built-in model that cannot start (its files
+/// are missing, say) reports why on each rewrite, which the menu shows as a warning, and the
+/// plain transcript is inserted.
+fn rewriter(config: &Config) -> Option<Box<dyn Rewriter>> {
+    let rewrite = &config.rewrite;
+    if rewrite.builtin {
+        let mut builtin = Builtin::new(LlamaServer {
+            binary: config.llama_server_path(),
+            model: Config::resolve(&rewrite.builtin_model),
+            mmproj: rewrite
+                .builtin_audio
+                .as_deref()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(Config::resolve),
+            log: Some(llama_log_path()),
+        });
+        builtin.timeout = Duration::from_secs(rewrite.timeout_seconds);
+        // Load the model now so the first dictation does not wait for it. When the rewrite is
+        // off, the server starts the first time it is turned on and used.
+        if rewrite.enabled {
+            let _ = builtin.start();
+        }
+        return Some(Box::new(builtin));
+    }
+    (!rewrite.model.is_empty()).then(|| {
+        Box::new(OpenAiCompatible {
+            base_url: rewrite.base_url.clone(),
+            api_key: Some(rewrite.api_key.clone()).filter(|k| !k.is_empty()),
+            model: rewrite.model.clone(),
+            timeout: Duration::from_secs(rewrite.timeout_seconds),
+            send_audio: rewrite.send_audio,
+        }) as Box<dyn Rewriter>
+    })
 }
 
 /// Performance cores on Apple silicon. ONNX Runtime splits work evenly across its threads, so a
@@ -185,7 +212,7 @@ impl Ui {
         let permissions = MenuItem::new(permissions::summary(&permissions::missing()), false, None);
         let rewrite = CheckMenuItem::new(
             "Rewrite with LLM",
-            !config.rewrite.model.is_empty(),
+            config.rewrite.builtin || !config.rewrite.model.is_empty(),
             config.rewrite.enabled,
             None,
         );

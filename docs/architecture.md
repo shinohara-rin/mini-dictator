@@ -22,7 +22,7 @@ hotkey down
   ├─ uncertainty  EncoderOutput + N(0, σ·std_d) × K ─► batched decode ─► K Hypotheses
   │               analyze() ─► unstable / dropped spans ─► format_for_llm()
   │                                            │  `the [unclear: "B", also heard "D"] ...`
-  ├─ rewrite ── Rewriter::rewrite(marked transcript, screen terms, text before cursor, pause)
+  ├─ rewrite ── Rewriter::rewrite(marked transcript, screen terms, text before cursor, pause, audio)
   │                                            │
   ├─ join ───── Joiner::join()   holds the final period until the next segment
   │                                            │
@@ -59,7 +59,7 @@ sentence starts or the hotkey is released.
 | `asr` | The recognizer interface and its two backends | `Asr`, `Bias`, `load`; `QwenAsr`, `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer` |
 | `uncertainty` | Monte Carlo over encoder output, span analysis | `MonteCarloConfig`, `estimate`, `analyze`, `format_for_llm` |
 | `context` | Screen text model and hotword ranking | `ContextProvider`, `ScreenContext`, `TextBlock`, `Region`, `FallbackProvider`, `rank_terms` |
-| `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `PassThrough` |
+| `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `Builtin`, `PassThrough` |
 | `join` | Continues or ends a sentence split by a pause | `Joiner`, `JoinConfig`, `Piece` |
 | `pipeline` | One dictation, end to end | `Engine`, `run_dictation`, `TextSink`, `Event` |
 
@@ -175,11 +175,34 @@ goes to the rewrite model only when `share_screen_text` is on.
 ### Rewrite
 
 `rewrite::SYSTEM_PROMPT` tells the model to fix recognition errors, punctuation, and fillers without
-adding content, to resolve `[unclear: ...]` spans from context and screen terms, and to reply with
-the final text only. `OpenAiCompatible` talks to any chat completions endpoint (hosted, OpenRouter,
-Ollama, llama.cpp). The reply loses a leading `<think>` block and any chat template tokens a server
-lets through. A failed rewrite, or one with no text left, inserts the plain transcript and reports a
-warning.
+adding content, to keep the transcript's language, to resolve `[unclear: ...]` spans from context and
+screen terms, and to reply with the final text only. Five worked examples (`rewrite::examples`) go
+before the request as earlier turns. On 30 English, Chinese, and Japanese cases they raised every
+small model's score, and they stopped 1 to 4B models from echoing the prompt or translating Chinese
+and Japanese into English. The last example is English, because a Chinese one in that place pulled
+some English replies into Chinese.
+
+`OpenAiCompatible` talks to any chat completions endpoint (hosted, OpenRouter, Ollama, llama.cpp).
+With `send_audio`, it attaches the segment as a 16 kHz WAV (`input_audio`) after the text and adds
+`AUDIO_NOTE` to the system prompt. The reply loses a leading `<think>` block, any chat template
+tokens a server lets through, and a second identical copy of itself. A failed rewrite, or one with
+no text left, inserts the plain transcript and reports a warning.
+
+`Builtin` is the default rewriter on macOS: Gemma 4 E2B (Q4_K_M, 3.1 GB) and its audio projector
+(0.6 GB) in llama.cpp's `llama-server`, which the app bundles and starts on a free local port. The
+server runs with thinking off (`enable_thinking: false`): Gemma 4 thinks before about half its
+answers otherwise, which took seconds and scored lower. It runs under `/bin/sh`, which watches a pipe
+from the app and stops the server when the pipe closes, so a crashed app leaves no model loaded. A
+server that exits starts again on the next rewrite.
+
+Why this model, from a benchmark on an L4 with the cases above
+(`research/local-rewriter/results.md` in the project files): Gemma 4 E2B with no audio passed 17
+of 30, and with the recording 21. The audio recovers words the recognizer skipped and names it
+misheard (Neymar Tron to Nemotron, 機会 to 機械学習); on the test clips it also fixed Барсук,
+вольера, and a dropped French sentence in a code-switched clip. It also pulls the model toward a
+verbatim transcript, so `AUDIO_NOTE` says fillers still go. Gemma 4 E4B scored higher from text
+alone (26 of 30) but is 5 GB and decodes at half the speed. Qwen3.5 2B and 4B, MiniCPM5, LFM2.5,
+and Granite 4.2 scored lower or echoed the prompt.
 
 ## Platform shell contract
 

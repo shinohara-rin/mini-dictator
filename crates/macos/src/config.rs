@@ -57,6 +57,20 @@ pub struct Uncertainty {
 #[serde(default)]
 pub struct Rewrite {
     pub enabled: bool,
+    /// Run the rewrite model on this Mac: Gemma 4 E2B in the bundled llama.cpp server, which also
+    /// hears each utterance. Off sends the rewrite to `base_url` instead. New configs turn it on;
+    /// a saved `[rewrite]` table without the key predates it and keeps using `base_url`.
+    #[serde(default)]
+    pub builtin: bool,
+    /// The built-in model. `scripts/fetch-models.sh` downloads it.
+    pub builtin_model: PathBuf,
+    /// The built-in model's audio projector. Empty makes the built-in model read the transcript
+    /// only.
+    pub builtin_audio: Option<PathBuf>,
+    /// `llama-server`. Empty means the one in the app bundle.
+    pub llama_server: Option<PathBuf>,
+    /// Attach the recording when calling `base_url`, for endpoints whose model takes audio input.
+    pub send_audio: bool,
     /// An OpenAI-compatible base URL, such as `https://api.openai.com/v1` or `http://localhost:11434/v1`.
     pub base_url: String,
     pub model: String,
@@ -88,7 +102,12 @@ impl Default for Config {
 impl Default for Rewrite {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
+            builtin: true,
+            builtin_model: PathBuf::from("models/gemma-4-E2B-it-Q4_K_M.gguf"),
+            builtin_audio: Some(PathBuf::from("models/mmproj-gemma-4-E2B-it-Q8_0.gguf")),
+            llama_server: None,
+            send_audio: false,
             base_url: "http://localhost:11434/v1".into(),
             model: "qwen3:4b".into(),
             api_key: String::new(),
@@ -181,6 +200,10 @@ pub fn debug_log_path() -> PathBuf {
     support_dir().join("debug.log")
 }
 
+pub fn llama_log_path() -> PathBuf {
+    support_dir().join("llama-server.log")
+}
+
 impl Config {
     /// Loads the config, writing the defaults first if there is none.
     pub fn load_or_create() -> Result<Self, String> {
@@ -222,6 +245,23 @@ impl Config {
             return support_dir().join(path);
         }
         path.to_path_buf()
+    }
+
+    /// `llama-server`: the config, then the app bundle's `Contents/Helpers/llama`.
+    pub fn llama_server_path(&self) -> PathBuf {
+        if let Some(path) = self
+            .rewrite
+            .llama_server
+            .as_deref()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            return Self::resolve(path);
+        }
+        let exe = std::env::current_exe().unwrap_or_default();
+        exe.parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(""))
+            .join("Helpers/llama/llama-server")
     }
 
     /// ONNX Runtime: the config, then `ORT_DYLIB_PATH`, then the app bundle's Frameworks folder.
@@ -281,6 +321,14 @@ mod tests {
         assert_eq!(config.hotkey, "F5");
         assert_eq!(config.rewrite.model, "x");
         assert!(!config.beep);
+    }
+
+    #[test]
+    fn a_saved_endpoint_config_keeps_its_endpoint() {
+        let config: Config = toml::from_str("[rewrite]\nenabled = true\nmodel = \"x\"\n").unwrap();
+        assert!(!config.rewrite.builtin);
+        let config: Config = toml::from_str("beep = false\n").unwrap();
+        assert!(config.rewrite.builtin);
     }
 
     #[test]
