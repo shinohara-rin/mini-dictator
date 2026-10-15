@@ -587,13 +587,14 @@ impl NemoTransducer {
 impl Asr for NemoTransducer {
     fn bias(&self, phrases: &[String]) -> Bias {
         let tokenizer = Tokenizer::new(&self.symbols);
-        let sequences: Vec<Vec<u32>> = phrases
+        // Only the phrases the vocabulary can spell reach the graph, and only those are reported.
+        let (phrases, sequences): (Vec<String>, Vec<Vec<u32>>) = phrases
             .iter()
-            .filter_map(|phrase| tokenizer.encode(phrase))
-            .collect();
+            .filter_map(|phrase| Some((phrase.clone(), tokenizer.encode(phrase)?)))
+            .unzip();
         let graph = ContextGraph::new(&sequences, self.search.hotword_boost);
         Bias {
-            phrases: phrases.to_vec(),
+            phrases,
             graph: (!graph.is_empty()).then_some(graph),
         }
     }
