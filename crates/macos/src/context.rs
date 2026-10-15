@@ -220,11 +220,18 @@ pub fn insert_at_cursor(text: &str) -> bool {
     let Some(before) = value_text(&focused) else {
         return false;
     };
+    let range = selected_range(&focused);
     let value = CFString::from_str(text);
     if unsafe { focused.set_attribute_value(&name, &value) } != AXError::Success {
         return false;
     }
+    // A selection that already held this text leaves the value as it was, but not the selection.
     value_text(&focused).is_some_and(|after| after != before)
+        || range.is_some_and(|before| {
+            selected_range(&focused).is_some_and(|after| {
+                (after.location, after.length) != (before.location, before.length)
+            })
+        })
 }
 
 /// How far up [`in_web_area`] looks: a page's fields can sit deep in its tree.
@@ -282,19 +289,22 @@ fn set_true(element: &AXUIElement, name: &str) -> AXError {
     unsafe { element.set_attribute_value(&CFString::from_str(name), CFBoolean::new(true).as_ref()) }
 }
 
+/// The selection, or the cursor as an empty one, in UTF-16 units.
+fn selected_range(element: &AXUIElement) -> Option<CFRange> {
+    let value = attribute(element, "AXSelectedTextRange")?
+        .downcast::<AXValue>()
+        .ok()?;
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    unsafe { value.value(AXValueType::CFRange, NonNull::from(&mut range).cast()) }.then_some(range)
+}
+
 /// The focused field's text before the cursor. `AXSelectedTextRange` counts UTF-16 units.
 fn text_before_cursor(focused: &AXUIElement) -> Option<String> {
     let value = string(focused, "AXValue")?;
-    let range = attribute(focused, "AXSelectedTextRange")
-        .and_then(|v| v.downcast::<AXValue>().ok())
-        .and_then(|v| {
-            let mut range = CFRange {
-                location: 0,
-                length: 0,
-            };
-            unsafe { v.value(AXValueType::CFRange, NonNull::from(&mut range).cast()) }
-                .then_some(range)
-        });
+    let range = selected_range(focused);
     let Some(range) = range else {
         return Some(value);
     };
