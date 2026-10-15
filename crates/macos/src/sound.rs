@@ -154,11 +154,16 @@ impl Sounds {
             return;
         }
         let echo = self.echo.borrow().clone();
-        if let (Some(output), Some((_, samples))) =
-            (echo, self.samples.iter().find(|(j, _)| *j == jingle))
-        {
-            // Cancelled from the microphone, so nothing needs marking.
-            if output.play(samples, CUE_RATE) {
+        if let (Some(output), Some((slot, (_, samples)))) = (
+            echo,
+            self.samples
+                .iter()
+                .enumerate()
+                .find(|(_, (j, _))| *j == jingle),
+        ) {
+            // Each cue has its own player, so different cues overlap. Cancelled from the
+            // microphone, so nothing needs marking.
+            if output.play(slot, samples, CUE_RATE) {
                 return;
             }
         }

@@ -21,7 +21,7 @@ use objc2_avf_audio::{
     AVAudioPlayerNode, AVAudioTime,
 };
 
-use crate::sound::Playback;
+use crate::sound::{Jingle, Playback};
 
 /// The microphone while a dictation records.
 pub enum Capture {
@@ -50,7 +50,7 @@ pub fn start(
 ) -> Result<(Capture, Option<String>), String> {
     let mut fallback = None;
     if cancel_echo {
-        match EchoCapture::start(sender.clone(), playback.clone()) {
+        match EchoCapture::start(sender.clone(), playback.clone(), Jingle::ALL.len()) {
             Ok(capture) => return Ok((Capture::Echo(capture), None)),
             Err(error) => fallback = Some(error),
         }
@@ -58,20 +58,22 @@ pub fn start(
     Ok((Capture::Plain(start_plain(sender, playback)?), fallback))
 }
 
-/// The cue player of a running [`EchoCapture`]. Main thread only.
+/// The cue players of a running [`EchoCapture`], one per cue so that different cues overlap in
+/// the mixer instead of queueing behind each other. Main thread only.
 #[derive(Clone)]
 pub struct EchoOutput {
-    player: Retained<AVAudioPlayerNode>,
+    players: Rc<Vec<Retained<AVAudioPlayerNode>>>,
     /// False once the capture stopped, after which the player must not be used.
     running: Rc<Cell<bool>>,
 }
 
 impl EchoOutput {
-    /// Plays mono samples at `rate`, after any cue still playing. False if the capture stopped.
-    pub fn play(&self, samples: &[f32], rate: f64) -> bool {
-        if !self.running.get() {
+    /// Plays mono samples at `rate` on player `slot`, starting over whatever that player was
+    /// still playing. False if the capture stopped or there is no such player.
+    pub fn play(&self, slot: usize, samples: &[f32], rate: f64) -> bool {
+        let Some(player) = self.players.get(slot).filter(|_| self.running.get()) else {
             return false;
-        }
+        };
         // SAFETY: the engine is running, the buffer matches the format the player was connected
         // with, and its single channel is filled within its capacity before it is scheduled.
         unsafe {
@@ -88,9 +90,10 @@ impl EchoOutput {
             buffer.setFrameLength(samples.len() as u32);
             let channel = *buffer.floatChannelData();
             std::ptr::copy_nonoverlapping(samples.as_ptr(), channel.as_ptr(), samples.len());
-            self.player
-                .scheduleBuffer_completionHandler(&buffer, std::ptr::null_mut());
-            self.player.play();
+            // A buffer scheduled without a time waits for the ones before it, so drop those.
+            player.stop();
+            player.scheduleBuffer_completionHandler(&buffer, std::ptr::null_mut());
+            player.play();
         }
         true
     }
@@ -123,7 +126,11 @@ pub struct EchoCapture {
 }
 
 impl EchoCapture {
-    fn start(sender: Sender<AudioChunk>, playback: Playback) -> Result<Self, String> {
+    fn start(
+        sender: Sender<AudioChunk>,
+        playback: Playback,
+        players: usize,
+    ) -> Result<Self, String> {
         let describe =
             |e: Retained<objc2_foundation::NSError>| e.localizedDescription().to_string();
         // SAFETY: the engine is set up while stopped, the player is attached before it is
@@ -134,10 +141,15 @@ impl EchoCapture {
             input
                 .setVoiceProcessingEnabled_error(true)
                 .map_err(describe)?;
-            let player = AVAudioPlayerNode::new();
-            engine.attachNode(&player);
             let format = cue_format(CUE_RATE).ok_or("no cue format")?;
-            engine.connect_to_format(&player, &engine.mainMixerNode(), Some(&format));
+            let players: Vec<_> = (0..players)
+                .map(|_| {
+                    let player = AVAudioPlayerNode::new();
+                    engine.attachNode(&player);
+                    engine.connect_to_format(&player, &engine.mainMixerNode(), Some(&format));
+                    player
+                })
+                .collect();
 
             let input_format = input.outputFormatForBus(0);
             let sample_rate = input_format.sampleRate() as u32;
@@ -178,7 +190,7 @@ impl EchoCapture {
                 engine,
                 input,
                 output: EchoOutput {
-                    player,
+                    players: Rc::new(players),
                     running: Rc::new(Cell::new(true)),
                 },
                 sender,
@@ -193,7 +205,9 @@ impl Drop for EchoCapture {
         // SAFETY: stops what `start` started, on the thread that started it.
         unsafe {
             self.input.removeTapOnBus(0);
-            self.output.player.stop();
+            for player in self.output.players.iter() {
+                player.stop();
+            }
             self.engine.stop();
         }
         if let Ok(mut sender) = self.sender.lock() {
