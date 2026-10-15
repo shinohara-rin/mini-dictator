@@ -12,9 +12,12 @@ pub const APP_NAME: &str = "Mini Dictator";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// A sherpa-onnx Qwen3-ASR export or offline transducer directory. Relative paths start at the
-    /// support directory.
+    /// A sherpa-onnx Qwen3-ASR export, Nemotron streaming transducer, or offline transducer
+    /// directory. Relative paths start at the support directory.
     pub model_dir: PathBuf,
+    /// The spoken language, such as `en` or `ja-JP`, for models that take one (Nemotron).
+    /// Empty lets the model detect it.
+    pub language: String,
     /// Silero VAD. Without it, a loudness detector gates the audio.
     pub vad_model: Option<PathBuf>,
     /// ONNX Runtime. Empty means `ORT_DYLIB_PATH`, then `Contents/Frameworks` of the app bundle.
@@ -84,6 +87,7 @@ impl Default for Config {
         Self {
             model_dir: PathBuf::from("models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"),
             vad_model: Some(PathBuf::from("models/silero_vad.onnx")),
+            language: String::new(),
             onnxruntime: None,
             hotkey: "Alt+Space".into(),
             read_screen: true,

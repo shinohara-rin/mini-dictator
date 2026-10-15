@@ -7,10 +7,15 @@
 //!   recognizer, so hotwords can score partial matches inside the beam search ([`ContextGraph`]). A
 //!   [`TransducerModel`] has the three networks of a sherpa-onnx transducer: the encoder, the
 //!   stateless decoder (prediction network), and the joiner.
+//! - [`nemo::NemoTransducer`] runs a cache-aware streaming NeMo transducer such as Nemotron ASR
+//!   Streaming. It encodes audio while the user speaks ([`Asr::stream`]), so a segment is ready to
+//!   decode almost as soon as it ends.
 //! - [`qwen::QwenAsr`] runs Qwen3-ASR, an audio encoder in front of an LLM that reads hotwords in its
 //!   prompt. It covers about 30 languages.
 
 mod context_graph;
+#[cfg(feature = "onnx")]
+pub mod nemo;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 #[cfg(feature = "onnx")]
@@ -128,19 +133,52 @@ pub trait Asr: Send + Sync {
         let mut decoded = self.decode(std::slice::from_ref(encoder), bias)?;
         Ok(decoded.pop().unwrap_or_default())
     }
+
+    /// An encoder that reads audio as it arrives, for models that can. `None` makes the pipeline
+    /// encode each segment once it ends.
+    fn stream(&self) -> Option<Box<dyn EncoderStream + '_>> {
+        None
+    }
+}
+
+/// Encodes one dictation's audio while it is recorded.
+///
+/// The stream reads every sample since the dictation started, speech and silence alike, and the
+/// pipeline takes each segment's frames out of it once they are ready. Sample positions count
+/// from the first accepted sample.
+pub trait EncoderStream {
+    /// Adds 16 kHz samples and encodes what they complete.
+    fn accept(&mut self, samples: &[f32]) -> Result<()>;
+    /// Encodes the rest after the last sample.
+    fn finish(&mut self) -> Result<()>;
+    /// The encoder frames to decode for the segment of samples `start..end`, or `None` until the
+    /// stream has encoded them. A streaming model writes a token some time after it hears the
+    /// sound, so the frames run past the segment's end, and the next segment's frames begin
+    /// where these end. Segments come in order.
+    fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput>;
+    /// No segment will start before sample `before`, so the stream may drop what lies there.
+    fn discard(&mut self, before: u64) {
+        let _ = before;
+    }
 }
 
 /// Loads the recognizer in a sherpa-onnx model directory: Qwen3-ASR when the directory has its
-/// files, otherwise a transducer searched with `search`. ONNX Runtime must be initialized first.
+/// files, otherwise a transducer searched with `search`, streaming when its encoder is. ONNX Runtime must be initialized first.
 #[cfg(feature = "onnx")]
 pub fn load(dir: &std::path::Path, threads: usize, search: SearchConfig) -> Result<Box<dyn Asr>> {
     if qwen::QwenFiles::is_qwen(dir) {
         let files = qwen::QwenFiles::discover(dir)?;
         let model = qwen::QwenAsr::load(&files, threads, qwen::QwenConfig::default())?;
+        return Ok(Box::new(model));
+    }
+    let files = onnx::TransducerFiles::discover(dir, true)?;
+    let encoder = onnx::load_session(&files.encoder, threads)?;
+    if nemo::is_streaming_encoder(&encoder) {
+        let language = search.language.clone();
+        let model = nemo::NemoTransducer::load(encoder, &files, search, language.as_deref())?;
         Ok(Box::new(model))
     } else {
-        let files = onnx::TransducerFiles::discover(dir, true)?;
-        let (model, symbols) = onnx::OnnxTransducer::load(&files, threads)?;
+        let (model, symbols) = onnx::OnnxTransducer::with_encoder(encoder, &files)?;
         Ok(Box::new(Recognizer::new(model, symbols, search)))
     }
 }

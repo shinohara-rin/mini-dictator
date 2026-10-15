@@ -5,10 +5,13 @@
 //!    [--hotword <phrase>]... [--screen <text file>] [--beam 4] [--boost 1.5]
 //!    [--samples N] [--sigma X] [--no-early-stop] [--seed N]   (defaults depend on the model)
 //!    [--rewrite-url <base url> --rewrite-model <name>]   (API key from MD_API_KEY)
+//!    [--language <code>]   (streaming NeMo models; default auto)
+//!    [--live [--debug]]   (play the file into the dictation pipeline in real time)
 //! ```
 //!
 //! The model directory holds a Qwen3-ASR export or a transducer; `--beam` and `--boost` apply to
-//! transducers.
+//! transducers. `--live` runs the pipeline as the app does, so a streaming model encodes while the
+//! file plays, and it reports how long the text took after the audio ended.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,9 +19,13 @@ use std::time::{Duration, Instant};
 use mini_dictator_core::asr::onnx::init_runtime;
 use mini_dictator_core::asr::{self, SearchConfig};
 use mini_dictator_core::audio::{AudioChunk, Resampler};
-use mini_dictator_core::context::{rank_terms, ContextSource, Region, ScreenContext, TextBlock};
+use mini_dictator_core::context::{
+    rank_terms, ContextProvider, ContextSource, Region, ScreenContext, TextBlock,
+};
 use mini_dictator_core::join::{Joiner, Piece};
-use mini_dictator_core::pipeline::{Engine, EngineConfig, SessionContext, Timings, Transcript};
+use mini_dictator_core::pipeline::{
+    run_dictation, Engine, EngineConfig, Event, SessionContext, TextSink, Timings, Transcript,
+};
 use mini_dictator_core::rewrite::{OpenAiCompatible, PassThrough, Rewriter};
 use mini_dictator_core::uncertainty;
 use mini_dictator_core::vad::{
@@ -42,6 +49,9 @@ struct Args {
     whole: bool,
     rewrite_url: Option<String>,
     rewrite_model: Option<String>,
+    live: bool,
+    /// Print the pipeline's debug events in `--live` mode.
+    debug: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -52,7 +62,7 @@ fn parse() -> Result<Args, String> {
     let mut threads = 4;
     let mut search = SearchConfig::default();
     let (mut samples, mut sigma, mut seed, mut early_stop) = (None, None, None, true);
-    let mut whole = false;
+    let (mut whole, mut live, mut debug) = (false, false, false);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<f32>().map_err(|e| format!("{flag}: {e}"));
@@ -72,10 +82,16 @@ fn parse() -> Result<Args, String> {
             "--seed" => seed = Some(number(value()?)? as u64),
             "--no-early-stop" => early_stop = false,
             "--whole" => whole = true,
+            "--live" => live = true,
+            "--debug" => debug = true,
+            "--language" => search.language = Some(value()?),
             "--rewrite-url" => rewrite_url = Some(value()?),
             "--rewrite-model" => rewrite_model = Some(value()?),
             other => return Err(format!("unknown flag {other}")),
         }
+    }
+    if whole && live {
+        return Err("--whole and --live do not go together: live mode always uses a VAD".into());
     }
     Ok(Args {
         model: model.ok_or("--model is required")?,
@@ -93,6 +109,8 @@ fn parse() -> Result<Args, String> {
         whole,
         rewrite_url,
         rewrite_model,
+        live,
+        debug,
     })
 }
 
@@ -136,6 +154,82 @@ fn segments<V: VoiceActivityDetector>(
     found
 }
 
+/// Plays `audio` into [`run_dictation`] in 100 ms blocks at real-time pace, printing each event
+/// with the time since playback started.
+/// The screen given on the command line, as live dictation would read it.
+struct Fixed(ScreenContext);
+
+impl ContextProvider for Fixed {
+    fn snapshot(&self) -> mini_dictator_core::Result<ScreenContext> {
+        Ok(self.0.clone())
+    }
+}
+
+fn live<V: VoiceActivityDetector>(
+    engine: &Engine,
+    vad: V,
+    audio: Vec<f32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    struct Print;
+    impl TextSink for Print {
+        fn insert(&mut self, _: &str) -> mini_dictator_core::Result<()> {
+            Ok(())
+        }
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let duration = Duration::from_secs_f64(audio.len() as f64 / 16_000.0);
+    let feeder = std::thread::spawn(move || {
+        let mut sent = 0;
+        for block in audio.chunks(1600) {
+            // Each block is due when its last sample would have been recorded.
+            sent += block.len();
+            let due = started + Duration::from_secs_f64(sent as f64 / 16_000.0);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            let chunk = AudioChunk {
+                samples: block.to_vec(),
+                sample_rate: 16_000,
+                channels: 1,
+                captured: Instant::now(),
+                sound_playing: false,
+            };
+            if sender.send(chunk).is_err() {
+                return;
+            }
+        }
+    });
+    let at = |label: &str| println!("[{:6.2}s] {label}", started.elapsed().as_secs_f64());
+    run_dictation(
+        engine,
+        vad,
+        receiver,
+        &mut Print,
+        &mut |event| match event {
+            Event::Transcribed {
+                plain,
+                unclear_spans,
+                behind_seconds,
+                ..
+            } => at(&format!(
+                "transcribed ({unclear_spans} unclear{}): {plain}",
+                behind_seconds.map_or(String::new(), |s| format!(", {s:.1} s behind"))
+            )),
+            Event::Inserted { text } => at(&format!("inserted: {text}")),
+            Event::Warning(message) => at(&format!("warning: {message}")),
+            Event::Debug(text) => at(&text),
+            _ => {}
+        },
+    )?;
+    feeder.join().ok();
+    println!(
+        "audio ended at {:.2}s, done at {:.2}s: {} after the audio",
+        duration.as_secs_f64(),
+        started.elapsed().as_secs_f64(),
+        ms(started.elapsed().saturating_sub(duration)),
+    );
+    Ok(())
+}
+
 fn ms(duration: Duration) -> String {
     format!("{:.0} ms", duration.as_secs_f64() * 1000.0)
 }
@@ -144,7 +238,7 @@ fn main() {
     let args = match parse() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME]");
+            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME] [--language CODE] [--live [--debug]]");
             std::process::exit(2);
         }
     };
@@ -182,9 +276,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = EngineConfig {
         monte_carlo,
+        debug: std::sync::Arc::new(args.debug.into()),
         ..EngineConfig::default()
     };
-    let engine = Engine {
+    let mut engine = Engine {
         asr: recognizer,
         context: Box::new(mini_dictator_core::context::NoContext),
         memory: Default::default(),
@@ -233,6 +328,14 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let audio = read_wav(&args.wav)?.to_model_input(&mut Resampler::default());
+    if args.live {
+        // The pipeline reads the screen itself when dictation starts.
+        engine.context = Box::new(Fixed(session.screen));
+        return match &args.vad {
+            Some(path) => live(&engine, SileroVad::load(path)?, audio),
+            None => live(&engine, EnergyVad::default(), audio),
+        };
+    }
     let found = match &args.vad {
         _ if args.whole => vec![SpeechSegment {
             samples: audio,

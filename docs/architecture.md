@@ -16,6 +16,7 @@ hotkey down
   │                                            │ SpeechSegment per utterance
   │                                            ▼
   ├─ asr ────── Asr::encode() ─► EncoderOutput   Qwen3-ASR audio features, or transducer encoder output
+  │             (a streaming model's EncoderStream encodes every block as it arrives instead)
   │                                            │
   │             Asr::decode() with the bias ─► reference Hypothesis
   │                                            │
@@ -55,8 +56,8 @@ sentence starts or the hotkey is released.
 |---|---|---|
 | `audio` | Mono 16 kHz conversion | `AudioChunk`, `Resampler` |
 | `vad` | Speech gating with hysteresis, pre-roll, hangover, max length | `VoiceActivityDetector`, `Segmenter`, `SpeechSegment`, `SileroVad` (v4 and v5), `EnergyVad` |
-| `features` | Kaldi-compatible 80-bin fbank for transducers, Whisper's 128-bin log mel for Qwen3-ASR | `Fbank`, `WhisperMel`, `Features` |
-| `asr` | The recognizer interface and its two backends | `Asr`, `Bias`, `load`; `QwenAsr`, `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer` |
+| `features` | Kaldi-compatible fbank for transducers (NeMo's Hann and Slaney mel variant too), Whisper's 128-bin log mel for Qwen3-ASR | `Fbank`, `FbankConfig`, `WhisperMel`, `Features` |
+| `asr` | The recognizer interface and its backends | `Asr`, `EncoderStream`, `Bias`, `load`; `QwenAsr`, `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer`; `NemoTransducer` |
 | `uncertainty` | Monte Carlo over encoder output, span analysis | `MonteCarloConfig`, `estimate`, `analyze`, `format_for_llm` |
 | `context` | Screen text model and hotword ranking | `ContextProvider`, `ScreenContext`, `TextBlock`, `Region`, `FallbackProvider`, `rank_terms` |
 | `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `PassThrough` |
@@ -66,10 +67,12 @@ sentence starts or the hotkey is released.
 Default features need no native code, so `cargo test` runs anywhere. `onnx` adds ONNX Runtime
 (loaded at run time from a bundled shared library). `http` adds the rewrite client.
 
-### Two recognizers
+### Recognizers
 
 The pipeline drives an `Asr`: `encode` once per segment, then `decode` a batch of encoder outputs
-with a `Bias` built from the screen terms. `asr::load` picks the backend from the model directory.
+with a `Bias` built from the screen terms. `asr::load` picks the backend from the model directory:
+Qwen3-ASR when it has `conv_frontend.onnx`, a streaming NeMo transducer when the encoder takes
+`cache_last_channel`, otherwise an offline zipformer.
 
 **Qwen3-ASR 0.6B** is the default. It is an audio encoder in front of a Qwen3 LLM and covers about 30
 languages and Chinese dialects, with punctuation and casing. The core runs the sherpa-onnx export
@@ -94,6 +97,36 @@ The int8 decoder quantizes activations per call, so a row's result depends sligh
 of its batch. The clean decode therefore runs alone, and noisy decodes batch among themselves.
 
 **Transducers** (sherpa-onnx zipformers) remain as a small, fast fallback for one language.
+
+**Nemotron ASR Streaming** (`sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11`,
+about 680 MB) is the streaming option. It is a cache-aware FastConformer with an LSTM prediction
+network: every 560 ms of audio, the encoder reads 65 feature frames (9 of them overlap the previous
+call) with its attention and convolution caches and emits 7 frames of 80 ms. It covers 40 locales
+with punctuation and casing, takes a language prompt (`language` in `SearchConfig`, `auto` by
+default), and writes a language tag such as `<fr-FR>` that the core drops.
+
+- `Asr::stream` hands the pipeline an `EncoderStream`, which encodes every block of the dictation as
+  it arrives, speech and silence alike. A finished segment waits only until the stream has passed
+  its end, so it decodes about half a second after the user stops instead of after a full encode.
+- The model writes a token up to about one chunk after its sound, so a segment's frames run 560 ms
+  past its end, and the next segment's frames start where those stop. Cutting frames at the
+  segment's own samples dropped the last words, and shifting both ends dropped first words.
+- The search is sherpa-onnx's for these models: up to 10 tokens per frame, each hypothesis with its
+  own LSTM state, which reads a new token only if the hypothesis survives pruning. The export's
+  prediction network takes one row at a time.
+- Features are Kaldi frames with a Hann window, no DC removal, and librosa's Slaney mel filters,
+  as sherpa-onnx computes them for NeMo. They are within about 0.005 of kaldi-native-fbank on speech,
+  and the decodes match sherpa-onnx's on the export's test clips. One difference is deliberate: the
+  log adds 2^-24 to each energy, as NeMo does in training, where sherpa-onnx floors energies at
+  `f32::EPSILON`. The floor flattens quiet speech: a test clip turned down 50 dB came out empty with
+  it and kept its last sentence with the additive guard. At normal levels the text is the same apart
+  from a comma.
+
+Against Qwen3-ASR on the same clips, on a 4-core container: read French, German, Spanish and
+Japanese come out about equally well, Korean and Mandarin read speech are fine, but a fast Mandarin
+tongue twister and a song fall apart, and noisy English drops a few words. Through `md --live`, a
+20 s clip of three languages finished 0.6 s after the audio without the uncertainty check and 1.7 s
+with it, against 7.3 s for Qwen3-ASR with its check.
 
 ### Why the core runs its own transducer search
 
@@ -129,6 +162,12 @@ at 3 dB SNR it marks the misheard words. For example, with Silero VAD the refere
 `LAMPS OF LIGHT UP` comes out as `LAMPS [unclear: "OF", also heard "WOULD", "DID", "SHOULD"] LIGHT UP`,
 and the truth is `WOULD`. On a 4-core container, 12 noisy decodes of a 6 s utterance take about 0.35 s
 after a 0.2 s encode.
+
+**Nemotron:** `K = 4`, `σ = 0.3`, early stop after 2. At σ = 1.0 the noisy decodes scramble whole
+sentences of clear speech; at 0.3 the clean clips have no spans, and the noisy English clip marks the
+word the model invented (`a problem [unclear: "up"] with the radio`). Its search costs more than a
+zipformer's, since the prediction network runs per hypothesis: 4 noisy decodes of a 5 s segment take
+about 1.3 s on the container, which is most of what is left of the wait after speech.
 
 **Qwen3-ASR:** noise goes on the audio features that the LLM reads, `K = 4`, `σ = 0.5`, early stop
 after 2. Without token times, tokens match by text alignment alone, and dropped speech is where enough
@@ -212,9 +251,8 @@ A shell provides:
 2. **Cheaper uncertainty for the LLM.** Feed the clean transcript to each noisy decode in one pass
    (teacher forcing) and only decode freely where a sample disagrees, which removes most decoder steps.
    The CoreML execution provider may also speed up the prompt pass.
-3. **Streaming.** Decode while the user speaks with a streaming zipformer, and run the noisy decodes
-   as parallel streams, as AIRI's live probe does. Offline decoding per VAD segment is the first step
-   because the rewrite needs the whole utterance anyway.
+3. **Streaming.** Nemotron encodes while the user speaks. Next: decode while they speak too, show
+   the partial text, and run the noisy decodes as parallel streams, as AIRI's live probe does.
 4. **Phonetic suggestions.** Port AIRI's phonetic matcher (pinyin and ARPAbet adapters) to suggest
    screen terms for spans the hotwords missed.
 5. **Untranscribed speech.** Port AIRI's syllable nucleus detection to mark syllables that no token

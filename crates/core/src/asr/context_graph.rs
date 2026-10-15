@@ -126,6 +126,20 @@ impl ContextGraph {
         (gain * self.boost, ContextState { node, pending })
     }
 
+    /// The tokens that extend a hotword this state has started, so a search can weigh them even
+    /// when the acoustics alone would prune them. Hotword starts are left to the acoustics.
+    pub fn continuations(&self, state: ContextState) -> Vec<u32> {
+        let mut tokens = Vec::new();
+        let mut node = state.node;
+        while node != 0 {
+            tokens.extend(self.nodes[node].children.keys());
+            node = self.nodes[node].fail;
+        }
+        tokens.sort_unstable();
+        tokens.dedup();
+        tokens
+    }
+
     /// The score change at the end of the utterance: an unfinished prefix gives its bonus back.
     pub fn finish(&self, state: ContextState) -> f32 {
         -(state.pending as f32) * self.boost
@@ -135,6 +149,18 @@ impl ContextGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuations_follow_started_hotwords_only() {
+        let graph = ContextGraph::new(&[vec![1, 2, 3], vec![2, 4]], 1.0);
+        let start = ContextState::default();
+        assert!(graph.continuations(start).is_empty());
+        let (_, after_1) = graph.step(start, 1);
+        assert_eq!(graph.continuations(after_1), vec![2]);
+        // `1 2` also starts `2 4`.
+        let (_, after_12) = graph.step(after_1, 2);
+        assert_eq!(graph.continuations(after_12), vec![3, 4]);
+    }
 
     fn walk(graph: &ContextGraph, tokens: &[u32]) -> f32 {
         let mut state = ContextState::default();

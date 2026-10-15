@@ -2,6 +2,8 @@
 //!
 //! [`Fbank`] computes Kaldi-compatible filterbank features, as icefall and sherpa-onnx compute them for
 //! zipformer transducers: 25 ms Povey windows every 10 ms, 80 mel bins, no dither, no snipped edges.
+//! [`FbankConfig::nemo`] switches it to the features of NeMo models: Hann windows and librosa's
+//! Slaney mel filters.
 //! [`WhisperMel`] computes the log mel spectrogram of Whisper, which Qwen3-ASR reads too.
 
 mod whisper;
@@ -21,6 +23,44 @@ pub struct FbankConfig {
     /// Negative values count down from the Nyquist frequency, as in Kaldi.
     pub high_freq: f32,
     pub preemphasis: f32,
+    pub window: Window,
+    /// Subtract each frame's mean before pre-emphasis, as Kaldi does.
+    pub remove_dc_offset: bool,
+    pub mel_scale: MelScale,
+    pub log_guard: LogGuard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    /// Kaldi's default: a Hann window raised to the power 0.85.
+    Povey,
+    Hann,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MelScale {
+    /// Kaldi's triangles on the HTK mel scale, with peak 1.
+    Kaldi,
+    /// librosa's default filters: the Slaney mel scale, each triangle scaled to unit area.
+    Slaney,
+}
+
+/// How the log of a mel energy avoids zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogGuard {
+    /// Kaldi's: energies below `f32::EPSILON` count as `f32::EPSILON`.
+    Floor,
+    /// NeMo's: 2^-24 is added to every energy, so quiet bins keep their differences.
+    Add,
+}
+
+impl LogGuard {
+    fn log(self, energy: f32) -> f32 {
+        match self {
+            Self::Floor => energy.max(f32::EPSILON).ln(),
+            Self::Add => (energy + 2f32.powi(-24)).ln(),
+        }
+    }
 }
 
 impl Default for FbankConfig {
@@ -32,6 +72,28 @@ impl Default for FbankConfig {
             low_freq: 20.0,
             high_freq: -400.0,
             preemphasis: 0.97,
+            window: Window::Povey,
+            remove_dc_offset: true,
+            mel_scale: MelScale::Kaldi,
+            log_guard: LogGuard::Floor,
+        }
+    }
+}
+
+impl FbankConfig {
+    /// The features NeMo models read: no normalization, Hann windows, no DC removal, librosa mel
+    /// filters from 0 to 8 kHz, and NeMo's additive log guard (sherpa-onnx floors the energies
+    /// instead, which loses quiet speech).
+    pub fn nemo(num_bins: usize) -> Self {
+        Self {
+            num_bins,
+            low_freq: 0.0,
+            high_freq: 8000.0,
+            window: Window::Hann,
+            remove_dc_offset: false,
+            mel_scale: MelScale::Slaney,
+            log_guard: LogGuard::Add,
+            ..Self::default()
         }
     }
 }
@@ -69,10 +131,17 @@ impl Fbank {
         let fft_size = frame_length.next_power_of_two();
         let window = (0..frame_length)
             .map(|i| {
-                (0.5 - 0.5 * (2.0 * PI * i as f32 / (frame_length - 1) as f32).cos()).powf(0.85)
+                let hann = 0.5 - 0.5 * (2.0 * PI * i as f32 / (frame_length - 1) as f32).cos();
+                match config.window {
+                    Window::Povey => hann.powf(0.85),
+                    Window::Hann => hann,
+                }
             })
             .collect();
-        let mel_banks = mel_banks(&config, fft_size);
+        let mel_banks = match config.mel_scale {
+            MelScale::Kaldi => mel_banks(&config, fft_size),
+            MelScale::Slaney => slaney_banks(&config, fft_size),
+        };
         Self {
             config,
             frame_length,
@@ -90,14 +159,29 @@ impl Fbank {
     }
 
     pub fn compute(&self, samples: &[f32]) -> Features {
-        let frames = self.frame_count(samples.len());
+        self.compute_range(samples, 0, self.frame_count(samples.len()))
+    }
+
+    /// Frames whose window lies inside `samples` without reflecting at the end: the frames a
+    /// stream can compute before more audio arrives. Frames before the start still reflect.
+    pub fn complete_frames(&self, samples: usize) -> usize {
+        // Frame i covers samples from i * shift + shift / 2 - length / 2, `length` long.
+        let reach = self.frame_shift / 2 + self.frame_length - self.frame_length / 2;
+        match samples.checked_sub(reach) {
+            Some(rest) => (rest / self.frame_shift + 1).min(self.frame_count(samples)),
+            None => 0,
+        }
+    }
+
+    /// Frames `first..first + count` of `samples`, as [`Self::compute`] numbers them.
+    pub fn compute_range(&self, samples: &[f32], first: usize, count: usize) -> Features {
         let dim = self.config.num_bins;
-        let mut data = Vec::with_capacity(frames * dim);
+        let mut data = Vec::with_capacity(count * dim);
         let mut frame = vec![0.0f32; self.frame_length];
         let mut real = vec![0.0f32; self.fft_size];
         let mut imag = vec![0.0f32; self.fft_size];
 
-        for index in 0..frames {
+        for index in first..first + count {
             let start = (index * self.frame_shift + self.frame_shift / 2) as isize
                 - (self.frame_length / 2) as isize;
             for (offset, value) in frame.iter_mut().enumerate() {
@@ -107,8 +191,10 @@ impl Fbank {
                     .unwrap_or(0.0);
             }
 
-            let mean = frame.iter().sum::<f32>() / frame.len() as f32;
-            frame.iter_mut().for_each(|v| *v -= mean);
+            if self.config.remove_dc_offset {
+                let mean = frame.iter().sum::<f32>() / frame.len() as f32;
+                frame.iter_mut().for_each(|v| *v -= mean);
+            }
             for i in (1..frame.len()).rev() {
                 frame[i] -= self.config.preemphasis * frame[i - 1];
             }
@@ -127,10 +213,14 @@ impl Fbank {
                     .enumerate()
                     .map(|(k, w)| w * (real[first + k].powi(2) + imag[first + k].powi(2)))
                     .sum();
-                data.push(energy.max(f32::EPSILON).ln());
+                data.push(self.config.log_guard.log(energy));
             }
         }
-        Features { frames, dim, data }
+        Features {
+            frames: count,
+            dim,
+            data,
+        }
     }
 }
 
@@ -184,6 +274,54 @@ fn mel_banks(config: &FbankConfig, fft_size: usize) -> Vec<(usize, Vec<f32>)> {
                     };
                     first.get_or_insert(k);
                     weights.push(weight);
+                } else if first.is_some() {
+                    break;
+                }
+            }
+            (first.unwrap_or(0), weights)
+        })
+        .collect()
+}
+
+fn slaney_mel(freq: f32) -> f32 {
+    const LINEAR: f32 = 200.0 / 3.0;
+    if freq < 1000.0 {
+        freq / LINEAR
+    } else {
+        15.0 + (freq / 1000.0).ln() / (6.4f32.ln() / 27.0)
+    }
+}
+
+fn slaney_hz(mel: f32) -> f32 {
+    const LINEAR: f32 = 200.0 / 3.0;
+    if mel < 15.0 {
+        mel * LINEAR
+    } else {
+        1000.0 * ((mel - 15.0) * 6.4f32.ln() / 27.0).exp()
+    }
+}
+
+/// librosa's `mel(htk=False, norm="slaney")` over the FFT bins up to and including Nyquist.
+fn slaney_banks(config: &FbankConfig, fft_size: usize) -> Vec<(usize, Vec<f32>)> {
+    let (low_mel, high_mel) = (slaney_mel(config.low_freq), slaney_mel(config.high_freq));
+    let edges: Vec<f32> = (0..config.num_bins + 2)
+        .map(|i| {
+            slaney_hz(low_mel + (high_mel - low_mel) * i as f32 / (config.num_bins + 1) as f32)
+        })
+        .collect();
+    let bin_width = SAMPLE_RATE as f32 / fft_size as f32;
+    (0..config.num_bins)
+        .map(|bin| {
+            let (left, center, right) = (edges[bin], edges[bin + 1], edges[bin + 2]);
+            let area = 2.0 / (right - left);
+            let mut first = None;
+            let mut weights = Vec::new();
+            for k in 0..=fft_size / 2 {
+                let f = bin_width * k as f32;
+                let weight = ((f - left) / (center - left)).min((right - f) / (right - center));
+                if weight > 0.0 {
+                    first.get_or_insert(k);
+                    weights.push(weight * area);
                 } else if first.is_some() {
                     break;
                 }
@@ -252,6 +390,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_nemo_log_guard_keeps_quiet_bins_apart() {
+        let (quiet, quieter) = (1e-8, 1e-9);
+        assert_eq!(LogGuard::Floor.log(quiet), LogGuard::Floor.log(quieter));
+        assert!(LogGuard::Add.log(quiet) > LogGuard::Add.log(quieter) + 0.1);
+        // Loud energies come out the same either way.
+        assert!((LogGuard::Add.log(1.0) - LogGuard::Floor.log(1.0)).abs() < 1e-6);
+    }
+
+    #[test]
     fn fft_matches_naive_dft() {
         let n = 16;
         let fft = Fft::new(n);
@@ -278,6 +425,41 @@ mod tests {
         assert_eq!(fbank.frame_count(16_000), 100);
         assert_eq!(fbank.frame_count(16_079), 100);
         assert_eq!(fbank.frame_count(16_080), 101);
+    }
+
+    #[test]
+    fn complete_frames_need_their_whole_window() {
+        let fbank = Fbank::new(FbankConfig::nemo(128));
+        // Frame 0 covers samples -120..280, and each next frame starts 160 later.
+        assert_eq!(fbank.complete_frames(279), 0);
+        assert_eq!(fbank.complete_frames(280), 1);
+        assert_eq!(fbank.complete_frames(439), 1);
+        assert_eq!(fbank.complete_frames(440), 2);
+    }
+
+    #[test]
+    fn frames_computed_as_audio_arrives_match_the_whole() {
+        let fbank = Fbank::new(FbankConfig::nemo(128));
+        let samples: Vec<f32> = (0..8_000)
+            .map(|i| 0.3 * (i as f32 * 0.07).sin() + 0.1 * (i as f32 * 0.31).cos())
+            .collect();
+        let whole = fbank.compute(&samples);
+        let prefix = &samples[..5_000];
+        let ready = fbank.complete_frames(prefix.len());
+        let early = fbank.compute_range(prefix, 0, ready);
+        assert_eq!(early.data, whole.data[..ready * whole.dim]);
+    }
+
+    #[test]
+    fn slaney_filters_have_unit_area_in_hertz() {
+        let config = FbankConfig::nemo(128);
+        let banks = slaney_banks(&config, 512);
+        assert_eq!(banks.len(), 128);
+        // Above 1 kHz the triangles span several FFT bins, so their sum times the bin width
+        // approaches the unit area that the Slaney normalization gives them.
+        let (_, weights) = &banks[100];
+        let area: f32 = weights.iter().sum::<f32>() * 16_000.0 / 512.0;
+        assert!((area - 1.0).abs() < 0.05, "area {area}");
     }
 
     #[test]
