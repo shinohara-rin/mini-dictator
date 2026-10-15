@@ -22,7 +22,16 @@ use crate::{Error, Result};
 
 /// Receives the final text. Shells type it into the focused app or paste it.
 pub trait TextSink {
-    fn insert(&mut self, text: &str) -> Result<()>;
+    fn insert(&mut self, text: &str) -> Result<Delivery>;
+}
+
+/// What a sink did with a piece of text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    Typed,
+    /// Not typed, for this reason, such as the focus having moved since the dictation started. The
+    /// dictation goes on as if it had been typed, so the shell can offer the whole text.
+    Held(String),
 }
 
 /// Progress for the tray icon and the log.
@@ -47,6 +56,11 @@ pub enum Event {
     },
     Inserted {
         text: String,
+    },
+    /// The sink did not type this text, for `reason`.
+    Held {
+        text: String,
+        reason: String,
     },
     /// A step failed. The dictation goes on when it can: a failed rewrite inserts the plain transcript.
     Warning(String),
@@ -342,9 +356,15 @@ impl Engine {
         if text.is_empty() {
             return Ok(None);
         }
-        sink.insert(&text).map_err(|e| Error::Sink(e.to_string()))?;
+        let delivery = sink.insert(&text).map_err(|e| Error::Sink(e.to_string()))?;
         session.inserted.push_str(&text);
-        events(Event::Inserted { text: text.clone() });
+        events(match delivery {
+            Delivery::Typed => Event::Inserted { text: text.clone() },
+            Delivery::Held(reason) => Event::Held {
+                text: text.clone(),
+                reason,
+            },
+        });
         Ok(Some(text))
     }
 }
@@ -556,9 +576,18 @@ mod tests {
     struct Collect(Vec<String>);
 
     impl TextSink for Collect {
-        fn insert(&mut self, text: &str) -> Result<()> {
+        fn insert(&mut self, text: &str) -> Result<Delivery> {
             self.0.push(text.to_owned());
-            Ok(())
+            Ok(Delivery::Typed)
+        }
+    }
+
+    /// Types nothing, as when the focus moved.
+    struct Hold;
+
+    impl TextSink for Hold {
+        fn insert(&mut self, _: &str) -> Result<Delivery> {
+            Ok(Delivery::Held("focus moved".into()))
         }
     }
 
@@ -720,6 +749,30 @@ mod tests {
             events.iter().all(|e| !matches!(e, Event::Heard { .. })),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn held_text_still_joins_into_the_dictation() {
+        let engine = engine();
+        let mut events = Vec::new();
+        let text = run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now()),
+            &mut Hold,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(text, "HELLO HELLO");
+        let held: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Held { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held, ["HELLO", " HELLO"]);
+        assert!(!events.iter().any(|e| matches!(e, Event::Inserted { .. })));
     }
 
     #[test]

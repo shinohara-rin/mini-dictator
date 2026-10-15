@@ -297,6 +297,47 @@ impl Ui {
 const RECORDING_LABEL: &str = "Press the New Hotkey (Esc to Cancel)…";
 const NEEDS_MODIFIER_LABEL: &str = "Add ⌃, ⌥, ⇧ or ⌘ to That Key (Esc to Cancel)…";
 
+/// Adds a typed or held piece to the menu's last text.
+fn on_text(
+    ui: &Ui,
+    last_text: &mut String,
+    event: CoreEvent,
+    held_cued: &mut bool,
+    cued_segment: bool,
+) {
+    let (text, held) = match event {
+        CoreEvent::Inserted { text } => (text, None),
+        CoreEvent::Held { text, reason } => {
+            debug_log::write(&format!("not typed, {reason}: {text:?}"));
+            (text, Some(reason))
+        }
+        _ => return,
+    };
+    last_text.push_str(&text);
+    // The period typed when a dictation ends keeps the preview of its text.
+    if !text.chars().any(char::is_alphanumeric) {
+        return;
+    }
+    match held {
+        None => {
+            ui.last
+                .set_text(format!("Last: {}", shorten(last_text.trim(), 40)));
+            if !cued_segment {
+                ui.jingle(Jingle::Typed);
+            }
+        }
+        Some(reason) => {
+            ui.last.set_text(format!(
+                "Not typed, {reason}: {}",
+                shorten(last_text.trim(), 30)
+            ));
+            if !std::mem::replace(held_cued, true) {
+                ui.jingle(Jingle::Warning);
+            }
+        }
+    }
+}
+
 fn start_label(hotkey: &str) -> String {
     format!("Start Dictation ({hotkey})")
 }
@@ -373,6 +414,12 @@ pub fn run() {
     // The last segment already played "hm-hm?" or "pfff", so the typed sparkle, landing right on
     // top of it, would add nothing.
     let mut cued_segment = false;
+    // The last dictation's whole text, typed or held, which clicking its menu item copies. It is
+    // replaced once the next dictation produces text.
+    let mut last_text = String::new();
+    let mut new_dictation = false;
+    // The dictation held text already and played the warning for it.
+    let mut held_cued = false;
     let mut capture: Option<Capture> = None;
     let mut recording: u64 = 0;
     // Shared with the memory sampler, which pauses while a dictation reads the screen itself.
@@ -440,6 +487,7 @@ pub fn run() {
                         if let Some(engine) = &engine {
                             dictation = start(engine.clone(), vad_path.clone(), proxy.clone(), ui);
                             busy = dictation.is_some();
+                            new_dictation = busy;
                             started_by_press = busy;
                             dictating.store(busy, Ordering::Relaxed);
                         }
@@ -469,9 +517,15 @@ pub fn run() {
                         (None, Some(engine)) if !busy => {
                             dictation = start(engine.clone(), vad_path.clone(), proxy.clone(), ui);
                             busy = dictation.is_some();
+                            new_dictation = busy;
                             dictating.store(busy, Ordering::Relaxed);
                         }
                         _ => {}
+                    }
+                } else if event.id == ui.last.id() {
+                    if !last_text.is_empty() {
+                        crate::paste::copy(last_text.trim());
+                        ui.status.set_text("Copied the last dictation");
                     }
                 } else if event.id == ui.rewrite.id() {
                     if let Some(s) = &switches {
@@ -560,15 +614,17 @@ pub fn run() {
                         };
                         ui.show(state, &status);
                     }
-                    // The period typed when a dictation ends keeps the preview of its text.
-                    CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => {
-                        ui.last
-                            .set_text(format!("Last: {}", shorten(text.trim(), 40)));
-                        if !cued_segment {
-                            ui.jingle(Jingle::Typed);
-                        }
+                    CoreEvent::Inserted { .. } | CoreEvent::Held { .. }
+                        if std::mem::take(&mut new_dictation) =>
+                    {
+                        last_text.clear();
+                        held_cued = false;
+                        ui.last.set_enabled(true);
+                        on_text(ui, &mut last_text, event, &mut held_cued, cued_segment);
                     }
-                    CoreEvent::Inserted { .. } => {}
+                    CoreEvent::Inserted { .. } | CoreEvent::Held { .. } => {
+                        on_text(ui, &mut last_text, event, &mut held_cued, cued_segment)
+                    }
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
                         debug_log::write(&format!("warning: {warning}"));
@@ -715,7 +771,8 @@ fn start(
     ui.cue(Cue::Start);
 
     std::thread::spawn(move || {
-        let mut sink = PasteSink;
+        // First, so the focus it records is the one at the hotkey press.
+        let mut sink = PasteSink::new();
         let events = proxy.clone();
         let mut forward = move |event: CoreEvent| match event {
             // Written here, so long screen text never passes through the event loop.

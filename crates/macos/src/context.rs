@@ -137,6 +137,56 @@ pub fn focused_window() -> Option<FocusedWindow> {
     Some(FocusedWindow { element, title })
 }
 
+/// What has keyboard focus: the app's process and its focused element, to tell later whether the
+/// user moved to another field or app.
+pub struct Focus {
+    pid: libc::pid_t,
+    element: Option<CFRetained<AXUIElement>>,
+}
+
+/// How far up from the focused element [`Focus::moved_from`] looks for the element focused before.
+const FOCUS_ANCESTORS: usize = 12;
+
+impl Focus {
+    /// None when the focused app cannot be read, for example while it does not answer.
+    pub fn now() -> Option<Focus> {
+        let system = unsafe { AXUIElement::new_system_wide() };
+        unsafe { system.set_messaging_timeout(0.1) };
+        let app = element(&system, "AXFocusedApplication")?;
+        // Electron and Chromium report the focused field only once their tree is on.
+        set_true(&app, "AXManualAccessibility");
+        let mut pid: libc::pid_t = 0;
+        if unsafe { app.pid(NonNull::from(&mut pid)) } != AXError::Success {
+            return None;
+        }
+        let element = element(&system, "AXFocusedUIElement");
+        Some(Focus { pid, element })
+    }
+
+    /// Whether the focus left `before`: another app, or an element that is neither the one focused
+    /// before nor inside it. Focus moving inside counts as staying, because a web page reports its
+    /// whole area until its tree is built and the field after. Unknown elements count as staying.
+    pub fn moved_from(&self, before: &Focus) -> bool {
+        if self.pid != before.pid {
+            return true;
+        }
+        let (Some(now), Some(then)) = (&self.element, &before.element) else {
+            return false;
+        };
+        let mut current = now.clone();
+        for _ in 0..=FOCUS_ANCESTORS {
+            if *current == **then {
+                return false;
+            }
+            match element(&current, "AXParent") {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        true
+    }
+}
+
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
     let name = CFString::from_str(name);
     let mut value: *const CFType = std::ptr::null();
