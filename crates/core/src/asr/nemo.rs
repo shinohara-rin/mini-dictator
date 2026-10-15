@@ -11,6 +11,7 @@
 //! after the text, which [`NemoTransducer`] drops.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -200,7 +201,7 @@ impl NemoTransducer {
             frames: Vec::new(),
             dropped_frames: 0,
             finished: false,
-            taken: 0,
+            handed_out: 0,
         }
     }
 
@@ -603,7 +604,7 @@ impl Asr for NemoTransducer {
         stream.accept(samples)?;
         stream.finish()?;
         // Nothing comes before the segment, so only its end moves by the delay.
-        Ok(stream.slice(0, samples.len() as u64 + stream.delay()))
+        Ok(stream.output(stream.frames_for(0, samples.len() as u64 + stream.delay())))
     }
 
     fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>> {
@@ -682,8 +683,8 @@ pub struct NemoStream<'a> {
     frames: Vec<f32>,
     dropped_frames: usize,
     finished: bool,
-    /// Where the frames of the last segment taken end, in samples.
-    taken: u64,
+    /// Encoder frames already given to a segment: each frame goes to one segment only.
+    handed_out: usize,
 }
 
 impl NemoStream<'_> {
@@ -742,23 +743,27 @@ impl NemoStream<'_> {
         (self.model.meta.shift * FEATURE_SHIFT) as u64
     }
 
-    /// The encoder frames that overlap samples `start..end`.
-    fn slice(&self, start: u64, end: u64) -> EncoderOutput {
-        let (dim, count) = (self.encoder_dim(), self.encoder_frames());
+    /// The encoder frames that overlap samples `start..end` and no earlier segment took.
+    fn frames_for(&self, start: u64, end: u64) -> Range<usize> {
+        let count = self.encoder_frames();
         let frame_samples = self.model.meta.frame_samples() as u64;
-        let first = (0..count)
-            .skip(self.dropped_frames)
+        let first = (self.dropped_frames.max(self.handed_out)..count)
             .find(|&i| self.frame_start(i) + frame_samples > start)
             .unwrap_or(count);
         let last = (first..count)
             .take_while(|&i| self.frame_start(i) < end)
             .last()
             .map_or(first, |i| i + 1);
+        first..last
+    }
+
+    fn output(&self, frames: Range<usize>) -> EncoderOutput {
+        let dim = self.encoder_dim();
         EncoderOutput {
-            frames: last - first,
+            frames: frames.len(),
             dim,
-            data: self.frames
-                [(first - self.dropped_frames) * dim..(last - self.dropped_frames) * dim]
+            data: self.frames[(frames.start - self.dropped_frames) * dim
+                ..(frames.end - self.dropped_frames) * dim]
                 .to_vec(),
         }
     }
@@ -799,23 +804,23 @@ impl EncoderStream for NemoStream<'_> {
 
     fn take(&mut self, start: u64, end: u64) -> Option<EncoderOutput> {
         // A token comes after its sound, so a segment's first token is never early, while its
-        // last ones can come up to `delay` after its end. The frames before `taken` went to the
-        // previous segment, whose last tokens they hold.
+        // last ones can come up to `delay` after its end. The frames handed out went to the
+        // previous segment, whose last tokens they hold, so this one starts after them.
         let end = end + self.delay();
         if !self.finished && self.frame_start(self.encoder_frames()) < end {
             return None;
         }
-        let frames = self.slice(start.max(self.taken), end);
-        self.taken = end;
-        // Later segments start at `taken` or after it.
+        let frames = self.frames_for(start, end);
+        self.handed_out = self.handed_out.max(frames.end);
+        let output = self.output(frames);
         self.discard(end);
-        Some(frames)
+        Some(output)
     }
 
     fn discard(&mut self, before: u64) {
         let (dim, frame_samples) = (self.encoder_dim(), self.model.meta.frame_samples() as u64);
         let done = (self.dropped_frames..self.encoder_frames())
-            .take_while(|&i| self.frame_start(i) + frame_samples <= before)
+            .take_while(|&i| i < self.handed_out || self.frame_start(i) + frame_samples <= before)
             .count();
         self.frames.drain(..done * dim);
         self.dropped_frames += done;
