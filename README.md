@@ -30,7 +30,7 @@ when something fails. A cue repeated within half a second plays once. Cancel Ech
 (`echo_cancellation`, on by default) records through macOS voice processing, which takes the cues
 out of the microphone so they are never dictated; it also turns down other apps' audio while you
 dictate. The first run asks for microphone and accessibility permission; accessibility is needed to
-see the hotkey, to read names from the focused window, and to paste. To pick another hotkey, choose
+see the hotkey, to read names from the focused window, and to type the text. To pick another hotkey, choose
 Change Hotkey in the menu, press the new combination, and let go; Esc cancels. A hotkey can be a key
 with modifiers (`Ctrl+Shift+D`), a function key or the microphone key alone (`F13`, `Dictation`), or
 modifiers alone (`RightCmd`), and Option and Command can name a side (`RightAlt`). Settings live in

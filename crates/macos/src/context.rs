@@ -137,6 +137,135 @@ pub fn focused_window() -> Option<FocusedWindow> {
     Some(FocusedWindow { element, title })
 }
 
+/// What has keyboard focus: the app's process and its focused element, to tell later whether the
+/// user moved to another field or app.
+pub struct Focus {
+    pid: libc::pid_t,
+    element: Option<CFRetained<AXUIElement>>,
+}
+
+// SAFETY: an AXUIElement is a CoreFoundation object, retained and released atomically, and the
+// accessibility API takes it on any thread; the screen reader already runs off the main thread.
+unsafe impl Send for Focus {}
+
+/// How far up from the focused element [`Focus::moved_from`] looks for the element focused before.
+/// A web page's fields can sit deep below its area.
+const FOCUS_ANCESTORS: usize = 64;
+
+impl Focus {
+    /// None when the focused app cannot be read, for example while it does not answer.
+    pub fn now() -> Option<Focus> {
+        let system = unsafe { AXUIElement::new_system_wide() };
+        unsafe { system.set_messaging_timeout(0.1) };
+        let app = element(&system, "AXFocusedApplication")?;
+        // Electron and Chromium report the focused field only once their tree is on.
+        set_true(&app, "AXManualAccessibility");
+        let mut pid: libc::pid_t = 0;
+        if unsafe { app.pid(NonNull::from(&mut pid)) } != AXError::Success {
+            return None;
+        }
+        let element = element(&system, "AXFocusedUIElement");
+        Some(Focus { pid, element })
+    }
+
+    /// The focused app's process.
+    pub fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    /// Whether the focus left `before`: another app, or an element that is neither the one focused
+    /// before nor inside it. Focus moving inside counts as staying, because a web page reports its
+    /// whole area until its tree is built and the field after. Unknown elements count as staying.
+    pub fn moved_from(&self, before: &Focus) -> bool {
+        if self.pid != before.pid {
+            return true;
+        }
+        let (Some(now), Some(then)) = (&self.element, &before.element) else {
+            return false;
+        };
+        let mut current = now.clone();
+        for _ in 0..=FOCUS_ANCESTORS {
+            if *current == **then {
+                return false;
+            }
+            match element(&current, "AXParent") {
+                Some(parent) => current = parent,
+                // The root, without passing the element focused before.
+                None => return true,
+            }
+        }
+        // Deeper than the limit: unknown, so the focus counts as staying.
+        false
+    }
+}
+
+/// Inserts `text` at the cursor of the focused element through the accessibility API, replacing
+/// any selection. False when the element does not take text this way, or took it with no effect,
+/// as some web views do: the caller then types it instead. Text is never inserted twice, because a
+/// change is checked only where the field's value can be read before and after.
+pub fn insert_at_cursor(text: &str) -> bool {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    // Long enough for a busy app to apply the change before it answers.
+    unsafe { system.set_messaging_timeout(0.5) };
+    let Some(focused) = element(&system, "AXFocusedUIElement") else {
+        return false;
+    };
+    // Web views apply the change later, out of process, so a check right after could miss it and
+    // the text would be typed a second time.
+    if in_web_area(&focused) {
+        return false;
+    }
+    let name = CFString::from_str("AXSelectedText");
+    let mut settable: u8 = 0;
+    let error =
+        unsafe { focused.is_attribute_settable(&name, NonNull::from(&mut settable).cast()) };
+    if error != AXError::Success || settable == 0 {
+        return false;
+    }
+    let Some(before) = value_text(&focused) else {
+        return false;
+    };
+    let range = selected_range(&focused);
+    let value = CFString::from_str(text);
+    if unsafe { focused.set_attribute_value(&name, &value) } != AXError::Success {
+        return false;
+    }
+    // A selection that already held this text leaves the value as it was, but not the selection.
+    value_text(&focused).is_some_and(|after| after != before)
+        || range.is_some_and(|before| {
+            selected_range(&focused).is_some_and(|after| {
+                (after.location, after.length) != (before.location, before.length)
+            })
+        })
+}
+
+/// How far up [`in_web_area`] looks: a page's fields can sit deep in its tree.
+const WEB_ANCESTORS: usize = 64;
+
+/// Whether `element` is part of a web page.
+fn in_web_area(element: &CFRetained<AXUIElement>) -> bool {
+    let mut current = element.clone();
+    for _ in 0..=WEB_ANCESTORS {
+        if string(&current, "AXRole").as_deref() == Some("AXWebArea") {
+            return true;
+        }
+        match self::element(&current, "AXParent") {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    false
+}
+
+/// The element's value as text, empty included. None when it has no text value.
+fn value_text(element: &AXUIElement) -> Option<String> {
+    Some(
+        attribute(element, "AXValue")?
+            .downcast_ref::<CFString>()?
+            .to_string(),
+    )
+}
+
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
     let name = CFString::from_str(name);
     let mut value: *const CFType = std::ptr::null();
@@ -165,19 +294,22 @@ fn set_true(element: &AXUIElement, name: &str) -> AXError {
     unsafe { element.set_attribute_value(&CFString::from_str(name), CFBoolean::new(true).as_ref()) }
 }
 
+/// The selection, or the cursor as an empty one, in UTF-16 units.
+fn selected_range(element: &AXUIElement) -> Option<CFRange> {
+    let value = attribute(element, "AXSelectedTextRange")?
+        .downcast::<AXValue>()
+        .ok()?;
+    let mut range = CFRange {
+        location: 0,
+        length: 0,
+    };
+    unsafe { value.value(AXValueType::CFRange, NonNull::from(&mut range).cast()) }.then_some(range)
+}
+
 /// The focused field's text before the cursor. `AXSelectedTextRange` counts UTF-16 units.
 fn text_before_cursor(focused: &AXUIElement) -> Option<String> {
     let value = string(focused, "AXValue")?;
-    let range = attribute(focused, "AXSelectedTextRange")
-        .and_then(|v| v.downcast::<AXValue>().ok())
-        .and_then(|v| {
-            let mut range = CFRange {
-                location: 0,
-                length: 0,
-            };
-            unsafe { v.value(AXValueType::CFRange, NonNull::from(&mut range).cast()) }
-                .then_some(range)
-        });
+    let range = selected_range(focused);
     let Some(range) = range else {
         return Some(value);
     };

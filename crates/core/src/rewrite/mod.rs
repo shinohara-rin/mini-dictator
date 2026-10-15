@@ -24,12 +24,20 @@ pub struct RewriteRequest {
     pub session_text: String,
     /// Seconds of silence between `session_text` and this transcript.
     pub pause_seconds: Option<f32>,
+    /// The text before stops mid-sentence, as a model judged it, so the transcript continues it.
+    pub sentence_open: bool,
 }
 
 /// Rewrites a transcript. The HTTP implementation is [`OpenAiCompatible`]; shells can add others.
 pub trait Rewriter: Send + Sync {
     /// The rewritten text, or None when no model ran and the plain transcript stands.
     fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>>;
+
+    /// Whether `text`, the text before the cursor, ends with a complete sentence, so a period
+    /// belongs after it. None when no model ran.
+    fn ends_sentence(&self, _text: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
 }
 
 /// Inserts the plain transcript. Used when no rewrite model is configured.
@@ -52,6 +60,22 @@ You turn raw speech recognition output into the text the user meant to type.
 - The user pauses while speaking, and each pause starts a new transcript. When text was already dictated, the transcript continues it. If it continues the same sentence, begin with a lowercase letter unless the first word is a name or \"I\", or with the punctuation that joins it, such as a comma. If it starts a new sentence, begin with a capital letter. A sentence often goes on after a short pause, and a long pause usually ends one. Never repeat the dictated text.
 - When the user dictates formatting, such as \"new line\" or \"bullet point\", apply it.
 - Reply with the final text only, with no quotes or explanation.";
+
+/// Asks for one token, so a small model answers in a single decode step.
+pub const SENTENCE_PROMPT: &str = "\
+Does the text end with a complete sentence, so that a period belongs at its end? A fragment, an \
+unfinished clause, or a sentence cut off mid-way is not complete. Reply with yes or no only.";
+
+/// The answer to [`SENTENCE_PROMPT`]: Some for a clear yes or no.
+pub fn parse_yes_no(reply: &str) -> Option<bool> {
+    let word = clean_reply(reply).to_lowercase();
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    match word {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
 
 /// Builds the user message of a rewrite request.
 pub fn user_prompt(request: &RewriteRequest) -> String {
@@ -78,6 +102,9 @@ pub fn user_prompt(request: &RewriteRequest) -> String {
         ));
         if let Some(pause) = request.pause_seconds {
             prompt.push_str(&format!("Pause before the transcript: {pause:.1} s\n"));
+        }
+        if request.sentence_open {
+            prompt.push_str("The dictated text stops mid-sentence; the transcript continues it.\n");
         }
     }
     prompt.push_str(&format!(
@@ -143,6 +170,15 @@ mod tests {
         });
         assert!(prompt.starts_with("App: Code\nScreen terms: Zustand, React\n"));
         assert!(prompt.ends_with("<transcript>\nuse [unclear: \"zoo stand\", also heard \"zustand\"] for state\n</transcript>"));
+    }
+
+    #[test]
+    fn reads_yes_and_no() {
+        assert_eq!(parse_yes_no("Yes"), Some(true));
+        assert_eq!(parse_yes_no(" no."), Some(false));
+        assert_eq!(parse_yes_no("<think></think>No"), Some(false));
+        assert_eq!(parse_yes_no("Maybe"), None);
+        assert_eq!(parse_yes_no(""), None);
     }
 
     #[test]

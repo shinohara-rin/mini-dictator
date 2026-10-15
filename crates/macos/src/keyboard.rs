@@ -38,7 +38,7 @@ const CLICKS: CGEventMask = (1 << CGEventType::LeftMouseDown.0)
     | (1 << CGEventType::OtherMouseDown.0)
     | (1 << CGEventType::ScrollWheel.0);
 
-/// Marks the app's own key events, such as the paste, in their user-data field so the taps let
+/// Marks the app's own key events, such as typed text, in their user-data field so the taps let
 /// them through untouched.
 pub const OWN_EVENT: i64 = 0x6d64_6963;
 
