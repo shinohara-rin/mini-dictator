@@ -110,6 +110,7 @@ fn microphone(audio: Vec<f32>) -> (Receiver<AudioChunk>, thread::JoinHandle<Inst
                 sample_rate: MIC_RATE,
                 channels: MIC_CHANNELS,
                 captured: Instant::now(),
+                sound_playing: false,
             };
             if sender.send(chunk).is_err() {
                 break;

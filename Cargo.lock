@@ -1221,6 +1221,7 @@ dependencies = [
 name = "mini-dictator-macos"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "cpal",
  "libc",
  "mini-dictator-core",
@@ -1228,6 +1229,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-application-services",
  "objc2-av-foundation",
+ "objc2-avf-audio",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
@@ -1467,6 +1469,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
 dependencies = [
  "bitflags",
+ "block2",
  "objc2",
  "objc2-foundation",
 ]
