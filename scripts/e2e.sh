@@ -5,7 +5,8 @@
 #
 #   scripts/e2e.sh [folder]
 #
-# MODEL picks another sherpa-onnx model, as in fetch-models.sh.
+# MODEL picks another sherpa-onnx model, as in fetch-models.sh. With E2E_FETCH_ONLY=1 it only
+# downloads, and writes the paths to <folder>/env.sh for scripts/bench.sh.
 set -eu
 
 ORT_VERSION=1.31.0
@@ -32,6 +33,11 @@ fi
 
 MODEL=$MODEL sh "$ROOT/scripts/fetch-models.sh" "$DEST"
 
+cat > "$DEST/env.sh" <<ENV
+export MD_E2E_ORT="$ORT/lib/$LIB" MD_E2E_MODEL="$DEST/$MODEL" MD_E2E_VAD="$DEST/silero_vad.onnx"
+ENV
+[ "${E2E_FETCH_ONLY:-}" = 1 ] && exit 0
+
 cd "$ROOT"
-MD_E2E_ORT="$ORT/lib/$LIB" MD_E2E_MODEL="$DEST/$MODEL" MD_E2E_VAD="$DEST/silero_vad.onnx" \
-  cargo test --release -p mini-dictator-core --features onnx --test e2e -- --ignored --nocapture
+. "$DEST/env.sh"
+cargo test --release -p mini-dictator-core --features onnx --test e2e -- --ignored --nocapture

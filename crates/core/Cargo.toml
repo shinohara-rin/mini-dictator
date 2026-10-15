@@ -29,3 +29,7 @@ hound.workspace = true
 [[test]]
 name = "e2e"
 required-features = ["onnx"]
+
+[[example]]
+name = "bench"
+required-features = ["onnx"]

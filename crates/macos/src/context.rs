@@ -285,3 +285,63 @@ impl ContextProvider for AccessibilityReader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mini_dictator_core::context::rank_terms;
+
+    fn read() -> ScreenContext {
+        let started = Instant::now();
+        let screen = AccessibilityReader::default().snapshot().unwrap();
+        println!(
+            "read {} blocks from {:?} in {:?}",
+            screen.blocks.len(),
+            screen.app,
+            started.elapsed()
+        );
+        for block in &screen.blocks {
+            println!("  {:?}: {:?}", block.region, block.text);
+        }
+        screen
+    }
+
+    /// Reads `tests/data/page.html`, which `scripts/accessibility-e2e.sh` opens in Chrome, as the
+    /// first dictation after Chrome starts would: Chrome builds its tree only once asked.
+    #[test]
+    #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
+    fn reads_names_from_a_chrome_page() {
+        assert!(is_trusted(false), "accessibility permission is not granted");
+        let first = read();
+        let second = read();
+        let hotwords: Vec<String> = rank_terms(&first, 100)
+            .into_iter()
+            .map(|t| t.phrase)
+            .collect();
+        println!("hotwords: {}", hotwords.join(", "));
+
+        assert_eq!(first.app.as_deref(), Some("Google Chrome"));
+        let title = first
+            .blocks
+            .iter()
+            .find(|b| b.region == Region::WindowTitle);
+        assert!(
+            title.is_some_and(|b| b.text.contains("Kestrelholm release notes")),
+            "{title:?}"
+        );
+        for name in ["Kestrelholm", "Airicraft", "Thessaly Varga", "Quillon"] {
+            assert!(
+                hotwords.iter().any(|h| h == name),
+                "{name} is not among the hotwords"
+            );
+        }
+        // The focused field may need the tree the first read asked for.
+        let focused = |screen: &ScreenContext| screen.focused_tail(400);
+        assert_eq!(
+            focused(&second).as_deref(),
+            Some("Dear Quillon, the next build is"),
+            "first read: {:?}",
+            focused(&first)
+        );
+    }
+}

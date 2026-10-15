@@ -41,3 +41,39 @@ jobs:
           path: ~/e2e
           key: e2e-${{ runner.os }}-${{ hashFiles('scripts/e2e.sh', 'scripts/fetch-models.sh') }}
       - run: sh scripts/e2e.sh ~/e2e
+
+  # Times the recognizer on the e2e clips, for this commit and the pull request's base on the same
+  # runner. Shared runners are noisy, so it only hints at large changes; it never fails the build.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: ~/e2e
+          key: e2e-${{ runner.os }}-${{ hashFiles('scripts/e2e.sh', 'scripts/fetch-models.sh') }}
+      - run: sh scripts/bench.sh ~/e2e ${{ github.event.pull_request.base.sha }}
+      - run: cat target/bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench
+          path: target/bench/*.json
+
+  # Reads a page in Chrome through the accessibility API with the app's own reader.
+  accessibility:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sh scripts/accessibility-e2e.sh
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-screen
+          path: target/accessibility
+          if-no-files-found: ignore
