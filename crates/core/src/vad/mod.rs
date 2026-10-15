@@ -67,9 +67,26 @@ pub struct SpeechSegment {
     pub start_sample: u64,
     /// True when the segment was cut at [`SegmenterConfig::max_segment_ms`] and speech goes on.
     pub truncated: bool,
+    /// Samples before the first speech frame. Shorter than the configured pre-roll when speech
+    /// starts again soon after the last segment closed, and 0 after a max-length cut.
+    pub pre_roll: usize,
+    /// Samples after the last speech frame.
+    pub post_roll: usize,
 }
 
 impl SpeechSegment {
+    /// The sample where speech starts, since the dictation started.
+    pub fn speech_start(&self) -> u64 {
+        self.start_sample + self.pre_roll.min(self.samples.len()) as u64
+    }
+
+    /// The sample where speech ends, since the dictation started.
+    pub fn speech_end(&self) -> u64 {
+        let end = self.start_sample + self.samples.len() as u64;
+        end.saturating_sub(self.post_roll as u64)
+            .max(self.speech_start())
+    }
+
     pub fn duration_seconds(&self) -> f32 {
         self.samples.len() as f32 / SAMPLE_RATE as f32
     }
@@ -85,6 +102,8 @@ enum State {
         /// Speech frames since the last max-length cut. A part without any is only silence.
         part_speech_frames: usize,
         silence_frames: usize,
+        /// Pre-roll samples at the start of `samples`.
+        pre_roll: usize,
     },
 }
 
@@ -154,6 +173,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 speech_frames,
                 part_speech_frames,
                 silence_frames,
+                pre_roll,
             } => {
                 samples.extend_from_slice(&tail);
                 self.close(
@@ -164,6 +184,10 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                     silence_frames,
                     false,
                 )
+                .map(|segment| SpeechSegment {
+                    pre_roll,
+                    ..segment
+                })
             }
             State::Silence => None,
         };
@@ -185,6 +209,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 if probability >= self.config.threshold {
                     let mut samples: Vec<f32> = self.pre_roll.drain(..).collect();
                     let start_sample = frame_start - samples.len() as u64;
+                    let pre_roll = samples.len();
                     samples.extend_from_slice(frame);
                     self.state = State::Speech {
                         samples,
@@ -192,6 +217,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                         speech_frames: 1,
                         part_speech_frames: 1,
                         silence_frames: 0,
+                        pre_roll,
                     };
                 } else {
                     self.pre_roll.extend(frame);
@@ -208,6 +234,7 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                 part_speech_frames,
                 silence_frames,
                 start_sample,
+                pre_roll,
             } => {
                 samples.extend_from_slice(frame);
                 if probability >= self.config.threshold {
@@ -226,18 +253,24 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                         speech_frames,
                         part_speech_frames,
                         silence_frames,
+                        pre_roll,
                     } = std::mem::replace(&mut self.state, State::Silence)
                     else {
                         unreachable!()
                     };
-                    return self.close(
-                        samples,
-                        start_sample,
-                        speech_frames,
-                        part_speech_frames,
-                        silence_frames,
-                        false,
-                    );
+                    return self
+                        .close(
+                            samples,
+                            start_sample,
+                            speech_frames,
+                            part_speech_frames,
+                            silence_frames,
+                            false,
+                        )
+                        .map(|segment| SpeechSegment {
+                            pre_roll,
+                            ..segment
+                        });
                 }
                 if samples.len() >= max_samples {
                     let samples = std::mem::take(samples);
@@ -249,7 +282,14 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
                     let (speech, part_speech, silence) =
                         (*speech_frames, *part_speech_frames, *silence_frames);
                     *part_speech_frames = 0;
-                    return self.close(samples, start, speech, part_speech, silence, true);
+                    // The next part continues the speech, with no pre-roll of its own.
+                    let lead = std::mem::take(pre_roll);
+                    return self
+                        .close(samples, start, speech, part_speech, silence, true)
+                        .map(|segment| SpeechSegment {
+                            pre_roll: lead,
+                            ..segment
+                        });
                 }
                 None
             }
@@ -280,6 +320,8 @@ impl<V: VoiceActivityDetector> Segmenter<V> {
             samples,
             start_sample,
             truncated,
+            pre_roll: 0,
+            post_roll: keep_trailing,
         })
     }
 }
@@ -317,6 +359,26 @@ mod tests {
             max_segment_ms: 10_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn records_the_pre_roll_and_post_roll_each_segment_kept() {
+        let mut segmenter = Segmenter::new(Scripted, config());
+        // The second utterance starts one frame after the first one closed.
+        let segments = segmenter.push(&audio(&[
+            (0.0, 5),
+            (1.0, 10),
+            (0.0, 10),
+            (0.0, 1),
+            (1.0, 10),
+            (0.0, 10),
+        ]));
+        assert_eq!(segments.len(), 2);
+        assert_eq!((segments[0].pre_roll, segments[0].post_roll), (320, 160));
+        assert_eq!((segments[1].pre_roll, segments[1].post_roll), (160, 160));
+        // Eleven silent frames separate the two utterances.
+        let pause = segments[1].speech_start() - segments[0].speech_end();
+        assert_eq!(pause, 11 * 160);
     }
 
     #[test]

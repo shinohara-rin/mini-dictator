@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use crate::asr::{Asr, Bias, EncoderOutput, EncoderStream, Hypothesis};
 use crate::audio::{AudioChunk, Resampler, SAMPLE_RATE};
 use crate::context::{merge_terms, rank_terms, ContextProvider, ScreenContext, TermMemory};
+use crate::join::{JoinConfig, Joiner, Piece};
 use crate::rewrite::{user_prompt, RewriteRequest, Rewriter};
 use crate::uncertainty::{self, format_for_llm, MonteCarloConfig, Uncertainty};
 use crate::vad::{Segmenter, SegmenterConfig, SpeechSegment, VoiceActivityDetector};
@@ -70,8 +71,10 @@ pub struct EngineConfig {
     pub max_hotwords: usize,
     /// Send focused-field text to the rewrite model. Hotwords are sent either way.
     pub share_screen_text: bool,
-    /// Characters of focused-field text the rewrite model reads.
+    /// Characters of focused-field text, and of text dictated so far, the rewrite model reads.
     pub preceding_chars: usize,
+    /// How segments split by a pause join into sentences.
+    pub join: JoinConfig,
     /// Emit [`Event::Debug`]. A shell flips it while dictations run; off, nothing is formatted.
     pub debug: Arc<AtomicBool>,
 }
@@ -86,6 +89,7 @@ impl Default for EngineConfig {
             max_hotwords: 100,
             share_screen_text: true,
             preceding_chars: 400,
+            join: JoinConfig::default(),
             debug: Arc::default(),
         }
     }
@@ -98,6 +102,8 @@ pub struct SessionContext {
     pub bias: Bias,
     /// Text inserted so far in this dictation.
     pub inserted: String,
+    /// The last segment's final period, held until the next one shows whether the sentence ended.
+    pub joiner: Joiner,
 }
 
 /// One decoded segment.
@@ -166,6 +172,7 @@ impl Engine {
             hotwords,
             bias,
             inserted: String::new(),
+            joiner: Joiner::default(),
         }
     }
 
@@ -215,10 +222,12 @@ impl Engine {
         })
     }
 
+    /// `pause_seconds` is the silence since the last inserted segment.
     pub fn rewrite_request(
         &self,
         transcript: &Transcript,
         session: &SessionContext,
+        pause_seconds: Option<f32>,
     ) -> RewriteRequest {
         RewriteRequest {
             marked_transcript: transcript.marked.clone(),
@@ -233,7 +242,8 @@ impl Engine {
             } else {
                 String::new()
             },
-            session_text: session.inserted.clone(),
+            session_text: tail(&session.inserted, self.config.preceding_chars),
+            pause_seconds,
         }
     }
 
@@ -270,7 +280,8 @@ impl Engine {
         if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
         }
-        let request = self.rewrite_request(&transcript, session);
+        let pause_seconds = session.joiner.pause_before(segment);
+        let request = self.rewrite_request(&transcript, session, pause_seconds);
         let started = Instant::now();
         let rewritten = self.rewriter.rewrite(&request);
         if self.debug() {
@@ -279,30 +290,64 @@ impl Engine {
                 ms(started.elapsed()),
                 indent(&user_prompt(&request), "    "),
                 match &rewritten {
-                    Ok(text) => format!("{text:?}"),
+                    Ok(Some(text)) => format!("{text:?}"),
+                    Ok(None) => "off, the transcript stands".into(),
                     Err(error) => format!("failed: {error}"),
                 }
             )));
         }
-        let text = match rewritten {
-            Ok(text) => text,
+        // Without a rewrite, the capitals are the recognizer's, chosen without the text before.
+        let (text, rewritten) = match rewritten {
+            Ok(Some(text)) => (text, true),
+            Ok(None) => (plain, false),
             Err(error) => {
                 events(Event::Warning(error.to_string()));
-                plain
+                (plain, false)
             }
         };
         if text.trim().is_empty() {
             return Ok(None);
         }
-        // Segments join with a space unless the text is CJK, which has none between sentences.
-        let text = match (session.inserted.chars().last(), text.chars().next()) {
-            (Some(last), Some(first))
-                if !last.is_whitespace() && !is_cjk(last) && !is_cjk(first) =>
-            {
-                format!(" {text}")
-            }
-            _ => text,
+        let piece = Piece {
+            rewritten,
+            text: &text,
+            pause_seconds,
+            names: &session.hotwords,
         };
+        let before = session.joiner.clone();
+        let text = session
+            .joiner
+            .join(&session.inserted, &piece, &self.config.join);
+        session.joiner.typed(segment);
+        let inserted = self.insert(text, session, sink, events);
+        if inserted.is_err() {
+            // Nothing was typed, so the period held before is still the one to type at the end.
+            session.joiner = before;
+        }
+        inserted
+    }
+
+    /// Types the period held back from the last segment. Call it when the dictation ends.
+    pub fn finish(
+        &self,
+        session: &mut SessionContext,
+        sink: &mut dyn TextSink,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<Option<String>> {
+        let text = session.joiner.finish();
+        self.insert(text, session, sink, events)
+    }
+
+    fn insert(
+        &self,
+        text: String,
+        session: &mut SessionContext,
+        sink: &mut dyn TextSink,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<Option<String>> {
+        if text.is_empty() {
+            return Ok(None);
+        }
         sink.insert(&text).map_err(|e| Error::Sink(e.to_string()))?;
         session.inserted.push_str(&text);
         events(Event::Inserted { text: text.clone() });
@@ -316,6 +361,12 @@ impl Engine {
 fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
     let end = segment.start_sample + segment.samples.len() as u64;
     captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
+}
+
+/// The last `max_chars` characters of `text`.
+fn tail(text: &str, max_chars: usize) -> String {
+    let skip = text.chars().count().saturating_sub(max_chars);
+    text.chars().skip(skip).collect()
 }
 
 fn ms(duration: Duration) -> String {
@@ -413,10 +464,6 @@ fn describe_transcript(
     text
 }
 
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32, 0x3000..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF)
-}
-
 /// Runs `step` on the stream. A failed stream is dropped with a warning, and the segments it has
 /// not covered are encoded on their own.
 fn feed(
@@ -487,11 +534,27 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     // Segments that wait for the stream to encode their end.
     let mut waiting = VecDeque::new();
 
-    for chunk in audio {
-        let samples = chunk.to_model_input(&mut resampler);
-        clock = (clock.0 + samples.len() as u64, chunk.captured);
-        feed(&mut stream, |s| s.accept(&samples), events);
-        waiting.extend(segmenter.push(&samples));
+    let dictate = || -> Result<()> {
+        for chunk in audio {
+            let samples = chunk.to_model_input(&mut resampler);
+            clock = (clock.0 + samples.len() as u64, chunk.captured);
+            feed(&mut stream, |s| s.accept(&samples), events);
+            waiting.extend(segmenter.push(&samples));
+            drain(
+                engine,
+                &mut stream,
+                &mut waiting,
+                clock,
+                &mut session,
+                sink,
+                events,
+            )?;
+            if let (Some(s), true) = (stream.as_deref_mut(), waiting.is_empty()) {
+                s.discard(segmenter.earliest_start());
+            }
+        }
+        waiting.extend(segmenter.finish());
+        feed(&mut stream, |s| s.finish(), events);
         drain(
             engine,
             &mut stream,
@@ -500,22 +563,13 @@ pub fn run_dictation<V: VoiceActivityDetector>(
             &mut session,
             sink,
             events,
-        )?;
-        if let (Some(s), true) = (stream.as_deref_mut(), waiting.is_empty()) {
-            s.discard(segmenter.earliest_start());
-        }
-    }
-    waiting.extend(segmenter.finish());
-    feed(&mut stream, |s| s.finish(), events);
-    drain(
-        engine,
-        &mut stream,
-        &mut waiting,
-        clock,
-        &mut session,
-        sink,
-        events,
-    )?;
+        )
+    };
+    let dictated = dictate();
+    // Text already typed keeps its final period when a later segment fails.
+    let finished = engine.finish(&mut session, sink, events);
+    dictated?;
+    finished?;
     events(Event::Finished);
     Ok(session.inserted)
 }
@@ -785,6 +839,33 @@ mod tests {
         assert!(taken[0].1 <= taken[1].0, "{taken:?}");
     }
 
+    /// Writes every segment as the sentence "Hello.".
+    struct Sentences;
+
+    impl Rewriter for Sentences {
+        fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
+            Ok(Some("Hello.".into()))
+        }
+    }
+
+    #[test]
+    fn a_final_period_waits_for_the_next_segment() {
+        let mut engine = engine();
+        engine.rewriter = Box::new(Sentences);
+        let mut sink = Collect(Vec::new());
+        let text = run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now()),
+            &mut sink,
+            &mut |_| {},
+        )
+        .unwrap();
+        // The second capital starts a new sentence, and the hotkey release ends it.
+        assert_eq!(sink.0, vec!["Hello", ". Hello", "."]);
+        assert_eq!(text, "Hello. Hello.");
+    }
+
     #[test]
     fn debug_events_show_the_context_the_decodes_and_the_rewrite() {
         let engine = engine();
@@ -810,7 +891,7 @@ mod tests {
         assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
         assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
         assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
-        assert!(debug[2].contains("reply: \"HELLO\""), "{}", debug[2]);
+        assert!(debug[2].contains("reply: off"), "{}", debug[2]);
     }
 
     #[test]
@@ -851,6 +932,8 @@ mod tests {
             .to_model_input(&mut Resampler::default()),
             start_sample: 0,
             truncated: false,
+            pre_roll: 0,
+            post_roll: 0,
         };
         assert!(!engine
             .transcribe(&segment, None, &session, true)

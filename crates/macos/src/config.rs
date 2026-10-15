@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use mini_dictator_core::join::JoinConfig;
 use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "Mini Dictator";
@@ -19,7 +20,9 @@ pub struct Config {
     pub vad_model: Option<PathBuf>,
     /// ONNX Runtime. Empty means `ORT_DYLIB_PATH`, then `Contents/Frameworks` of the app bundle.
     pub onnxruntime: Option<PathBuf>,
-    /// For example `Alt+Space` or `Ctrl+Shift+D`. Tap to toggle, hold to talk.
+    /// For example `Alt+Space`, `Ctrl+Shift+D`, `F13`, `Dictation` (the microphone key), or a
+    /// modifier alone such as `RightCmd`.
+    /// `LeftAlt` and `RightAlt` (or `Cmd`, `Ctrl`, `Shift`) name a side. Tap to toggle, hold to talk.
     pub hotkey: String,
     /// Read the focused window for hotwords.
     pub read_screen: bool,
@@ -34,6 +37,9 @@ pub struct Config {
     /// uncertainty check, the rewrite prompt and reply, and timings. The menu turns it on and off
     /// until the app quits.
     pub debug: bool,
+    /// Without a rewrite, a pause this long ends a sentence, and after a shorter one the next
+    /// words continue it. With a rewrite, the model decides and is told the pause.
+    pub sentence_pause_seconds: f32,
     pub uncertainty: Uncertainty,
     pub rewrite: Rewrite,
 }
@@ -76,6 +82,7 @@ impl Default for Config {
             share_screen_text: true,
             beep: true,
             debug: false,
+            sentence_pause_seconds: JoinConfig::default().sentence_pause_seconds,
             uncertainty: Uncertainty::default(),
             rewrite: Rewrite::default(),
         }
@@ -105,6 +112,75 @@ pub fn config_path() -> PathBuf {
     support_dir().join("config.toml")
 }
 
+/// Where a write to `path` should land: a symlinked config, such as one kept in a dotfiles
+/// repository, is replaced at its target, even when that target does not exist yet.
+fn link_target(path: &Path) -> Result<PathBuf, String> {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return Ok(path);
+    }
+    let mut path = path.to_path_buf();
+    // A bound on the hops, in case the links form a loop.
+    for _ in 0..32 {
+        let Ok(target) = std::fs::read_link(&path) else {
+            return Ok(path);
+        };
+        path = match path.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    Err(format!("{}: too many symbolic links", path.display()))
+}
+
+/// Writes the config file, readable by the user only since it can hold an API key. The text goes
+/// to a temporary file that then replaces the config, so a failed write leaves the old one whole.
+fn write(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
+    let path = link_target(&config_path())?;
+    let temporary = path.with_extension("toml.tmp");
+    let written = (|| {
+        // A leftover temporary could be open elsewhere with looser permissions, so start fresh:
+        // `mode` applies only to a file this call creates.
+        match std::fs::remove_file(&temporary) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// The config text with `hotkey` set, its comments and layout untouched. A file that does not
+/// parse is an error rather than something to overwrite.
+fn with_hotkey(text: &str, hotkey: &str) -> Result<String, String> {
+    let mut document: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
+    match document
+        .get_mut("hotkey")
+        .and_then(|item| item.as_value_mut())
+    {
+        Some(value) => {
+            let decor = value.decor().clone();
+            *value = hotkey.into();
+            *value.decor_mut() = decor;
+        }
+        None => document["hotkey"] = toml_edit::value(hotkey),
+    }
+    Ok(document.to_string())
+}
+
 pub fn debug_log_path() -> PathBuf {
     support_dir().join("debug.log")
 }
@@ -124,20 +200,18 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        write(&toml::to_string_pretty(self).map_err(|e| e.to_string())?)
+    }
 
+    /// Writes only the hotkey into the config file, keeping the rest as the user wrote it.
+    pub fn save_hotkey(hotkey: &str) -> Result<(), String> {
         let path = config_path();
-        std::fs::create_dir_all(support_dir().join("models")).map_err(|e| e.to_string())?;
-        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        file.write_all(text.as_bytes()).map_err(|e| e.to_string())
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        write(&with_hotkey(&text, hotkey).map_err(|e| format!("{}: {e}", path.display()))?)
     }
 
     /// Expands `~` and resolves relative paths against the support directory.
@@ -172,5 +246,49 @@ impl Config {
                 .parent()?
                 .join("Frameworks/libonnxruntime.dylib"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dangling_config_link_is_written_at_its_target() {
+        let dir = std::env::temp_dir().join(format!("mini-dictator-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink("dotfiles/dictator.toml", &link).unwrap();
+        assert_eq!(link_target(&link), Ok(dir.join("dotfiles/dictator.toml")));
+        // A loop is refused rather than overwritten.
+        let looped = dir.join("loop.toml");
+        std::os::unix::fs::symlink("loop.toml", &looped).unwrap();
+        assert!(link_target(&looped).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn setting_the_hotkey_keeps_the_rest_of_the_file() {
+        let text = "# mine\nhotkey = \"Alt+Space\" # tap or hold\nbeep = false\n\n[rewrite]\nmodel = \"x\"\n";
+        assert_eq!(
+            with_hotkey(text, "Ctrl+Shift+D").unwrap(),
+            "# mine\nhotkey = \"Ctrl+Shift+D\" # tap or hold\nbeep = false\n\n[rewrite]\nmodel = \"x\"\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_hotkey_goes_before_the_tables() {
+        let text = "beep = false\n\n[rewrite]\nmodel = \"x\"\n";
+        let updated = with_hotkey(text, "F5").unwrap();
+        let config: Config = toml::from_str(&updated).unwrap();
+        assert_eq!(config.hotkey, "F5");
+        assert_eq!(config.rewrite.model, "x");
+        assert!(!config.beep);
+    }
+
+    #[test]
+    fn a_broken_file_is_left_alone() {
+        assert!(with_hotkey("hotkey = ", "F5").is_err());
     }
 }

@@ -14,8 +14,10 @@ use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSPasteboard, NSPasteboardItem, NSPasteboardType, NSPasteboardTypeString, NSPasteboardWriting,
 };
-use objc2_core_graphics::{CGEvent, CGEventFlags, CGEventTapLocation};
+use objc2_core_graphics::{CGEvent, CGEventField, CGEventFlags, CGEventTapLocation};
 use objc2_foundation::{NSArray, NSData, NSString};
+
+use crate::keyboard;
 
 /// The virtual key code of V on ANSI keyboards. macOS maps Cmd+V by key position.
 const KEY_V: u16 = 9;
@@ -62,6 +64,12 @@ fn press_command_v() -> Result<()> {
         let event = CGEvent::new_keyboard_event(None, KEY_V, down)
             .ok_or_else(|| Error::Sink("cannot create a key event".into()))?;
         CGEvent::set_flags(Some(&event), CGEventFlags::MaskCommand);
+        // So a hotkey recording in progress lets the paste through.
+        CGEvent::set_integer_value_field(
+            Some(&event),
+            CGEventField::EventSourceUserData,
+            keyboard::OWN_EVENT,
+        );
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
     }
     Ok(())

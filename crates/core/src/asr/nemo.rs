@@ -578,6 +578,7 @@ impl NemoTransducer {
                     log_prob,
                 })
                 .collect(),
+            ids: Vec::new(),
         }
     }
 }
