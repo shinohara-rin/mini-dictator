@@ -338,7 +338,12 @@ mod tests {
 
     fn read() -> ScreenContext {
         let started = Instant::now();
-        let screen = AccessibilityReader::default().snapshot().unwrap();
+        let screen = AccessibilityReader::default()
+            .snapshot()
+            .unwrap_or_else(|error| {
+                println!("read failed: {error}");
+                ScreenContext::empty()
+            });
         println!(
             "read {} blocks from {:?} in {:?}",
             screen.blocks.len(),
@@ -367,39 +372,25 @@ mod tests {
         };
         drop(NonNull::new(value as *mut CFType).map(|ptr| unsafe { CFRetained::from_raw(ptr) }));
         println!("system-wide AXFocusedApplication: {error:?}");
+        // The first read asks Chrome for its tree. Keep reading until the page shows up, to see
+        // how long a dictation right after Chrome starts would go without the page's names.
+        let started = Instant::now();
         let first = read();
-        let second = read();
-        std::thread::sleep(Duration::from_secs(2));
-        println!("after two seconds:");
-        let later = read();
-        dump_window();
-        // Which switch makes Chrome build the page's tree: the reader sets AXManualAccessibility on
-        // every read, and AXEnhancedUserInterface only once it finds an empty web area.
-        let system = unsafe { AXUIElement::new_system_wide() };
-        if let Some(app) = focused_app(&system) {
-            println!(
-                "AXManualAccessibility: {:?}, AXEnhancedUserInterface: {:?}",
-                set_true(&app, "AXManualAccessibility"),
-                set_true(&app, "AXEnhancedUserInterface")
-            );
-            std::thread::sleep(Duration::from_secs(1));
-            println!("a second after AXEnhancedUserInterface:");
-            read();
-            dump_window();
+        let mut page = first.clone();
+        while !page.blocks.iter().any(|b| b.text.contains("Airicraft"))
+            && started.elapsed() < Duration::from_secs(30)
+        {
+            std::thread::sleep(Duration::from_millis(500));
+            println!("after {:?}:", started.elapsed());
+            page = read();
         }
-        let hotwords: Vec<String> = rank_terms(&first, 100)
+        dump_window();
+        let second = read();
+        let hotwords: Vec<String> = rank_terms(&page, 100)
             .into_iter()
             .map(|t| t.phrase)
             .collect();
         println!("hotwords: {}", hotwords.join(", "));
-        println!(
-            "hotwords two seconds later: {}",
-            rank_terms(&later, 100)
-                .into_iter()
-                .map(|t| t.phrase)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
 
         // AXTitle names the app "Chrome" on some systems and "Google Chrome" on others.
         assert!(
