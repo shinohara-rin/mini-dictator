@@ -302,6 +302,40 @@ mod tests {
     use super::*;
     use mini_dictator_core::context::rank_terms;
 
+    /// Prints the focused window's roles and child counts, to show where the page's content is.
+    fn dump_window() {
+        let system = unsafe { AXUIElement::new_system_wide() };
+        let Some(window) = focused_app(&system).and_then(|app| element(&app, "AXFocusedWindow"))
+        else {
+            println!("no focused window");
+            return;
+        };
+        let names: Vec<CFRetained<CFString>> = NODE_ATTRIBUTES
+            .iter()
+            .map(|n| CFString::from_str(n))
+            .collect();
+        let names = CFArray::from_retained_objects(&names);
+        let mut stack = vec![(window, 0)];
+        let mut shown = 0;
+        while let Some((current, depth)) = stack.pop() {
+            if shown >= 300 {
+                break;
+            }
+            shown += 1;
+            let node = node(&current, &names);
+            println!(
+                "{}{} ({} children) {:?}",
+                "  ".repeat(depth),
+                node.role.as_deref().unwrap_or("?"),
+                node.children.len(),
+                node.text.as_deref().unwrap_or("")
+            );
+            if depth < 14 {
+                stack.extend(node.children.into_iter().rev().map(|c| (c, depth + 1)));
+            }
+        }
+    }
+
     fn read() -> ScreenContext {
         let started = Instant::now();
         let screen = AccessibilityReader::default().snapshot().unwrap();
@@ -335,13 +369,30 @@ mod tests {
         println!("system-wide AXFocusedApplication: {error:?}");
         let first = read();
         let second = read();
+        std::thread::sleep(Duration::from_secs(2));
+        println!("after two seconds:");
+        let later = read();
+        dump_window();
         let hotwords: Vec<String> = rank_terms(&first, 100)
             .into_iter()
             .map(|t| t.phrase)
             .collect();
         println!("hotwords: {}", hotwords.join(", "));
+        println!(
+            "hotwords two seconds later: {}",
+            rank_terms(&later, 100)
+                .into_iter()
+                .map(|t| t.phrase)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
-        assert_eq!(first.app.as_deref(), Some("Google Chrome"));
+        // AXTitle names the app "Chrome" on some systems and "Google Chrome" on others.
+        assert!(
+            first.app.as_deref().is_some_and(|a| a.contains("Chrome")),
+            "{:?}",
+            first.app
+        );
         let title = first
             .blocks
             .iter()
