@@ -52,6 +52,8 @@ struct Args {
     live: bool,
     /// Print the pipeline's debug events in `--live` mode.
     debug: bool,
+    partial_ms: Option<u32>,
+    early_commit_ms: Option<u32>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -63,6 +65,7 @@ fn parse() -> Result<Args, String> {
     let mut search = SearchConfig::default();
     let (mut samples, mut sigma, mut seed, mut early_stop) = (None, None, None, true);
     let (mut whole, mut live, mut debug) = (false, false, false);
+    let (mut partial_ms, mut early_commit_ms) = (None, None);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         let number = |v: String| v.parse::<f32>().map_err(|e| format!("{flag}: {e}"));
@@ -84,6 +87,8 @@ fn parse() -> Result<Args, String> {
             "--whole" => whole = true,
             "--live" => live = true,
             "--debug" => debug = true,
+            "--partial-ms" => partial_ms = Some(number(value()?)? as u32),
+            "--early-commit-ms" => early_commit_ms = Some(number(value()?)? as u32),
             "--language" => search.language = Some(value()?),
             "--rewrite-url" => rewrite_url = Some(value()?),
             "--rewrite-model" => rewrite_model = Some(value()?),
@@ -108,6 +113,8 @@ fn parse() -> Result<Args, String> {
         rewrite_model,
         live,
         debug,
+        partial_ms,
+        early_commit_ms,
     })
 }
 
@@ -207,6 +214,7 @@ fn live<V: VoiceActivityDetector>(
                 behind_seconds.map_or(String::new(), |s| format!(", {s:.1} s behind"))
             )),
             Event::Inserted { text } => at(&format!("inserted: {text}")),
+            Event::Partial { text } => at(&format!("hearing: {text}")),
             Event::Warning(message) => at(&format!("warning: {message}")),
             Event::Debug(text) => at(&text),
             _ => {}
@@ -230,7 +238,7 @@ fn main() {
     let args = match parse() {
         Ok(args) => args,
         Err(message) => {
-            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME] [--language CODE] [--live [--debug]]");
+            eprintln!("{message}\n\nusage: md --model <dir> --wav <file> [--vad <onnx> | --whole] [--ort <lib>] [--threads N] [--hotword <phrase>]... [--screen <txt>] [--beam N] [--boost X] [--samples N] [--sigma X] [--rewrite-url URL --rewrite-model NAME] [--language CODE] [--live [--debug] [--partial-ms N] [--early-commit-ms N]]");
             std::process::exit(2);
         }
     };
@@ -266,10 +274,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !args.early_stop {
         monte_carlo.first_samples = 0;
     }
+    let defaults = EngineConfig::default();
     let config = EngineConfig {
         monte_carlo,
         debug: std::sync::Arc::new(args.debug.into()),
-        ..EngineConfig::default()
+        partial_ms: args.partial_ms.unwrap_or(defaults.partial_ms),
+        early_commit_ms: args.early_commit_ms.unwrap_or(defaults.early_commit_ms),
+        ..defaults
     };
     let mut engine = Engine {
         asr: recognizer,

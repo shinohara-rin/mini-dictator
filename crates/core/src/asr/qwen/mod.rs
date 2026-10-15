@@ -220,11 +220,13 @@ impl QwenAsr {
         ids.into_iter().map(i64::from).collect()
     }
 
-    /// Greedy decoding of rows whose audio has the same length, in one batch.
+    /// Greedy decoding of rows whose audio has the same length, in one batch. The output of every
+    /// row starts with `prefix`, which the first call reads after the prompt.
     fn generate(
         &self,
         prompt: &[i64],
         rows: &[&EncoderOutput],
+        prefix: &[u32],
         max_new: usize,
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         let batch = rows.len();
@@ -244,25 +246,35 @@ impl QwenAsr {
 
         let mut generated: Vec<Vec<(u32, f32)>> = vec![Vec::new(); batch];
         let mut done = vec![false; batch];
-        let mut input: Vec<i64> = prompt.repeat(batch);
+        let mut input: Vec<i64> = prompt
+            .iter()
+            .copied()
+            .chain(prefix.iter().map(|id| i64::from(*id)))
+            .collect::<Vec<_>>()
+            .repeat(batch);
         let mut start = 0;
-        let mut length = context;
+        let mut length = context + prefix.len();
+        let mut forced = prefix;
         loop {
-            let picks: Vec<(u32, f32)> = self
-                .step(
-                    &input,
-                    batch,
-                    length,
-                    start,
-                    &audio,
-                    (frames, dim),
-                    &mut cache,
-                    total,
-                    length - 1,
-                )?
-                .into_iter()
-                .map(|row| row[0])
-                .collect();
+            let rows = self.step(
+                &input,
+                batch,
+                length,
+                start,
+                &audio,
+                (frames, dim),
+                &mut cache,
+                total,
+                length - 1 - forced.len(),
+                forced,
+            )?;
+            // The forced tokens come first, with their log probabilities, then the pick after them.
+            let mut picks: Vec<(u32, f32)> = Vec::with_capacity(batch);
+            for (b, mut row) in rows.into_iter().enumerate() {
+                picks.push(row.pop().expect("a pick after the last token"));
+                generated[b].extend(row);
+            }
+            forced = &[];
             start += length;
             for (b, (id, log_prob)) in picks.iter().copied().enumerate() {
                 if done[b] {
@@ -342,6 +354,7 @@ impl QwenAsr {
             &mut cache,
             total,
             context - 1,
+            &[],
         )?;
         // The noisy rows keep the reference's `language X<asr_text>` header, if it has one; any
         // other text before the marker is transcript, as `transcript` keeps it.
@@ -440,6 +453,7 @@ impl QwenAsr {
                         &mut local_cache,
                         total,
                         0,
+                        &[],
                     )?;
                     position += 1;
                     for (o, (_, row)) in open.iter_mut().enumerate() {
@@ -480,7 +494,8 @@ impl QwenAsr {
 
     /// Runs the decoder on `length` new tokens per row at cache position `start`, stores their
     /// cache entries, and returns each row's most likely next token with its log probability after
-    /// each new token from `keep_from` on.
+    /// each new token from `keep_from` on. Where `forced` names the next token, it comes back with
+    /// its own log probability instead.
     #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
@@ -493,6 +508,7 @@ impl QwenAsr {
         cache: &mut [Vec<f32>],
         total: usize,
         keep_from: usize,
+        forced: &[u32],
     ) -> Result<Vec<Vec<(u32, f32)>>> {
         let shape = &self.shape;
         let width = shape.kv_heads * shape.head_dim;
@@ -553,7 +569,11 @@ impl QwenAsr {
                 (keep_from..steps)
                     .map(|p| {
                         let at = (b * steps + p) * vocab;
-                        pick(&logits[at..at + vocab])
+                        let logits = &logits[at..at + vocab];
+                        match forced.get(p - keep_from) {
+                            Some(id) => (*id, log_prob_of(logits, *id)),
+                            None => pick(logits),
+                        }
                     })
                     .collect()
             })
@@ -649,7 +669,7 @@ impl QwenAsr {
                 let rows: Vec<&EncoderOutput> = part.iter().map(|i| &encoders[*i]).collect();
                 let generated = match reference {
                     Some(ids) => self.generate_noisy(&prompt, &rows, ids)?,
-                    _ => self.generate(&prompt, &rows, max_new)?,
+                    _ => self.generate(&prompt, &rows, &[], max_new)?,
                 };
                 for (index, generated) in part.iter().zip(generated) {
                     results[*index] = self.to_hypothesis(&generated);
@@ -726,6 +746,22 @@ fn decode_lossy(bytes: &[u8]) -> (String, Vec<usize>) {
 /// Hotwords as the system prompt reads them.
 fn hotword_text(phrases: &[String]) -> String {
     phrases.join(", ")
+}
+
+/// The log probability of token `id`.
+fn log_prob_of(logits: &[f32], id: u32) -> f32 {
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits
+        .iter()
+        .map(|v| v - max)
+        .filter(|d| *d > -30.0)
+        .map(f32::exp)
+        .sum();
+    logits[id as usize] - max - sum.ln()
 }
 
 /// Most likely token and its log probability. Logits far below the best add nothing measurable to
@@ -888,6 +924,38 @@ fn stretch_end(
     }
     // A word too long to finish here: it stands for the reference's word all the same.
     (row.len() >= LOCAL_TOKENS).then(|| Some(next_word(tokenizer, reference, start)))
+}
+
+/// The ids that decodes `a` and `b` of a growing utterance share, ending where a word of `b`
+/// begins, without the last shared word.
+fn agreed_prefix(
+    tokenizer: &BpeTokenizer,
+    stops: &[u32],
+    asr_text: u32,
+    a: &[u32],
+    b: &[u32],
+) -> Vec<u32> {
+    let shared = a
+        .iter()
+        .zip(b)
+        .take_while(|(x, y)| x == y && !stops.contains(x))
+        .count();
+    // Keep whole words: the prefix ends before a token of the later decode that starts one.
+    // Its last word may still grow with the audio, so the prefix stops short of it. The last
+    // shared word is left out too: two decodes of audio cut in the same word can agree on a
+    // wrong reading of it, such as `schein` for `scheint`.
+    let text_end = b
+        .iter()
+        .position(|id| stops.contains(id))
+        .unwrap_or(b.len());
+    let header = b.iter().position(|id| *id == asr_text).map_or(0, |i| i + 1);
+    let mut word_starts = (header + 1..=shared.min(text_end.saturating_sub(1)))
+        .rev()
+        .filter(|n| starts_word(tokenizer, &b[..*n], b[*n], &b[*n + 1..]));
+    word_starts.next();
+    word_starts
+        .next()
+        .map_or_else(Vec::new, |n| b[..n].to_vec())
 }
 
 /// The first reference token after `start` that begins a word, or the reference's end.
@@ -1099,6 +1167,32 @@ impl Asr for QwenAsr {
         self.decode_rows(encoders, bias, ids)
     }
 
+    /// Reads the prompt and `prefix` in one call and generates only the rest.
+    fn decode_after(
+        &self,
+        encoder: &EncoderOutput,
+        bias: &Bias,
+        prefix: &[u32],
+    ) -> Result<Hypothesis> {
+        let max_new = self.max_new_tokens(encoder.frames);
+        if prefix.is_empty() || encoder.frames == 0 || prefix.len() >= max_new {
+            return self.decode_one(encoder, bias);
+        }
+        let prompt = self.prompt(encoder.frames, &bias.phrases);
+        let generated = self.generate(&prompt, &[encoder], prefix, max_new)?;
+        Ok(self.to_hypothesis(&generated[0]))
+    }
+
+    fn agreed_prefix(&self, earlier: &Hypothesis, later: &Hypothesis) -> Vec<u32> {
+        agreed_prefix(
+            &self.tokenizer,
+            &self.template.stops,
+            self.template.asr_text,
+            &earlier.ids,
+            &later.ids,
+        )
+    }
+
     fn frame_seconds(&self) -> f32 {
         0.08
     }
@@ -1192,6 +1286,32 @@ mod tests {
         assert_eq!(text(&body), "ab ab");
         // Silence.
         assert_eq!(text(&with(&[&encode("language None"), &[asr_text]])), "");
+    }
+
+    #[test]
+    fn decodes_agree_on_whole_words_short_of_the_last_shared_one() {
+        let t = tokenizer::tests::tokenizer();
+        let (stops, asr_text) = ([300], 302);
+        let decode = |text: &str, stop: bool| {
+            let mut ids = vec![asr_text];
+            ids.extend(t.encode(text));
+            ids.extend(stop.then_some(300));
+            ids
+        };
+        // `ab ab` and `ab ab ab` share three words; the last of them may still be cut short.
+        let earlier = decode("ab ab ab", true);
+        let later = decode("ab ab ab c", true);
+        assert_eq!(
+            agreed_prefix(&t, &stops, asr_text, &earlier, &later),
+            decode("ab ab", false)
+        );
+        // The later decode's last word is never part of it, even when both share it.
+        assert_eq!(
+            agreed_prefix(&t, &stops, asr_text, &later, &later),
+            decode("ab ab", false)
+        );
+        // Decodes that differ in their first word share nothing to keep.
+        assert!(agreed_prefix(&t, &stops, asr_text, &decode("c ab", false), &later).is_empty());
     }
 
     #[test]

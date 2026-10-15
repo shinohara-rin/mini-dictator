@@ -8,6 +8,12 @@
 //! With a streaming recognizer ([`Asr::stream`]) the encoder reads the audio as it arrives, and a
 //! segment waits only until the encoder has passed its end. Otherwise each segment is encoded once
 //! the voice activity detector closes it.
+//!
+//! A recognizer that continues decodes ([`Asr::decode_after`], Qwen3-ASR) decodes the utterance
+//! in progress again every [`EngineConfig::partial_ms`], and the decode at its end starts from the
+//! words two of those decodes agreed on, so it generates only the last words. Once a pause has
+//! lasted [`EngineConfig::early_commit_ms`], the utterance is transcribed as the pause would end
+//! it, and the text goes out the moment the segment closes, unless speech came back first.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -49,6 +55,10 @@ pub enum Event {
     Inserted {
         text: String,
     },
+    /// What the utterance in progress says so far. Later words may still change.
+    Partial {
+        text: String,
+    },
     /// A step failed. The dictation goes on when it can: a failed rewrite inserts the plain transcript.
     Warning(String),
     /// What one step read, produced, and how long it took, for a debug log: the screen text and
@@ -75,6 +85,14 @@ pub struct EngineConfig {
     pub preceding_chars: usize,
     /// How segments split by a pause join into sentences.
     pub join: JoinConfig,
+    /// While an utterance goes on, decode it again each time it has grown by this much, show the
+    /// text so far ([`Event::Partial`]), and let the decode at its end continue from the words two
+    /// such decodes agreed on. 0 turns it off. Recognizers with a streaming encoder skip it.
+    pub partial_ms: u32,
+    /// Once a pause has lasted this long, transcribe the utterance as the pause would end it, so the
+    /// text is ready when the pause reaches [`SegmenterConfig::min_silence_ms`]. Speech that comes
+    /// back first throws that transcript away. 0 turns it off.
+    pub early_commit_ms: u32,
     /// Emit [`Event::Debug`]. A shell flips it while dictations run; off, nothing is formatted.
     pub debug: Arc<AtomicBool>,
 }
@@ -90,6 +108,8 @@ impl Default for EngineConfig {
             share_screen_text: true,
             preceding_chars: 400,
             join: JoinConfig::default(),
+            partial_ms: 1000,
+            early_commit_ms: 250,
             debug: Arc::default(),
         }
     }
@@ -123,6 +143,17 @@ pub struct Timings {
     pub decode: Duration,
     /// The noisy decodes of the uncertainty check.
     pub check: Duration,
+}
+
+/// What the pipeline already has for a segment when it closes.
+#[derive(Debug, Default)]
+pub struct Prepared {
+    /// Encoder output a stream computed while the segment was spoken.
+    pub encoded: Option<EncoderOutput>,
+    /// Ids the decode starts with, from decodes of the utterance in progress.
+    pub prefix: Vec<u32>,
+    /// The whole transcript, made early in the pause that closed the segment.
+    pub transcript: Option<Transcript>,
 }
 
 pub struct Engine {
@@ -177,11 +208,13 @@ impl Engine {
     }
 
     /// Decodes one segment, with the uncertainty check when `check` is true. `encoded` is the
-    /// segment's encoder output when a stream has computed it already.
+    /// segment's encoder output when a stream has computed it already, and the decode starts with
+    /// the ids in `prefix`.
     pub fn transcribe(
         &self,
         segment: &SpeechSegment,
         encoded: Option<EncoderOutput>,
+        prefix: &[u32],
         session: &SessionContext,
         check: bool,
     ) -> Result<Transcript> {
@@ -191,7 +224,7 @@ impl Engine {
             None => self.asr.encode(&segment.samples)?,
         };
         let encoded = started.elapsed();
-        let reference = self.asr.decode_one(&encoder, &session.bias)?;
+        let reference = self.asr.decode_after(&encoder, &session.bias, prefix)?;
         let decoded = started.elapsed();
         let unchecked = MonteCarloConfig {
             samples: 0,
@@ -247,20 +280,30 @@ impl Engine {
         }
     }
 
-    /// Decodes, rewrites, and inserts one segment. `encoded` is its encoder output from a stream,
-    /// if any, and `lag_seconds` is how long ago its audio ended. Returns the inserted text, if any.
+    /// Decodes, rewrites, and inserts one segment, starting from what `prepared` holds.
+    /// `lag_seconds` is how long ago its audio ended. Returns the inserted text, if any.
     pub fn process(
         &self,
         segment: &SpeechSegment,
-        encoded: Option<EncoderOutput>,
+        prepared: Prepared,
         lag_seconds: f32,
         session: &mut SessionContext,
         sink: &mut dyn TextSink,
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<String>> {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
-        let streamed = encoded.is_some();
-        let transcript = self.transcribe(segment, encoded, session, behind_seconds.is_none())?;
+        let streamed = prepared.encoded.is_some();
+        let early = prepared.transcript.is_some();
+        let transcript = match prepared.transcript {
+            Some(transcript) => transcript,
+            None => self.transcribe(
+                segment,
+                prepared.encoded,
+                &prepared.prefix,
+                session,
+                behind_seconds.is_none() && self.rewriter.reads_uncertainty(),
+            )?,
+        };
         let plain = transcript.reference.text();
         if self.debug() {
             events(Event::Debug(describe_transcript(
@@ -268,6 +311,8 @@ impl Engine {
                 lag_seconds,
                 behind_seconds.is_some(),
                 streamed,
+                early,
+                &prepared.prefix,
                 &transcript,
             )));
         }
@@ -414,6 +459,8 @@ fn describe_transcript(
     lag_seconds: f32,
     behind: bool,
     streamed: bool,
+    early: bool,
+    prefix: &[u32],
     transcript: &Transcript,
 ) -> String {
     let Timings {
@@ -423,7 +470,7 @@ fn describe_transcript(
     } = &transcript.timings;
     let uncertainty = &transcript.uncertainty;
     let mut text = format!(
-        "segment at {:.2} s, {:.2} s long{}, {lag_seconds:.2} s behind: encode {}, decode {}\n  plain:  {:?}",
+        "segment at {:.2} s, {:.2} s long{}, {lag_seconds:.2} s behind: encode {}, decode {}{}{}\n  plain:  {:?}",
         segment.start_sample as f32 / SAMPLE_RATE as f32,
         segment.duration_seconds(),
         if segment.truncated { " (truncated)" } else { "" },
@@ -433,6 +480,12 @@ fn describe_transcript(
             ms(*encode)
         },
         ms(*decode),
+        if prefix.is_empty() {
+            String::new()
+        } else {
+            format!(" after {} agreed tokens", prefix.len())
+        },
+        if early { ", done early in the pause" } else { "" },
         transcript.reference.text(),
     );
     if behind {
@@ -482,10 +535,12 @@ fn feed(
 }
 
 /// Processes the waiting segments in order, as far as the stream has encoded them. Without a
-/// stream, every segment goes at once.
+/// stream, every segment goes at once, with what the draft of its utterance holds.
+#[allow(clippy::too_many_arguments)]
 fn drain(
     engine: &Engine,
     stream: &mut Option<Box<dyn EncoderStream + '_>>,
+    draft: &mut Option<Draft>,
     waiting: &mut VecDeque<SpeechSegment>,
     clock: (u64, Instant),
     session: &mut SessionContext,
@@ -502,15 +557,130 @@ fn drain(
             None => None,
         };
         let segment = waiting.pop_front().expect("front exists");
-        engine.process(
-            &segment,
+        let mut prepared = Prepared {
             encoded,
-            lag(&segment, clock),
-            session,
-            sink,
-            events,
-        )?;
+            ..Prepared::default()
+        };
+        let mut lag_seconds = lag(&segment, clock);
+        if let Some(d) = draft.take().filter(|d| d.start == segment.start_sample) {
+            prepared.prefix = d.prefix;
+            if let Some((_, transcript, early_lag)) = d
+                .early
+                .filter(|(samples, _, _)| *samples == segment.samples.len())
+            {
+                // The transcript is as late as it was when it was made.
+                prepared.transcript = Some(transcript);
+                lag_seconds = early_lag;
+            }
+        }
+        engine.process(&segment, prepared, lag_seconds, session, sink, events)?;
     }
+    Ok(())
+}
+
+/// Decodes of the utterance in progress, for a recognizer without a streaming encoder.
+struct Draft {
+    /// The utterance's first sample.
+    start: u64,
+    /// Samples of the utterance at the last decode.
+    decoded: usize,
+    /// Samples the utterance grows by before the next decode: at least
+    /// [`EngineConfig::partial_ms`], and twice what the last decode took, so drafting never takes
+    /// more than half the time.
+    step: usize,
+    last: Option<Hypothesis>,
+    /// What the last two decodes agreed on, which later decodes start with.
+    prefix: Vec<u32>,
+    /// The transcript made early in a pause, with the segment length it is for and how long
+    /// after its audio it was made.
+    early: Option<(usize, Transcript, f32)>,
+}
+
+/// Audio waiting in the channel beyond this means the dictation is behind, and drafting waits.
+const DRAFT_BACKLOG: Duration = Duration::from_millis(300);
+
+/// Decodes the utterance in progress again once it has grown by [`EngineConfig::partial_ms`], or
+/// transcribes it as it would end once its pause has lasted [`EngineConfig::early_commit_ms`].
+fn advance_draft<V: VoiceActivityDetector>(
+    engine: &Engine,
+    segmenter: &Segmenter<V>,
+    draft: &mut Option<Draft>,
+    clock: (u64, Instant),
+    session: &SessionContext,
+    events: &mut dyn FnMut(Event),
+) -> Result<()> {
+    let config = &engine.config;
+    let Some((start, length, silence_ms)) = segmenter.open() else {
+        *draft = None;
+        return Ok(());
+    };
+    if draft.as_ref().is_none_or(|d| d.start != start) {
+        *draft = Some(Draft {
+            start,
+            decoded: 0,
+            step: 0,
+            last: None,
+            prefix: Vec::new(),
+            early: None,
+        });
+    }
+    let d = draft.as_mut().expect("set above");
+    if clock.1.elapsed() > DRAFT_BACKLOG {
+        return Ok(());
+    }
+    let pausing = config.early_commit_ms > 0 && silence_ms >= config.early_commit_ms;
+    if pausing {
+        if d.early.is_none() {
+            if let Some(segment) = segmenter.preview() {
+                let lag_seconds = lag(&segment, clock);
+                let check =
+                    lag_seconds <= config.max_lag_seconds && engine.rewriter.reads_uncertainty();
+                let transcript = engine.transcribe(&segment, None, &d.prefix, session, check)?;
+                d.early = Some((segment.samples.len(), transcript, lag_seconds));
+            }
+        }
+        return Ok(());
+    }
+    if silence_ms == 0 {
+        // Speech came back, so the pause will not end the utterance where the early transcript
+        // thought.
+        d.early = None;
+    }
+    let step = (config.partial_ms as usize * SAMPLE_RATE as usize / 1000).max(d.step);
+    if config.partial_ms == 0 || length < d.decoded + step {
+        return Ok(());
+    }
+    let Some(segment) = segmenter.preview() else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let encoder = engine.asr.encode(&segment.samples)?;
+    let decoded = engine
+        .asr
+        .decode_after(&encoder, &session.bias, &d.prefix)?;
+    let continued = d.prefix.len();
+    if let Some(last) = &d.last {
+        let agreed = engine.asr.agreed_prefix(last, &decoded);
+        if agreed.len() > d.prefix.len() {
+            d.prefix = agreed;
+        }
+    }
+    let took = started.elapsed();
+    d.decoded = length;
+    d.step = (2.0 * took.as_secs_f32() * SAMPLE_RATE as f32) as usize;
+    if engine.debug() {
+        events(Event::Debug(format!(
+            "draft of {:.2} s in {} after {continued} agreed tokens, {} agreed now: {:?}",
+            segment.duration_seconds(),
+            ms(took),
+            d.prefix.len(),
+            decoded.text(),
+        )));
+    }
+    events(Event::Partial {
+        text: decoded.text(),
+    });
+    d.last = Some(decoded);
     Ok(())
 }
 
@@ -533,6 +703,8 @@ pub fn run_dictation<V: VoiceActivityDetector>(
     let mut stream = engine.asr.stream();
     // Segments that wait for the stream to encode their end.
     let mut waiting = VecDeque::new();
+    let mut draft = None;
+    let mut drafting = stream.is_none();
 
     let dictate = || -> Result<()> {
         for chunk in audio {
@@ -543,6 +715,7 @@ pub fn run_dictation<V: VoiceActivityDetector>(
             drain(
                 engine,
                 &mut stream,
+                &mut draft,
                 &mut waiting,
                 clock,
                 &mut session,
@@ -552,12 +725,25 @@ pub fn run_dictation<V: VoiceActivityDetector>(
             if let (Some(s), true) = (stream.as_deref_mut(), waiting.is_empty()) {
                 s.discard(segmenter.earliest_start());
             }
+            if drafting {
+                if let Err(error) =
+                    advance_draft(engine, &segmenter, &mut draft, clock, &session, events)
+                {
+                    // The segment is still decoded when it closes, from scratch.
+                    events(Event::Warning(format!(
+                        "decoding speech in progress: {error}"
+                    )));
+                    draft = None;
+                    drafting = false;
+                }
+            }
         }
         waiting.extend(segmenter.finish());
         feed(&mut stream, |s| s.finish(), events);
         drain(
             engine,
             &mut stream,
+            &mut draft,
             &mut waiting,
             clock,
             &mut session,
@@ -866,9 +1052,182 @@ mod tests {
         assert_eq!(text, "Hello. Hello.");
     }
 
+    /// Wraps a recognizer as one that continues decodes, and records the prefix of each decode.
+    struct Continuing {
+        inner: Box<dyn Asr>,
+        prefixes: Arc<std::sync::Mutex<Vec<Vec<u32>>>>,
+    }
+
+    impl Asr for Continuing {
+        fn bias(&self, phrases: &[String]) -> Bias {
+            self.inner.bias(phrases)
+        }
+        fn encode(&self, samples: &[f32]) -> Result<EncoderOutput> {
+            self.inner.encode(samples)
+        }
+        fn decode(&self, encoders: &[EncoderOutput], bias: &Bias) -> Result<Vec<Hypothesis>> {
+            self.inner.decode(encoders, bias)
+        }
+        fn decode_after(
+            &self,
+            encoder: &EncoderOutput,
+            bias: &Bias,
+            prefix: &[u32],
+        ) -> Result<Hypothesis> {
+            self.prefixes.lock().unwrap().push(prefix.to_vec());
+            self.inner.decode_one(encoder, bias)
+        }
+        fn agreed_prefix(&self, _: &Hypothesis, _: &Hypothesis) -> Vec<u32> {
+            vec![1]
+        }
+        fn frame_seconds(&self) -> f32 {
+            self.inner.frame_seconds()
+        }
+    }
+
+    /// `pattern` of tone and silence seconds, sent in blocks of 100 ms. They count as recorded in
+    /// the future, so however slow the test runs, the dictation never falls behind.
+    fn blocks(pattern: &[(bool, f32)]) -> Receiver<AudioChunk> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for (loud, seconds) in pattern {
+            let samples = if *loud {
+                tone(*seconds)
+            } else {
+                vec![0.0; (48_000.0 * seconds) as usize]
+            };
+            for block in samples.chunks(4_800) {
+                sender
+                    .send(AudioChunk {
+                        samples: block.to_vec(),
+                        sample_rate: 48_000,
+                        channels: 1,
+                        captured: Instant::now() + Duration::from_secs(600),
+                    })
+                    .unwrap();
+            }
+        }
+        receiver
+    }
+
+    #[test]
+    fn an_utterance_decoded_early_in_its_pause_goes_out_when_the_pause_ends() {
+        let Engine {
+            asr,
+            context,
+            rewriter,
+            config,
+            memory,
+        } = engine();
+        let prefixes = Arc::default();
+        let engine = Engine {
+            asr: Box::new(Continuing {
+                inner: asr,
+                prefixes: Arc::clone(&prefixes),
+            }),
+            context,
+            rewriter,
+            config,
+            memory,
+        };
+        let mut sink = Collect(Vec::new());
+        let mut partials = Vec::new();
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            blocks(&[(false, 0.3), (true, 2.5), (false, 1.5)]),
+            &mut sink,
+            &mut |e| {
+                if let Event::Partial { text } = e {
+                    partials.push(text);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(sink.0, vec!["HELLO"]);
+        // Two drafts as the utterance grew, then the decode early in the pause, which continues
+        // from what the drafts agreed on. Nothing decodes it again when the pause ends.
+        assert_eq!(partials, vec!["HELLO", "HELLO"]);
+        assert_eq!(*prefixes.lock().unwrap(), vec![vec![], vec![], vec![1]]);
+    }
+
+    #[test]
+    fn speech_after_an_early_decode_makes_the_segment_decode_again() {
+        let Engine {
+            asr,
+            context,
+            rewriter,
+            config,
+            memory,
+        } = engine();
+        let prefixes = Arc::default();
+        let engine = Engine {
+            asr: Box::new(Continuing {
+                inner: asr,
+                prefixes: Arc::clone(&prefixes),
+            }),
+            context,
+            rewriter,
+            config: EngineConfig {
+                partial_ms: 0,
+                ..config
+            },
+            memory,
+        };
+        let mut sink = Collect(Vec::new());
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            blocks(&[
+                (false, 0.3),
+                (true, 1.0),
+                (false, 0.4),
+                (true, 1.0),
+                (false, 1.5),
+            ]),
+            &mut sink,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(sink.0, vec!["HELLO"]);
+        // Early in the first pause, early in the second, and nothing when the second one ends.
+        assert_eq!(prefixes.lock().unwrap().len(), 2);
+    }
+
+    /// A rewrite model that keeps every transcript as it is, reading the uncertainty markers.
+    struct KeepsTranscript;
+
+    impl Rewriter for KeepsTranscript {
+        fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn without_a_rewrite_model_nothing_checks_uncertainty() {
+        let engine = engine();
+        engine.config.debug.store(true, Ordering::Relaxed);
+        let mut transcripts = Vec::new();
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            speech(Instant::now()),
+            &mut Collect(Vec::new()),
+            &mut |e| match e {
+                Event::Debug(text) if text.starts_with("segment at") => transcripts.push(text),
+                _ => {}
+            },
+        )
+        .unwrap();
+        assert_eq!(transcripts.len(), 2);
+        assert!(transcripts
+            .iter()
+            .all(|t| t.contains("uncertainty check off")));
+    }
+
     #[test]
     fn debug_events_show_the_context_the_decodes_and_the_rewrite() {
-        let engine = engine();
+        let mut engine = engine();
+        engine.rewriter = Box::new(KeepsTranscript);
         engine.config.debug.store(true, Ordering::Relaxed);
         let mut debug = Vec::new();
         run_dictation(
@@ -876,10 +1235,9 @@ mod tests {
             crate::vad::EnergyVad::default(),
             speech(Instant::now()),
             &mut Collect(Vec::new()),
-            &mut |e| {
-                if let Event::Debug(text) = e {
-                    debug.push(text);
-                }
+            &mut |e| match e {
+                Event::Debug(text) if !text.starts_with("draft of") => debug.push(text),
+                _ => {}
             },
         )
         .unwrap();
@@ -936,13 +1294,13 @@ mod tests {
             post_roll: 0,
         };
         assert!(!engine
-            .transcribe(&segment, None, &session, true)
+            .transcribe(&segment, None, &[], &session, true)
             .unwrap()
             .uncertainty
             .samples
             .is_empty());
         assert!(engine
-            .transcribe(&segment, None, &session, false)
+            .transcribe(&segment, None, &[], &session, false)
             .unwrap()
             .uncertainty
             .samples
@@ -953,7 +1311,7 @@ mod tests {
             engine
                 .process(
                     &segment,
-                    None,
+                    Prepared::default(),
                     lag,
                     &mut session,
                     &mut Collect(Vec::new()),

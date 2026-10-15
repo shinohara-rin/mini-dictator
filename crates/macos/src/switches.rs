@@ -43,4 +43,8 @@ impl Rewriter for Switchable<Option<Box<dyn Rewriter>>> {
             _ => Ok(None),
         }
     }
+
+    fn reads_uncertainty(&self) -> bool {
+        self.on() && self.inner.as_ref().is_some_and(|r| r.reads_uncertainty())
+    }
 }

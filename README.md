@@ -63,6 +63,10 @@ the text took after the audio ended (`--debug` adds each step). `--language ja` 
 ...) fixes the language instead of detecting it. In the app, point `model_dir` at that directory and
 set `language` in `config.toml`.
 
+With Qwen3-ASR, `--live` shows drafts of the phrase in progress (`hearing: ...`).
+`--partial-ms 0` turns them off and `--early-commit-ms 0` turns off the decode early in a pause,
+to compare.
+
 Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run
 the rewrite. Any OpenAI-compatible endpoint works, including a local Ollama at
 `http://localhost:11434/v1`.

@@ -30,6 +30,12 @@ pub struct RewriteRequest {
 pub trait Rewriter: Send + Sync {
     /// The rewritten text, or None when no model ran and the plain transcript stands.
     fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>>;
+
+    /// False when [`Self::rewrite`] would run no model, so nothing reads the uncertainty markers
+    /// and the pipeline skips the check that finds them.
+    fn reads_uncertainty(&self) -> bool {
+        true
+    }
 }
 
 /// Inserts the plain transcript. Used when no rewrite model is configured.
@@ -38,6 +44,10 @@ pub struct PassThrough;
 impl Rewriter for PassThrough {
     fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    fn reads_uncertainty(&self) -> bool {
+        false
     }
 }
 
