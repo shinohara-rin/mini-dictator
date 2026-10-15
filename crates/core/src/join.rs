@@ -127,7 +127,7 @@ impl Joiner {
 }
 
 /// Whether `piece`, whose text without its final period is `body`, goes on with the sentence of
-/// `typed`, by its first letter and the pause. A model's judgment of `typed` is not counted.
+/// `typed`, by its first letter and then the pause. A model's yes on `typed` overrules the pause.
 fn continues(typed: &str, body: &str, piece: &Piece, config: &JoinConfig) -> bool {
     piece.pause_seconds.is_some_and(|pause| {
         // An opening quote or bracket says nothing; the letter after it does.
@@ -149,7 +149,8 @@ fn continues(typed: &str, body: &str, piece: &Piece, config: &JoinConfig) -> boo
                 .trim_end()
                 .trim_end_matches(is_closing_punctuation)
                 .ends_with(['?', '!', '？', '！']);
-            !ended && pause < config.sentence_pause_seconds
+            // A model that judged the text before complete overrules a short pause.
+            !ended && pause < config.sentence_pause_seconds && piece.ends_sentence != Some(true)
         }
     })
 }
@@ -456,6 +457,28 @@ mod tests {
             dictate("Paris last year.", true),
             "I traveled to Paris last year. It was fun."
         );
+    }
+
+    #[test]
+    fn a_finished_sentence_keeps_its_period_after_a_short_pause() {
+        let config = JoinConfig::default();
+        let piece = |text, pause_seconds, ends_sentence| Piece {
+            text,
+            pause_seconds,
+            rewritten: true,
+            names: &[],
+            ends_sentence,
+        };
+        let mut joiner = Joiner::default();
+        let mut typed = joiner.join("", &piece("It worked.", None, None), &config);
+        // "I" keeps its capital anywhere, so only the pause would decide.
+        typed += &joiner.join(
+            &typed,
+            &piece("I will go on.", Some(0.5), Some(true)),
+            &config,
+        );
+        typed += &joiner.finish();
+        assert_eq!(typed, "It worked. I will go on.");
     }
 
     #[test]

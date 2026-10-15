@@ -38,6 +38,17 @@ extern "C" {
     fn IsSecureEventInputEnabled() -> bool;
 }
 
+/// The focus, tried a few times: a busy app can miss one accessibility request.
+fn read_focus() -> Option<Focus> {
+    for _ in 0..3 {
+        if let Some(focus) = Focus::now() {
+            return Some(focus);
+        }
+        sleep(Duration::from_millis(50));
+    }
+    None
+}
+
 pub struct InsertSink {
     /// What had focus when the dictation started. None when it could not be read.
     focus: Option<Focus>,
@@ -134,12 +145,14 @@ fn type_text(text: &str, terminal: bool) -> Result<()> {
 impl TextSink for InsertSink {
     fn insert(&mut self, text: &str) -> Result<Delivery> {
         if self.held.is_none() {
-            let moved = match (&self.focus, Focus::now()) {
-                (Some(before), Some(now)) => now.moved_from(before),
-                _ => false,
-            };
-            if moved {
-                self.held = Some("the focus moved".into());
+            // Without a reading at the hotkey press there is nothing to compare, so the text is
+            // typed. Once there is one, a focus that cannot be read now may have moved.
+            if let Some(before) = &self.focus {
+                match read_focus() {
+                    Some(now) if !now.moved_from(before) => {}
+                    Some(_) => self.held = Some("the focus moved".into()),
+                    None => self.held = Some("the focus could not be read".into()),
+                }
             }
         }
         if self.held.is_none() && unsafe { IsSecureEventInputEnabled() } {
