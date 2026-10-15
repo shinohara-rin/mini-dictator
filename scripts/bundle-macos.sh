@@ -9,6 +9,8 @@
 # System Settings > Privacy & Security > Accessibility after a rebuild.
 set -eu
 
+# The app's minimum macOS below is the newest these two need: ONNX Runtime 1.31 targets 14.0 and
+# the llama.cpp build 13.3.
 ORT_VERSION=1.31.0
 # A llama.cpp release with Gemma 4 audio input (mtmd's gemma4a preprocessor).
 LLAMA_VERSION=b11600
@@ -70,7 +72,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION%%-*}</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Mini Dictator turns your speech into text.</string>
 </dict>
