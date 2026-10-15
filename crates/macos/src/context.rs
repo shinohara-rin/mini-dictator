@@ -191,6 +191,66 @@ impl Focus {
     }
 }
 
+/// Inserts `text` at the cursor of the focused element through the accessibility API, replacing
+/// any selection. False when the element does not take text this way, or took it with no effect,
+/// as some web views do: the caller then types it instead. Text is never inserted twice, because a
+/// change is checked only where the field's value can be read before and after.
+pub fn insert_at_cursor(text: &str) -> bool {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    // Long enough for a busy app to apply the change before it answers.
+    unsafe { system.set_messaging_timeout(0.5) };
+    let Some(focused) = element(&system, "AXFocusedUIElement") else {
+        return false;
+    };
+    // Web views apply the change later, out of process, so a check right after could miss it and
+    // the text would be typed a second time.
+    if in_web_area(&focused) {
+        return false;
+    }
+    let name = CFString::from_str("AXSelectedText");
+    let mut settable: u8 = 0;
+    let error =
+        unsafe { focused.is_attribute_settable(&name, NonNull::from(&mut settable).cast()) };
+    if error != AXError::Success || settable == 0 {
+        return false;
+    }
+    let Some(before) = value_text(&focused) else {
+        return false;
+    };
+    let value = CFString::from_str(text);
+    if unsafe { focused.set_attribute_value(&name, &value) } != AXError::Success {
+        return false;
+    }
+    value_text(&focused).is_some_and(|after| after != before)
+}
+
+/// How far up [`in_web_area`] looks: a page's fields can sit deep in its tree.
+const WEB_ANCESTORS: usize = 64;
+
+/// Whether `element` is part of a web page.
+fn in_web_area(element: &CFRetained<AXUIElement>) -> bool {
+    let mut current = element.clone();
+    for _ in 0..=WEB_ANCESTORS {
+        if string(&current, "AXRole").as_deref() == Some("AXWebArea") {
+            return true;
+        }
+        match self::element(&current, "AXParent") {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    false
+}
+
+/// The element's value as text, empty included. None when it has no text value.
+fn value_text(element: &AXUIElement) -> Option<String> {
+    Some(
+        attribute(element, "AXValue")?
+            .downcast_ref::<CFString>()?
+            .to_string(),
+    )
+}
+
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
     let name = CFString::from_str(name);
     let mut value: *const CFType = std::ptr::null();

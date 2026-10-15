@@ -1,5 +1,5 @@
 //! The macOS shell: a menu bar icon, a global hotkey, the microphone, the accessibility tree, and
-//! paste. Everything else is `mini-dictator-core`.
+//! text insertion. Everything else is `mini-dictator-core`.
 
 #[cfg(target_os = "macos")]
 mod app;
@@ -16,9 +16,9 @@ mod hotkey;
 #[cfg(target_os = "macos")]
 mod icons;
 #[cfg(target_os = "macos")]
-mod keyboard;
+mod insert;
 #[cfg(target_os = "macos")]
-mod paste;
+mod keyboard;
 #[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]

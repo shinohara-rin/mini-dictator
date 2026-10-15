@@ -1,5 +1,5 @@
 //! The privacy permissions the app needs: the microphone to hear, and accessibility both to read
-//! the screen and to paste. The menu polls these, because macOS sends no notice when the user
+//! the screen and to type. The menu polls these, because macOS sends no notice when the user
 //! grants one in System Settings.
 
 use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};

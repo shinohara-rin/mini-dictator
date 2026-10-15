@@ -192,7 +192,7 @@ A shell provides:
 | Microphone | sends `AudioChunk` | `cpal` | `cpal` | `cpal` |
 | Screen text | `ContextProvider` | AX API | UI Automation | AT-SPI |
 | OCR fallback | `ContextProvider` | Vision | `Windows.Media.Ocr` | Tesseract or a small ONNX OCR |
-| Text insertion | `TextSink` | clipboard paste, restored after | `SendInput` Unicode | clipboard paste via portal or `wtype`/`xdotool` |
+| Text insertion | `TextSink` | AX `AXSelectedText`, else Unicode key events | `SendInput` Unicode | clipboard paste via portal or `wtype`/`xdotool` |
 
 ## Language and runtime: Rust
 

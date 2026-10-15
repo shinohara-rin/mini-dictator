@@ -30,8 +30,8 @@ use crate::context::{focused_window, is_trusted, AccessibilityReader, Focus, Foc
 use crate::debug_log;
 use crate::hotkey::{Hotkey, Outcome, Signal};
 use crate::icons::{icon, State};
+use crate::insert::InsertSink;
 use crate::keyboard::{self, Capture, Listener};
-use crate::paste::PasteSink;
 use crate::permissions;
 use crate::sound::{Cue, Jingle, Level, Sounds};
 use crate::switches::Switchable;
@@ -524,7 +524,7 @@ pub fn run() {
                     }
                 } else if event.id == ui.last.id() {
                     if !last_text.is_empty() {
-                        crate::paste::copy(last_text.trim());
+                        crate::insert::copy(last_text.trim());
                         ui.status.set_text("Copied the last dictation");
                     }
                 } else if event.id == ui.rewrite.id() {
@@ -773,7 +773,7 @@ fn start(
     ui.cue(Cue::Start);
 
     std::thread::spawn(move || {
-        let mut sink = PasteSink::new(focus);
+        let mut sink = InsertSink::new(focus);
         let events = proxy.clone();
         let mut forward = move |event: CoreEvent| match event {
             // Written here, so long screen text never passes through the event loop.
