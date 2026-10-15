@@ -316,7 +316,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     .joiner
                     .would_type_period(&session.inserted, &piece, &engine.config.join)
             {
-                piece.ends_sentence = engine.ends_sentence(&request, &mut |_| {});
+                piece.ends_sentence =
+                    engine.ends_sentence(&request, session.joiner.held_closing(), &mut |_| {});
                 println!("  complete sentence before: {:?}", piece.ends_sentence);
             }
             let joined = session

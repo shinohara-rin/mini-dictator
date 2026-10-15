@@ -327,7 +327,8 @@ impl Engine {
             .joiner
             .would_type_period(&session.inserted, &piece, &self.config.join)
         {
-            piece.ends_sentence = self.ends_sentence(&request, events);
+            piece.ends_sentence =
+                self.ends_sentence(&request, session.joiner.held_closing(), events);
         }
         let before = session.joiner.clone();
         let text = session
@@ -343,14 +344,19 @@ impl Engine {
     }
 
     /// Asks the rewrite model whether the text before the cursor is a complete sentence, before a
-    /// held period is typed. None when no model answers.
+    /// held period is typed. None when no model answers. `closing` is the quotes or
+    /// brackets held with the period, which close what came before.
     pub fn ends_sentence(
         &self,
         request: &RewriteRequest,
+        closing: &str,
         events: &mut dyn FnMut(Event),
     ) -> Option<bool> {
         let before = tail(
-            &format!("{}{}", request.preceding_text, request.session_text),
+            &format!(
+                "{}{}{closing}",
+                request.preceding_text, request.session_text
+            ),
             self.config.preceding_chars,
         );
         let started = Instant::now();

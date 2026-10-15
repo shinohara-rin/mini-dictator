@@ -58,6 +58,12 @@ impl Joiner {
         !self.held.is_empty()
     }
 
+    /// Closing quotes or brackets held with the period, already part of the text before the cursor
+    /// as the user will see it.
+    pub fn held_closing(&self) -> &str {
+        &self.closing
+    }
+
     /// Whether joining `piece` would type the held period, so a model's judgment of the text
     /// before could keep it back.
     pub fn would_type_period(&self, typed: &str, piece: &Piece, config: &JoinConfig) -> bool {

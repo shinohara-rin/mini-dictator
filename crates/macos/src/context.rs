@@ -149,7 +149,8 @@ pub struct Focus {
 unsafe impl Send for Focus {}
 
 /// How far up from the focused element [`Focus::moved_from`] looks for the element focused before.
-const FOCUS_ANCESTORS: usize = 12;
+/// A web page's fields can sit deep below its area.
+const FOCUS_ANCESTORS: usize = 64;
 
 impl Focus {
     /// None when the focused app cannot be read, for example while it does not answer.
@@ -184,10 +185,12 @@ impl Focus {
             }
             match element(&current, "AXParent") {
                 Some(parent) => current = parent,
-                None => break,
+                // The root, without passing the element focused before.
+                None => return true,
             }
         }
-        true
+        // Deeper than the limit: unknown, so the focus counts as staying.
+        false
     }
 }
 
