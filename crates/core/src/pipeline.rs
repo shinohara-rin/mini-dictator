@@ -393,16 +393,12 @@ fn describe_context(
         hotwords.len(),
         hotwords.join(", ")
     );
-    // A backend can keep fewer: Qwen3-ASR keeps what fits its prompt budget.
+    // A backend can keep fewer: Qwen3-ASR keeps what fits its prompt budget, and a transducer
+    // keeps what its tokenizer can spell.
     let _ = write!(
         text,
-        "\n  sent to the recognizer ({}{}): {}",
+        "\n  sent to the recognizer ({}): {}",
         bias.phrases.len(),
-        if bias.graph.is_some() {
-            ", as a hotword graph"
-        } else {
-            ", in its prompt"
-        },
         bias.phrases.join(", ")
     );
     text
@@ -602,6 +598,8 @@ mod tests {
         );
         let session = engine.prepare(&mut |_| {});
         assert_eq!(session.hotwords, vec!["Kitty", "Airicraft"]);
+        // The test vocabulary cannot spell Airicraft, so the hotword graph leaves it out.
+        assert_eq!(session.bias.phrases, vec!["Kitty"]);
     }
 
     fn tone(seconds: f32) -> Vec<f32> {
@@ -713,7 +711,7 @@ mod tests {
         assert!(debug[0].contains("Focused: \"Meeting with Hello Kitty\""));
         assert!(debug[0].contains("hotwords (1): Kitty"), "{}", debug[0]);
         assert!(
-            debug[0].contains("sent to the recognizer (1, as a hotword graph): Kitty"),
+            debug[0].contains("sent to the recognizer (1): Kitty"),
             "{}",
             debug[0]
         );

@@ -306,10 +306,17 @@ impl<M: TransducerModel> Recognizer<M> {
 }
 
 impl<M: TransducerModel> Asr for Recognizer<M> {
+    /// Keeps the phrases the tokenizer can spell, the ones the graph holds.
     fn bias(&self, phrases: &[String]) -> Bias {
-        let graph = self.context_graph(phrases, self.search.hotword_boost);
+        let tokenizer = Tokenizer::new(&self.symbols);
+        let phrases: Vec<String> = phrases
+            .iter()
+            .filter(|phrase| tokenizer.encode(phrase).is_some())
+            .cloned()
+            .collect();
+        let graph = self.context_graph(&phrases, self.search.hotword_boost);
         Bias {
-            phrases: phrases.to_vec(),
+            phrases,
             graph: (!graph.is_empty()).then_some(graph),
         }
     }
