@@ -163,12 +163,12 @@ impl TextSink for PasteSink {
                 self.held = Some("the focus moved".into());
             }
         }
+        if self.held.is_none() && unsafe { IsSecureEventInputEnabled() } {
+            // Kept for the rest too: later pieces would continue text the target never got.
+            self.held = Some("secure input is on".into());
+        }
         if let Some(reason) = &self.held {
             return Ok(Delivery::Held(reason.clone()));
-        }
-        if unsafe { IsSecureEventInputEnabled() } {
-            // Only this piece: secure input can go off again, and the focus did not move.
-            return Ok(Delivery::Held("secure input is on".into()));
         }
 
         let pasteboard = NSPasteboard::generalPasteboard();

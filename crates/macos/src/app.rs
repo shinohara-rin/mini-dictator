@@ -315,7 +315,7 @@ fn on_text(
     };
     last_text.push_str(&text);
     // The period typed when a dictation ends keeps the preview of its text.
-    if !text.chars().any(char::is_alphanumeric) {
+    if held.is_none() && !text.chars().any(char::is_alphanumeric) {
         return;
     }
     match held {
