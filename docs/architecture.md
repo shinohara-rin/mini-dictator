@@ -137,7 +137,11 @@ default), and writes a language tag such as `<fr-FR>` that the core drops.
   prediction network takes one row at a time.
 - Features are Kaldi frames with a Hann window, no DC removal, and librosa's Slaney mel filters,
   as sherpa-onnx computes them for NeMo. They are within about 0.005 of kaldi-native-fbank on speech,
-  and the decodes match sherpa-onnx's on the export's test clips.
+  and the decodes match sherpa-onnx's on the export's test clips. One difference is deliberate: the
+  log adds 2^-24 to each energy, as NeMo does in training, where sherpa-onnx floors energies at
+  `f32::EPSILON`. The floor flattens quiet speech: a test clip turned down 50 dB came out empty with
+  it and kept its last sentence with the additive guard. At normal levels the text is the same apart
+  from a comma.
 
 Against Qwen3-ASR on the same clips, on a 4-core container: read French, German, Spanish and
 Japanese come out about equally well, Korean and Mandarin read speech are fine, but a fast Mandarin
