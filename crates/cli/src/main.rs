@@ -180,8 +180,11 @@ fn live<V: VoiceActivityDetector>(
     let started = Instant::now();
     let duration = Duration::from_secs_f64(audio.len() as f64 / 16_000.0);
     let feeder = std::thread::spawn(move || {
-        for (i, block) in audio.chunks(1600).enumerate() {
-            let due = started + Duration::from_millis(100 * (i as u64 + 1));
+        let mut sent = 0;
+        for block in audio.chunks(1600) {
+            // Each block is due when its last sample would have been recorded.
+            sent += block.len();
+            let due = started + Duration::from_secs_f64(sent as f64 / 16_000.0);
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             let chunk = AudioChunk {
                 samples: block.to_vec(),
