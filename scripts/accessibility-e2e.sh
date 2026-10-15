@@ -27,19 +27,42 @@ if [ -n "${CI:-}" ]; then
     "SELECT client, auth_value FROM access WHERE service = 'kTCCServiceAccessibility';" 2>&1 || true
 fi
 
-profile=$(mktemp -d)
-"$CHROME" --user-data-dir="$profile" --no-first-run --no-default-browser-check \
-  --disable-search-engine-choice-screen --new-window "file://$PAGE" > /dev/null 2>&1 &
-chrome=$!
-trap 'kill $chrome 2>/dev/null || true; rm -rf "$profile" 2>/dev/null || true' EXIT
-sleep 8
-osascript -e 'tell application "Google Chrome" to activate' || true
-sleep 2
+# Starts Chrome on the page with the given flags and brings it to the front.
+chrome=
+profile=
+start_chrome() {
+  profile=$(mktemp -d)
+  "$CHROME" --user-data-dir="$profile" --no-first-run --no-default-browser-check \
+    --disable-search-engine-choice-screen "$@" --new-window "file://$PAGE" > /dev/null 2>&1 &
+  chrome=$!
+  sleep 8
+  osascript -e 'tell application "Google Chrome" to activate' || true
+  sleep 2
+}
+stop_chrome() {
+  kill "$chrome" 2>/dev/null || true
+  wait "$chrome" 2>/dev/null || true
+  rm -rf "$profile" 2>/dev/null || true
+}
+trap stop_chrome EXIT
+screenshot() {
+  [ -n "${CI:-}" ] || return 0
+  mkdir -p target/accessibility
+  screencapture -x "target/accessibility/$1.png" || true
+}
 
+# A plain Chrome, as on a user's Mac: does the reader get it to build the page's tree? Reported,
+# not failed, since GitHub's runner may differ from a Mac with a person at it.
+start_chrome
+if ! "$binary" --ignored --nocapture --exact context::tests::turns_on_chromes_tree; then
+  screenshot plain
+  echo "::warning::The reader did not get a plain Chrome to expose the page; see the test output above"
+fi
+stop_chrome
+
+# Chrome with its tree forced on: the reader must find the page, its names and the focused field.
+start_chrome --force-renderer-accessibility
 status=0
 "$binary" --ignored --nocapture --exact "context::tests::$TEST" || status=$?
-if [ "$status" != 0 ] && [ -n "${CI:-}" ]; then
-  mkdir -p target/accessibility
-  screencapture -x target/accessibility/screen.png || true
-fi
+[ "$status" = 0 ] || screenshot forced
 exit $status

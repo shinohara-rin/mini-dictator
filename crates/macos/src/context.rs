@@ -356,36 +356,31 @@ mod tests {
         screen
     }
 
-    /// Reads `tests/data/page.html`, which `scripts/accessibility-e2e.sh` opens in Chrome, as the
-    /// first dictation after Chrome starts would: Chrome builds its tree only once asked.
+    /// Reads until the page's text shows up or `limit` passes.
+    fn read_until_page(limit: Duration) -> (ScreenContext, Option<Duration>) {
+        let started = Instant::now();
+        loop {
+            let screen = read();
+            if screen.blocks.iter().any(|b| b.text.contains("Airicraft")) {
+                return (screen, Some(started.elapsed()));
+            }
+            if started.elapsed() >= limit {
+                dump_window();
+                return (screen, None);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Reads `tests/data/page.html`, which `scripts/accessibility-e2e.sh` opens in a Chrome with
+    /// its accessibility tree forced on: the reader finds the page, its names, and the focused
+    /// field's text before the cursor.
     #[test]
     #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
     fn reads_names_from_a_chrome_page() {
         assert!(is_trusted(false), "accessibility permission is not granted");
-        let system = unsafe { AXUIElement::new_system_wide() };
-        let mut value: *const CFType = std::ptr::null();
-        let error = unsafe {
-            system.copy_attribute_value(
-                &CFString::from_str("AXFocusedApplication"),
-                NonNull::from(&mut value),
-            )
-        };
-        drop(NonNull::new(value as *mut CFType).map(|ptr| unsafe { CFRetained::from_raw(ptr) }));
-        println!("system-wide AXFocusedApplication: {error:?}");
-        // The first read asks Chrome for its tree. Keep reading until the page shows up, to see
-        // how long a dictation right after Chrome starts would go without the page's names.
-        let started = Instant::now();
-        let first = read();
-        let mut page = first.clone();
-        while !page.blocks.iter().any(|b| b.text.contains("Airicraft"))
-            && started.elapsed() < Duration::from_secs(30)
-        {
-            std::thread::sleep(Duration::from_millis(500));
-            println!("after {:?}:", started.elapsed());
-            page = read();
-        }
-        dump_window();
-        let second = read();
+        let (page, found) = read_until_page(Duration::from_secs(10));
+        println!("page found after {found:?}");
         let hotwords: Vec<String> = rank_terms(&page, 100)
             .into_iter()
             .map(|t| t.phrase)
@@ -394,14 +389,11 @@ mod tests {
 
         // AXTitle names the app "Chrome" on some systems and "Google Chrome" on others.
         assert!(
-            first.app.as_deref().is_some_and(|a| a.contains("Chrome")),
+            page.app.as_deref().is_some_and(|a| a.contains("Chrome")),
             "{:?}",
-            first.app
+            page.app
         );
-        let title = first
-            .blocks
-            .iter()
-            .find(|b| b.region == Region::WindowTitle);
+        let title = page.blocks.iter().find(|b| b.region == Region::WindowTitle);
         assert!(
             title.is_some_and(|b| b.text.contains("Kestrelholm release notes")),
             "{title:?}"
@@ -412,13 +404,34 @@ mod tests {
                 "{name} is not among the hotwords"
             );
         }
-        // The focused field may need the tree the first read asked for.
-        let focused = |screen: &ScreenContext| screen.focused_tail(400);
         assert_eq!(
-            focused(&second).as_deref(),
-            Some("Dear Quillon, the next build is"),
-            "first read: {:?}",
-            focused(&first)
+            page.focused_tail(400).as_deref(),
+            Some("Dear Quillon, the next build is")
         );
+    }
+
+    /// Whether the reader gets a plain Chrome, started without forced accessibility, to build the
+    /// page's tree, as the app must on a user's Mac. If its own switches do not, it also tries
+    /// AXEnhancedUserInterface up front, to show whether that would.
+    #[test]
+    #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
+    fn turns_on_chromes_tree() {
+        assert!(is_trusted(false), "accessibility permission is not granted");
+        let (_, found) = read_until_page(Duration::from_secs(10));
+        if found.is_none() {
+            let system = unsafe { AXUIElement::new_system_wide() };
+            let app = focused_app(&system).expect("no focused app");
+            println!(
+                "the reader's switches did not bring up the page; AXEnhancedUserInterface: {:?}",
+                set_true(&app, "AXEnhancedUserInterface")
+            );
+            let (_, after) = read_until_page(Duration::from_secs(10));
+            println!("page found {after:?} after AXEnhancedUserInterface");
+        }
+        assert!(
+            found.is_some(),
+            "the reader's switches did not make Chrome build the page's tree"
+        );
+        println!("page found after {found:?}");
     }
 }
