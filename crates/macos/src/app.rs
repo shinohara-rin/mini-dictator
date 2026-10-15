@@ -212,7 +212,7 @@ impl Ui {
         let permissions = MenuItem::new(permissions::summary(&permissions::missing()), false, None);
         let rewrite = CheckMenuItem::new(
             "Rewrite with LLM",
-            !config.rewrite.model.is_empty(),
+            config.rewrite.builtin || !config.rewrite.model.is_empty(),
             config.rewrite.enabled,
             None,
         );

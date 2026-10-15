@@ -58,7 +58,9 @@ pub struct Uncertainty {
 pub struct Rewrite {
     pub enabled: bool,
     /// Run the rewrite model on this Mac: Gemma 4 E2B in the bundled llama.cpp server, which also
-    /// hears each utterance. Off sends the rewrite to `base_url` instead.
+    /// hears each utterance. Off sends the rewrite to `base_url` instead. New configs turn it on;
+    /// a saved `[rewrite]` table without the key predates it and keeps using `base_url`.
+    #[serde(default)]
     pub builtin: bool,
     /// The built-in model. `scripts/fetch-models.sh` downloads it.
     pub builtin_model: PathBuf,
@@ -319,6 +321,14 @@ mod tests {
         assert_eq!(config.hotkey, "F5");
         assert_eq!(config.rewrite.model, "x");
         assert!(!config.beep);
+    }
+
+    #[test]
+    fn a_saved_endpoint_config_keeps_its_endpoint() {
+        let config: Config = toml::from_str("[rewrite]\nenabled = true\nmodel = \"x\"\n").unwrap();
+        assert!(!config.rewrite.builtin);
+        let config: Config = toml::from_str("beep = false\n").unwrap();
+        assert!(config.rewrite.builtin);
     }
 
     #[test]

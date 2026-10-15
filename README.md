@@ -39,6 +39,7 @@ which reads the transcript and also hears the recording, so it can fix names and
 recognizer misheard. It loads at launch, uses about 4 GB of memory while the app runs, and stops
 when the app quits. Set `builtin = false` under `[rewrite]` to send the rewrite to `base_url`
 instead (`send_audio = true` attaches the recording there too), or turn Rewrite off in the menu.
+A config saved by an earlier version keeps using its endpoint until `builtin = true` is added.
 `fetch-models.sh` with `REWRITER=0` skips the Gemma download.
 
 To see what a dictation did, check Write Debug Log in the menu, or set `debug = true` to have it on
