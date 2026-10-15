@@ -2,7 +2,7 @@
 //! `verbose` adds a cue for each step of the pipeline, drawn by [`crate::synth`].
 
 use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,8 @@ const ECHO_MARGIN: Duration = Duration::from_millis(250);
 pub struct Playback {
     base: Instant,
     until_ms: Arc<AtomicU64>,
+    /// Mark every cue, not only the voice-like ones.
+    every_cue: Arc<AtomicBool>,
 }
 
 impl Playback {
@@ -54,6 +56,7 @@ impl Playback {
         Playback {
             base: Instant::now(),
             until_ms: Arc::new(AtomicU64::new(0)),
+            every_cue: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -61,6 +64,11 @@ impl Playback {
         let end = Instant::now() + Duration::from_secs_f64(seconds.max(0.0)) + ECHO_MARGIN;
         let end = end.duration_since(self.base).as_millis() as u64;
         self.until_ms.fetch_max(end, Ordering::Relaxed);
+    }
+
+    /// For a dictation that uses the loudness detector, which hears any cue as speech.
+    pub fn mark_every_cue(&self, on: bool) {
+        self.every_cue.store(on, Ordering::Relaxed);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -131,7 +139,7 @@ impl Sounds {
             // A sound still playing ignores `play`; start it over instead.
             sound.stop();
             sound.play();
-            if jingle.sounds_like_voice() {
+            if jingle.sounds_like_voice() || self.playback.every_cue.load(Ordering::Relaxed) {
                 self.playback.started(sound.duration());
             }
         }

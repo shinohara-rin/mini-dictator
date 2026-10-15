@@ -31,8 +31,8 @@ pub struct Config {
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
     /// `"off"`, `"minimal"` (a sound when the microphone opens and closes), or `"verbose"` (also a
-    /// cue for each segment heard, unclear words, nothing heard, catching up, text typed, and errors). The menu
-    /// changes it until the app quits.
+    /// cue for each segment heard, unclear words, nothing heard, catching up, text typed, and
+    /// errors). The menu changes it until the app quits.
     // A config written before this field keeps its own setting, not the new default.
     #[serde(default)]
     pub sounds: Option<Level>,
@@ -234,7 +234,8 @@ impl Config {
         path.to_path_buf()
     }
 
-    /// `sounds`, else `beep` from a config written before it, else the minimal sounds that config had.
+    /// `sounds`, else `beep` from a config written before it, else the minimal sounds that config
+    /// had.
     pub fn sound_level(&self) -> Level {
         self.sounds.unwrap_or(match self.beep {
             Some(false) => Level::Off,

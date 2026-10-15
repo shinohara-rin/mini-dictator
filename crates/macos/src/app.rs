@@ -685,7 +685,8 @@ fn start(
     ui: &Ui,
 ) -> Option<Dictation> {
     let (sender, receiver) = mpsc::channel();
-    let stream = match crate::audio::start(sender, ui.sounds.playback()) {
+    let playback = ui.sounds.playback();
+    let stream = match crate::audio::start(sender, playback.clone()) {
         Ok(stream) => stream,
         Err(error) => {
             ui.show(State::Error, &shorten(&format!("Microphone: {error}"), 60));
@@ -708,7 +709,11 @@ fn start(
             }
         };
         debug_log::write("dictation started");
-        let result = match vad_path.map(|p| SileroVad::load(&p)) {
+        let vad = vad_path.map(|p| SileroVad::load(&p));
+        // The loudness detector takes any of the app's cues for speech, not only the voice-like
+        // ones Silero does.
+        playback.mark_every_cue(!matches!(vad, Some(Ok(_))));
+        let result = match vad {
             Some(Ok(vad)) => run_dictation(&engine, vad, receiver, &mut sink, &mut forward),
             Some(Err(error)) => {
                 forward(CoreEvent::Warning(format!(
