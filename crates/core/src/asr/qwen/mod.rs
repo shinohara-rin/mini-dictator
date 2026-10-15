@@ -1,76 +1,78 @@
-//! Qwen3-ASR through ONNX Runtime, in the export that sherpa-onnx ships
-//! (`sherpa-onnx-qwen3-asr-0.6B-int8-*`).
+//! Qwen3-ASR: an audio encoder in front of a Qwen3 LLM.
 //!
-//! The model is an audio encoder in front of a Qwen3 LLM:
+//! The encoder turns Whisper mel features into audio features in the LLM's embedding space, 12.5
+//! per second. These are the [`EncoderOutput`] that uncertainty adds noise to. The LLM runs on a chat
+//! prompt whose `<|audio_pad|>` tokens stand for the audio features, reads hotwords as text in its
+//! system prompt, and gives no token times.
 //!
-//! - `conv_frontend.onnx` downsamples Whisper mel features by 8, to 12.5 audio tokens per second.
-//! - `encoder.onnx` turns them into audio features in the LLM's embedding space. These are the
-//!   [`EncoderOutput`] that uncertainty adds noise to.
-//! - `decoder.onnx` runs the LLM on a chat prompt whose `<|audio_pad|>` tokens stand for the audio
-//!   features. It returns the key/value cache entries of the tokens it read, and the caller keeps
-//!   the cache.
+//! Two runtimes run the networks, behind [`QwenModel`]:
 //!
-//! The LLM reads hotwords as text in its system prompt, and it gives no token times.
+//! - [`ort::OrtQwen`] runs the int8 ONNX export that sherpa-onnx ships, on the CPU.
+//! - [`mlx::MlxQwen`] runs an MLX checkpoint such as `mlx-community/Qwen3-ASR-0.6B-4bit`, on the GPU
+//!   of Apple silicon.
+//!
+//! [`QwenAsr`] holds what they share: the tokenizer and prompt, greedy decoding, the noisy check,
+//! and reading the transcript out of the answer.
 
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+pub mod mlx;
+#[cfg(feature = "onnx")]
+pub mod ort;
 mod tokenizer;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-use ort::session::{Session, SessionInputValue};
-use ort::value::{Tensor, TensorRef};
+use std::path::Path;
 
 pub use tokenizer::BpeTokenizer;
 
-use super::onnx::load_session;
 use super::{
     is_cjk, is_punctuation, split_words, Asr, Bias, EncoderOutput, Hypothesis, TimedToken,
 };
-use crate::features::WhisperMel;
+use crate::features::{Features, WhisperMel};
 use crate::uncertainty::MonteCarloConfig;
 use crate::{Error, Result};
 
-fn model_error(error: impl std::fmt::Display) -> Error {
-    Error::Model(error.to_string())
-}
-
-/// Mel frames the frontend reads as one chunk. The export bakes it in.
+/// Mel frames the encoder reads as one chunk.
 const CHUNK_FRAMES: usize = 100;
 const MEL_BINS: usize = 128;
 
-/// The files of one Qwen3-ASR export.
-#[derive(Debug, Clone)]
-pub struct QwenFiles {
-    pub conv_frontend: PathBuf,
-    pub encoder: PathBuf,
-    pub decoder: PathBuf,
-    /// Directory with `vocab.json`, `merges.txt`, and `tokenizer_config.json`.
-    pub tokenizer: PathBuf,
-}
+/// A token the decoder picked, with its log probability.
+pub type Pick = (u32, f32);
 
-impl QwenFiles {
-    /// True when `dir` looks like a Qwen3-ASR export rather than a transducer.
-    pub fn is_qwen(dir: &Path) -> bool {
-        dir.join("conv_frontend.onnx").is_file()
-    }
+/// The networks of Qwen3-ASR in one runtime: the audio encoder, and the LLM decoder with its
+/// key/value cache.
+pub trait QwenModel: Send + Sync {
+    /// The key/value cache of a batch of rows.
+    type Cache;
 
-    /// Finds the files in a model directory, preferring the int8 encoder and decoder.
-    pub fn discover(dir: &Path) -> Result<Self> {
-        let pick = |stem: &str| -> Result<PathBuf> {
-            [format!("{stem}.int8.onnx"), format!("{stem}.onnx")]
-                .into_iter()
-                .map(|name| dir.join(name))
-                .find(|path| path.is_file())
-                .ok_or_else(|| Error::Model(format!("no {stem}.onnx in {}", dir.display())))
-        };
-        Ok(Self {
-            conv_frontend: pick("conv_frontend")?,
-            encoder: pick("encoder")?,
-            decoder: pick("decoder")?,
-            tokenizer: dir.join("tokenizer"),
-        })
-    }
+    /// Audio features for Whisper mel features of 128 bins, one row per audio token
+    /// ([`audio_token_count`]).
+    fn encode(&self, features: Features) -> Result<EncoderOutput>;
+
+    /// An empty cache for `batch` rows of at most `total` tokens.
+    fn cache(&self, batch: usize, total: usize) -> Self::Cache;
+
+    /// A cache of the given rows of `cache`, holding its first `length` positions.
+    fn fork(&self, cache: &Self::Cache, rows: &[usize], length: usize) -> Self::Cache;
+
+    /// Bytes the cache of one row takes for `tokens` tokens.
+    fn cache_bytes(&self, tokens: usize) -> usize;
+
+    /// Runs the decoder on `length` new tokens per row at cache position `start`, stores their
+    /// cache entries, and returns each row's most likely next token with its log probability after
+    /// each new token from `keep_from` on. `input` holds the rows one after another; where it has
+    /// `<|audio_pad|>` tokens, the decoder reads each row's `audio` features of `(frames, dim)`.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &self,
+        input: &[i64],
+        length: usize,
+        start: usize,
+        audio: &[f32],
+        shape: (usize, usize),
+        cache: &mut Self::Cache,
+        keep_from: usize,
+    ) -> Result<Vec<Vec<Pick>>>;
 }
 
 #[derive(Debug, Clone)]
@@ -135,62 +137,35 @@ impl Template {
     }
 }
 
-/// Shapes the decoder's inputs reveal.
-struct DecoderShape {
-    layers: usize,
-    kv_heads: usize,
-    head_dim: usize,
-}
-
-pub struct QwenAsr {
-    frontend: Mutex<Session>,
-    encoder: Mutex<Session>,
-    decoder: Mutex<Session>,
+pub struct QwenAsr<M> {
+    model: M,
     tokenizer: BpeTokenizer,
     template: Template,
     mel: WhisperMel,
-    shape: DecoderShape,
     pub config: QwenConfig,
 }
 
-impl QwenAsr {
-    pub fn load(files: &QwenFiles, threads: usize, config: QwenConfig) -> Result<Self> {
-        let tokenizer = BpeTokenizer::load(&files.tokenizer)?;
+#[cfg(feature = "onnx")]
+impl QwenAsr<ort::OrtQwen> {
+    pub fn load_onnx(files: &ort::QwenFiles, threads: usize, config: QwenConfig) -> Result<Self> {
+        Self::new(
+            ort::OrtQwen::load(files, threads)?,
+            &files.tokenizer,
+            config,
+        )
+    }
+}
+
+impl<M: QwenModel> QwenAsr<M> {
+    /// Qwen3-ASR on `model`, with the tokenizer files in `tokenizer`.
+    pub fn new(model: M, tokenizer: &Path, config: QwenConfig) -> Result<Self> {
+        let tokenizer = BpeTokenizer::load(tokenizer)?;
         let template = Template::new(&tokenizer)?;
-        let decoder = load_session(&files.decoder, threads)?;
-        let layers = decoder
-            .inputs()
-            .iter()
-            .filter(|input| input.name().starts_with("cache_key_"))
-            .count();
-        let dims: Vec<i64> = decoder
-            .inputs()
-            .iter()
-            .find(|input| input.name() == "cache_key_0")
-            .and_then(|input| input.dtype().tensor_shape())
-            .map(|shape| shape.iter().copied().collect())
-            .unwrap_or_default();
-        let (kv_heads, head_dim) = match dims.as_slice() {
-            [_, _, heads, dim] if *heads > 0 && *dim > 0 => (*heads as usize, *dim as usize),
-            _ => {
-                return Err(Error::Model(format!(
-                    "unexpected decoder cache shape {dims:?} in {}",
-                    files.decoder.display()
-                )))
-            }
-        };
         Ok(Self {
-            frontend: Mutex::new(load_session(&files.conv_frontend, threads)?),
-            encoder: Mutex::new(load_session(&files.encoder, threads)?),
-            decoder: Mutex::new(decoder),
+            model,
             tokenizer,
             template,
             mel: WhisperMel::new(MEL_BINS),
-            shape: DecoderShape {
-                layers,
-                kv_heads,
-                head_dim,
-            },
             config,
         })
     }
@@ -232,10 +207,7 @@ impl QwenAsr {
         let dim = rows[0].dim;
         let context = prompt.len();
         let total = context + max_new;
-        let width = self.shape.kv_heads * self.shape.head_dim;
-        let mut cache: Vec<Vec<f32>> = (0..2 * self.shape.layers)
-            .map(|_| vec![0.0; batch * total * width])
-            .collect();
+        let mut cache = self.model.cache(batch, total);
         let audio: Vec<f32> = rows
             .iter()
             .flat_map(|row| row.data[..frames * dim].iter().copied())
@@ -249,15 +221,14 @@ impl QwenAsr {
         let mut length = context;
         loop {
             let picks: Vec<(u32, f32)> = self
+                .model
                 .step(
                     &input,
-                    batch,
                     length,
                     start,
                     &audio,
                     (frames, dim),
                     &mut cache,
-                    total,
                     length - 1,
                 )?
                 .into_iter()
@@ -321,10 +292,7 @@ impl QwenAsr {
         let reference = &reference[..reference.len() - usize::from(stopped)];
         let length = reference.len();
         let total = context + length + LOCAL_TOKENS + 1;
-        let width = self.shape.kv_heads * self.shape.head_dim;
-        let mut cache: Vec<Vec<f32>> = (0..2 * self.shape.layers)
-            .map(|_| vec![0.0; batch * total * width])
-            .collect();
+        let mut cache = self.model.cache(batch, total);
         let audio: Vec<f32> = rows
             .iter()
             .flat_map(|row| row.data[..frames * dim].iter().copied())
@@ -332,15 +300,13 @@ impl QwenAsr {
         let mut input: Vec<i64> = prompt.to_vec();
         input.extend(reference.iter().map(|id| i64::from(*id)));
         // After the prompt and after each reference token: what each row picks next.
-        let scored = self.step(
+        let scored = self.model.step(
             &input.repeat(batch),
-            batch,
             input.len(),
             0,
             &audio,
             (frames, dim),
             &mut cache,
-            total,
             context - 1,
         )?;
         // The noisy rows keep the reference's `language X<asr_text>` header, if it has one; any
@@ -372,7 +338,6 @@ impl QwenAsr {
 
         let mut stretches: Vec<Vec<Stretch>> = vec![Vec::new(); batch];
         let mut resume = vec![0usize; batch];
-        let slab = total * width;
         let row_audio = frames * dim;
         for i in 0..=length {
             let group: Vec<usize> = (0..batch)
@@ -405,14 +370,8 @@ impl QwenAsr {
             }
             if !open.is_empty() {
                 // The cache of each open row holds the prompt and the reference before `i`.
-                let mut local_cache: Vec<Vec<f32>> = cache
-                    .iter()
-                    .map(|buffer| {
-                        open.iter()
-                            .flat_map(|(b, _)| buffer[b * slab..(b + 1) * slab].iter().copied())
-                            .collect()
-                    })
-                    .collect();
+                let rows: Vec<usize> = open.iter().map(|(b, _)| *b).collect();
+                let mut local_cache = self.model.fork(&cache, &rows, context + i);
                 let local_audio: Vec<f32> = open
                     .iter()
                     .flat_map(|(b, _)| audio[b * row_audio..(b + 1) * row_audio].iter().copied())
@@ -430,15 +389,13 @@ impl QwenAsr {
                             })
                         })
                         .collect();
-                    let picks = self.step(
+                    let picks = self.model.step(
                         &input,
-                        open.len(),
                         1,
                         position,
                         &local_audio,
                         (frames, dim),
                         &mut local_cache,
-                        total,
                         0,
                     )?;
                     position += 1;
@@ -476,104 +433,6 @@ impl QwenAsr {
         Ok((0..batch)
             .map(|b| splice(reference, &scored[b], &stretches[b]))
             .collect())
-    }
-
-    /// Runs the decoder on `length` new tokens per row at cache position `start`, stores their
-    /// cache entries, and returns each row's most likely next token with its log probability after
-    /// each new token from `keep_from` on.
-    #[allow(clippy::too_many_arguments)]
-    fn step(
-        &self,
-        input: &[i64],
-        batch: usize,
-        length: usize,
-        start: usize,
-        audio: &[f32],
-        (frames, dim): (usize, usize),
-        cache: &mut [Vec<f32>],
-        total: usize,
-        keep_from: usize,
-    ) -> Result<Vec<Vec<(u32, f32)>>> {
-        let shape = &self.shape;
-        let width = shape.kv_heads * shape.head_dim;
-        let mut inputs: Vec<(String, SessionInputValue<'_>)> = vec![
-            (
-                "input_ids".into(),
-                Tensor::from_array(([batch, length], input.to_vec()))
-                    .map_err(model_error)?
-                    .into(),
-            ),
-            (
-                "audio_features".into(),
-                TensorRef::from_array_view(([batch, frames, dim], audio))
-                    .map_err(model_error)?
-                    .into(),
-            ),
-            (
-                "attention_mask".into(),
-                Tensor::from_array(([batch, length], vec![1i64; batch * length]))
-                    .map_err(model_error)?
-                    .into(),
-            ),
-            (
-                "cache_position".into(),
-                Tensor::from_array((
-                    [length],
-                    (start as i64..(start + length) as i64).collect::<Vec<_>>(),
-                ))
-                .map_err(model_error)?
-                .into(),
-            ),
-        ];
-        let dims = [batch, total, shape.kv_heads, shape.head_dim];
-        for (layer, pair) in cache.chunks(2).enumerate() {
-            inputs.push((
-                format!("cache_key_{layer}"),
-                TensorRef::from_array_view((dims, pair[0].as_slice()))
-                    .map_err(model_error)?
-                    .into(),
-            ));
-            inputs.push((
-                format!("cache_value_{layer}"),
-                TensorRef::from_array_view((dims, pair[1].as_slice()))
-                    .map_err(model_error)?
-                    .into(),
-            ));
-        }
-
-        let mut session = self.decoder.lock().expect("decoder lock");
-        let outputs = session.run(inputs).map_err(model_error)?;
-        let (logits_shape, logits) = outputs["logits"]
-            .try_extract_tensor::<f32>()
-            .map_err(model_error)?;
-        let vocab = logits_shape[2] as usize;
-        let steps = logits_shape[1] as usize;
-        let picks = (0..batch)
-            .map(|b| {
-                (keep_from..steps)
-                    .map(|p| {
-                        let at = (b * steps + p) * vocab;
-                        pick(&logits[at..at + vocab])
-                    })
-                    .collect()
-            })
-            .collect();
-
-        for (layer, pair) in cache.chunks_mut(2).enumerate() {
-            for (kind, buffer) in ["key", "value"].iter().zip(pair.iter_mut()) {
-                let (delta_shape, delta) = outputs[format!("{kind}_delta_{layer}").as_str()]
-                    .try_extract_tensor::<f32>()
-                    .map_err(model_error)?;
-                let rows = (delta_shape[1] as usize).min(total - start);
-                for b in 0..batch {
-                    let from = b * delta_shape[1] as usize * width;
-                    let to = (b * total + start) * width;
-                    buffer[to..to + rows * width]
-                        .copy_from_slice(&delta[from..from + rows * width]);
-                }
-            }
-        }
-        Ok(picks)
     }
 
     /// Words of the generated text after its `language X<asr_text>` header, without added tokens.
@@ -635,12 +494,7 @@ impl QwenAsr {
         for (frames, indices) in groups {
             let prompt = self.prompt(frames, &bias.phrases);
             let max_new = self.max_new_tokens(frames);
-            let cache_bytes = 2
-                * self.shape.layers
-                * (prompt.len() + max_new)
-                * self.shape.kv_heads
-                * self.shape.head_dim
-                * 4;
+            let cache_bytes = self.model.cache_bytes(prompt.len() + max_new);
             // The first call returns logits for every position it reads.
             let first_call = prompt.len() + reference.map_or(0, <[u32]>::len);
             let row_bytes = cache_bytes + first_call * vocab * 4;
@@ -730,7 +584,8 @@ fn hotword_text(phrases: &[String]) -> String {
 
 /// Most likely token and its log probability. Logits far below the best add nothing measurable to
 /// the normalizer, so they skip the exponential.
-fn pick(logits: &[f32]) -> (u32, f32) {
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn pick(logits: &[f32]) -> Pick {
     let (best, max) = logits
         .iter()
         .copied()
@@ -1014,7 +869,7 @@ pub fn audio_token_count(frames: usize) -> usize {
     full * after_convs(CHUNK_FRAMES) + if rest > 0 { after_convs(rest) } else { 0 }
 }
 
-impl Asr for QwenAsr {
+impl<M: QwenModel> Asr for QwenAsr<M> {
     /// Keeps the leading phrases that fit the prompt's hotword budget.
     fn bias(&self, phrases: &[String]) -> Bias {
         let mut kept: Vec<String> = Vec::new();
@@ -1041,43 +896,22 @@ impl Asr for QwenAsr {
         if features.frames < 2 {
             return Ok(empty);
         }
-        let input = Tensor::from_array(([1, features.frames, features.dim], features.data))
-            .map_err(model_error)?;
-        let (conv_shape, conv) = {
-            let mut session = self.frontend.lock().expect("frontend lock");
-            let outputs = session
-                .run(ort::inputs!["input_features" => input])
-                .map_err(model_error)?;
-            let (shape, data) = outputs[0]
-                .try_extract_tensor::<f32>()
-                .map_err(model_error)?;
-            (shape.iter().copied().collect::<Vec<i64>>(), data.to_vec())
-        };
-        let tokens = conv_shape[1] as usize;
-        let valid = audio_token_count(features.frames).min(tokens);
-        let mask: Vec<bool> = (0..tokens).map(|i| i < valid).collect();
-        let conv = Tensor::from_array((conv_shape, conv)).map_err(model_error)?;
-        let mask = Tensor::from_array(([1, tokens], mask)).map_err(model_error)?;
-        let mut session = self.encoder.lock().expect("encoder lock");
-        let outputs = session
-            .run(ort::inputs!["input_features" => conv, "feature_attention_mask" => mask])
-            .map_err(model_error)?;
-        let (shape, data) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(model_error)?;
-        let dim = shape[2] as usize;
-        // The encoder zeroes padded positions. Silence at the end is not speech either.
-        let speech = (0..valid)
+        let encoded = self.model.encode(features)?;
+        let dim = encoded.dim;
+        // The ONNX encoder zeroes padded positions. Silence at the end is not speech either.
+        let speech = (0..encoded.frames)
             .rev()
-            .find(|t| data[t * dim..(t + 1) * dim].iter().any(|v| v.abs() > 1e-6))
+            .find(|t| encoded.frame(*t).iter().any(|v| v.abs() > 1e-6))
             .map_or(0, |t| t + 1);
         if speech == 0 {
             return Ok(empty);
         }
+        let mut data = encoded.data;
+        data.truncate(speech * dim);
         Ok(EncoderOutput {
             frames: speech,
             dim,
-            data: data[..speech * dim].to_vec(),
+            data,
         })
     }
 

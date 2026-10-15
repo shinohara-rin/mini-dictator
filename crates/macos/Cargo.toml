@@ -12,7 +12,7 @@ name = "mini-dictator"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-mini-dictator-core = { workspace = true, features = ["onnx", "http"] }
+mini-dictator-core = { workspace = true, features = ["onnx", "mlx", "http"] }
 serde.workspace = true
 toml = "1"
 toml_edit = "0.25"

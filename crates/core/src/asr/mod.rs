@@ -8,12 +8,12 @@
 //!   [`TransducerModel`] has the three networks of a sherpa-onnx transducer: the encoder, the
 //!   stateless decoder (prediction network), and the joiner.
 //! - [`qwen::QwenAsr`] runs Qwen3-ASR, an audio encoder in front of an LLM that reads hotwords in its
-//!   prompt. It covers about 30 languages.
+//!   prompt. It covers about 30 languages, through ONNX Runtime or MLX.
 
 mod context_graph;
 #[cfg(feature = "onnx")]
 pub mod onnx;
-#[cfg(feature = "onnx")]
+#[cfg(feature = "qwen")]
 pub mod qwen;
 mod search;
 mod tokens;
@@ -130,18 +130,40 @@ pub trait Asr: Send + Sync {
     }
 }
 
-/// Loads the recognizer in a sherpa-onnx model directory: Qwen3-ASR when the directory has its
-/// files, otherwise a transducer searched with `search`. ONNX Runtime must be initialized first.
-#[cfg(feature = "onnx")]
+/// Loads the recognizer in a model directory: an MLX checkpoint of Qwen3-ASR (`config.json` and
+/// `.safetensors` weights) when MLX is built in, a sherpa-onnx export of Qwen3-ASR, or otherwise a
+/// sherpa-onnx transducer searched with `search`. ONNX Runtime must be initialized first for the
+/// ONNX models.
+#[cfg(any(feature = "onnx", all(feature = "mlx", target_os = "macos")))]
 pub fn load(dir: &std::path::Path, threads: usize, search: SearchConfig) -> Result<Box<dyn Asr>> {
-    if qwen::QwenFiles::is_qwen(dir) {
-        let files = qwen::QwenFiles::discover(dir)?;
-        let model = qwen::QwenAsr::load(&files, threads, qwen::QwenConfig::default())?;
-        Ok(Box::new(model))
-    } else {
-        let files = onnx::TransducerFiles::discover(dir, true)?;
-        let (model, symbols) = onnx::OnnxTransducer::load(&files, threads)?;
-        Ok(Box::new(Recognizer::new(model, symbols, search)))
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    if qwen::mlx::MlxQwen::is_checkpoint(dir) {
+        let model = qwen::QwenAsr::new(
+            qwen::mlx::MlxQwen::load(dir)?,
+            dir,
+            qwen::QwenConfig::default(),
+        )?;
+        return Ok(Box::new(model));
+    }
+    #[cfg(feature = "onnx")]
+    {
+        if qwen::ort::QwenFiles::is_qwen(dir) {
+            let files = qwen::ort::QwenFiles::discover(dir)?;
+            let model = qwen::QwenAsr::load_onnx(&files, threads, qwen::QwenConfig::default())?;
+            Ok(Box::new(model))
+        } else {
+            let files = onnx::TransducerFiles::discover(dir, true)?;
+            let (model, symbols) = onnx::OnnxTransducer::load(&files, threads)?;
+            Ok(Box::new(Recognizer::new(model, symbols, search)))
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = (threads, search);
+        Err(crate::Error::Model(format!(
+            "{} is not an MLX Qwen3-ASR checkpoint, and ONNX models are not built in",
+            dir.display()
+        )))
     }
 }
 

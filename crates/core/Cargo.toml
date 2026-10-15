@@ -9,7 +9,12 @@ rust-version.workspace = true
 [features]
 default = []
 # Runs sherpa-onnx transducer and Qwen3-ASR models and Silero VAD through ONNX Runtime, loaded at run time.
-onnx = ["dep:ort", "dep:fancy-regex", "dep:unicode-normalization", "dep:serde_json"]
+onnx = ["dep:ort", "qwen"]
+# Runs Qwen3-ASR MLX checkpoints (mlx-community/Qwen3-ASR-*) on the GPU through MLX. macOS only;
+# elsewhere the feature builds nothing. MLX builds from source, which needs Xcode's Metal compiler.
+mlx = ["dep:mlx-rs", "qwen"]
+# Qwen3-ASR's tokenizer, prompt and decoding, shared by both runtimes.
+qwen = ["dep:fancy-regex", "dep:unicode-normalization", "dep:serde_json"]
 # Rewrites transcripts with an OpenAI-compatible chat completions endpoint.
 http = ["dep:ureq", "dep:serde", "dep:serde_json"]
 
@@ -21,3 +26,6 @@ serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 fancy-regex = { workspace = true, optional = true }
 unicode-normalization = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mlx-rs = { workspace = true, optional = true }

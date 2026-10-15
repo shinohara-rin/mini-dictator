@@ -1,5 +1,6 @@
 #!/bin/sh
-# Builds "Mini Dictator.app" (Apple Silicon) in target/release, with ONNX Runtime in Contents/Frameworks.
+# Builds "Mini Dictator.app" (Apple Silicon) in target/release, with ONNX Runtime in Contents/Frameworks
+# and MLX's Metal kernels (mlx.metallib) in Contents/Resources.
 #
 #   scripts/bundle-macos.sh [version]
 #
@@ -14,7 +15,14 @@ VERSION=${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/macos/Cargo.tom
 APP="$ROOT/target/release/Mini Dictator.app"
 CACHE="$ROOT/target/onnxruntime-$ORT_VERSION"
 
+# MLX compiles its kernels into one metallib, at this path when the build sets it.
+export MLX_RS_METAL_PATH=${MLX_RS_METAL_PATH:-"$ROOT/target/mlx-metal"}
 cargo build --release -p mini-dictator-macos --manifest-path "$ROOT/Cargo.toml"
+if [ ! -f "$MLX_RS_METAL_PATH/mlx.metallib" ]; then
+  # A cached MLX build from before the path was set: build it again to make the metallib.
+  cargo clean --release -p mlx-sys --manifest-path "$ROOT/Cargo.toml"
+  cargo build --release -p mini-dictator-macos --manifest-path "$ROOT/Cargo.toml"
+fi
 
 # The archive's paths start with ./, so unpack into a scratch folder and take the folder inside.
 if [ ! -f "$CACHE/lib/libonnxruntime.$ORT_VERSION.dylib" ]; then
@@ -29,6 +37,7 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 cp "$ROOT/target/release/mini-dictator" "$APP/Contents/MacOS/"
+cp "$MLX_RS_METAL_PATH/mlx.metallib" "$APP/Contents/Resources/"
 
 # The app icon, every size iconutil wants, scaled down from the 1024 px master.
 ICONSET="$ROOT/target/AppIcon.iconset"

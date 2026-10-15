@@ -18,6 +18,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # MLX compiles Metal kernels; newer Xcodes ship the Metal compiler as a separate download.
+      - if: runner.os == 'macOS'
+        run: xcrun --find metal > /dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
