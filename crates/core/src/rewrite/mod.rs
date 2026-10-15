@@ -28,21 +28,24 @@ pub struct RewriteRequest {
     pub preceding_text: String,
     /// Text already inserted in this dictation, so a sentence split by a pause continues.
     pub session_text: String,
+    /// Seconds of silence between `session_text` and this transcript.
+    pub pause_seconds: Option<f32>,
     /// The utterance at 16 kHz, for models that listen as well as read. Empty when not shared.
     pub audio: Vec<f32>,
 }
 
 /// Rewrites a transcript. The HTTP implementation is [`OpenAiCompatible`]; shells can add others.
 pub trait Rewriter: Send + Sync {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String>;
+    /// The rewritten text, or None when no model ran and the plain transcript stands.
+    fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>>;
 }
 
 /// Inserts the plain transcript. Used when no rewrite model is configured.
 pub struct PassThrough;
 
 impl Rewriter for PassThrough {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String> {
-        Ok(request.plain_transcript.clone())
+    fn rewrite(&self, _: &RewriteRequest) -> Result<Option<String>> {
+        Ok(None)
     }
 }
 
@@ -54,6 +57,7 @@ You turn raw speech recognition output into the text the user meant to type.
 - Spans marked [unclear: \"X\", also heard \"Y\"] are where the recognizer was unsure. Pick the reading that fits the context and the screen terms, or keep X.
 - [possibly missed speech] marks audio the recognizer may have skipped. Insert a word there only when the context makes it obvious.
 - Screen terms show how names are spelled where the user is typing. Use their spelling when the speech sounds like them.
+- The user pauses while speaking, and each pause starts a new transcript. When text was already dictated, the transcript continues it. If it continues the same sentence, begin with a lowercase letter unless the first word is a name or \"I\", or with the punctuation that joins it, such as a comma. If it starts a new sentence, begin with a capital letter. A sentence often goes on after a short pause, and a long pause usually ends one. Never repeat the dictated text.
 - When the user dictates formatting, such as \"new line\" or \"bullet point\", apply it.
 - Reply with the final text only, with no quotes or explanation.";
 
@@ -70,6 +74,7 @@ pub fn examples() -> Vec<(RewriteRequest, &'static str)> {
         app: Some(app.into()),
         screen_terms: terms.iter().map(|t| t.to_string()).collect(),
         session_text: session.into(),
+        pause_seconds: (!session.is_empty()).then_some(0.7),
         ..RewriteRequest::default()
     };
     // The last example is the closest to the request, so it is English: a Chinese one there
@@ -131,6 +136,9 @@ pub fn user_prompt(request: &RewriteRequest) -> String {
             "Already dictated in this session:\n<dictated>\n{}\n</dictated>\n",
             request.session_text
         ));
+        if let Some(pause) = request.pause_seconds {
+            prompt.push_str(&format!("Pause before the transcript: {pause:.1} s\n"));
+        }
     }
     prompt.push_str(&format!(
         "Transcript:\n<transcript>\n{}\n</transcript>",

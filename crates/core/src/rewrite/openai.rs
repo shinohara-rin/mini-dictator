@@ -66,7 +66,7 @@ impl OpenAiCompatible {
 }
 
 impl Rewriter for OpenAiCompatible {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String> {
+    fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>> {
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(self.timeout))
             .build()
@@ -98,7 +98,7 @@ impl Rewriter for OpenAiCompatible {
         if text.is_empty() && !request.marked_transcript.trim().is_empty() {
             return Err(Error::Rewrite("the reply has no text".into()));
         }
-        Ok(text)
+        Ok(Some(text))
     }
 }
 

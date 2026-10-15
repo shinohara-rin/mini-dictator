@@ -216,7 +216,7 @@ impl Builtin {
 }
 
 impl Rewriter for Builtin {
-    fn rewrite(&self, request: &RewriteRequest) -> Result<String> {
+    fn rewrite(&self, request: &RewriteRequest) -> Result<Option<String>> {
         OpenAiCompatible {
             base_url: format!("{}/v1", self.base_url()?),
             api_key: None,

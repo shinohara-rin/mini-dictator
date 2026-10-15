@@ -22,11 +22,17 @@ open "target/release/Mini Dictator.app"
 
 Press ⌥Space to start and again to stop, or hold it while you speak. A soft tick plays when the
 microphone opens and a pop when it closes. The first run asks for microphone and accessibility
-permission; accessibility is needed both to read names from the focused window and to paste.
-Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens it): the
-model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite endpoint. Names seen
-on screen in the last few minutes count as well as the current window's; `screen_memory_seconds`
-sets how fast they fade (0 turns the memory off).
+permission; accessibility is needed to see the hotkey, to read names from the focused window, and
+to paste. To pick another hotkey, choose Change Hotkey in the menu, press the new combination, and
+let go; Esc cancels. A hotkey can be a key with modifiers (`Ctrl+Shift+D`), a function key or the
+microphone key alone (`F13`, `Dictation`), or modifiers alone (`RightCmd`), and Option and Command
+can name a side (`RightAlt`).
+Settings live in `~/Library/Application Support/Mini Dictator/config.toml` (the menu opens its
+folder): the model, the hotkey, the sounds (`beep`), the uncertainty samples, and the rewrite
+endpoint. Edits to the file apply on the next launch. Names seen on screen in the last few minutes
+count as well as the current window's; `screen_memory_seconds` sets how fast they fade (0 turns
+the memory off). `sentence_pause_seconds` (1.5): without a rewrite, a shorter pause continues the
+sentence instead of ending it with a period.
 
 The rewrite runs on the Mac by default: the app starts the bundled llama.cpp server with Gemma 4 E2B,
 which reads the transcript and also hears the recording, so it can fix names and words the
