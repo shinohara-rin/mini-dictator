@@ -168,6 +168,11 @@ impl Focus {
         Some(Focus { pid, element })
     }
 
+    /// The focused app's process.
+    pub fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     /// Whether the focus left `before`: another app, or an element that is neither the one focused
     /// before nor inside it. Focus moving inside counts as staying, because a web page reports its
     /// whole area until its tree is built and the field after. Unknown elements count as staying.

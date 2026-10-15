@@ -2,7 +2,8 @@
 //!
 //! Native fields take the text through the accessibility API, at the cursor in one step. Others,
 //! web pages and Electron apps among them, get it typed as Unicode key events, a few characters per
-//! event, with Shift-Return for each line break: chat apps send the message on a plain Return.
+//! event, with Shift-Return for each line break: chat apps send the message on a plain Return. A
+//! terminal runs a command on either, so there a line break is typed as a space.
 //!
 //! Text is inserted only into what had focus when the dictation started. Once the focus moves, the
 //! rest of the dictation is held, and the menu offers it to copy.
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use mini_dictator_core::pipeline::{Delivery, TextSink};
 use mini_dictator_core::{Error, Result};
-use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString, NSRunningApplication};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
 };
@@ -81,10 +82,35 @@ fn press(
     Ok(())
 }
 
-/// Types `text` as Unicode key events.
-fn type_text(text: &str) -> Result<()> {
+/// Terminals, where any Return runs the line typed so far.
+const TERMINALS: [&str; 8] = [
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "com.mitchellh.ghostty",
+    "com.github.wez.wezterm",
+    "org.alacritty",
+    "net.kovidgoyal.kitty",
+    "dev.warp.Warp-Stable",
+    "co.zeit.hyper",
+];
+
+fn is_terminal(pid: libc::pid_t) -> bool {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.bundleIdentifier())
+        .is_some_and(|id| TERMINALS.contains(&id.to_string().as_str()))
+}
+
+/// Types `text` as Unicode key events. In a terminal, line breaks become spaces.
+fn type_text(text: &str, terminal: bool) -> Result<()> {
     // A private source, so the modifiers the user holds, such as a held hotkey, do not join in.
     let source = CGEventSource::new(CGEventSourceStateID::Private);
+    let joined;
+    let text = if terminal {
+        joined = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+        joined.as_str()
+    } else {
+        text
+    };
     for (i, line) in text.split('\n').enumerate() {
         if i > 0 {
             press(source.as_deref(), KEY_RETURN, CGEventFlags::MaskShift, &[])?;
@@ -124,7 +150,8 @@ impl TextSink for InsertSink {
             return Ok(Delivery::Held(reason.clone()));
         }
         if !insert_at_cursor(text) {
-            type_text(text)?;
+            let terminal = self.focus.as_ref().is_some_and(|f| is_terminal(f.pid()));
+            type_text(text, terminal)?;
         }
         Ok(Delivery::Typed)
     }
