@@ -76,6 +76,9 @@ pub struct TimedToken {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Hypothesis {
     pub tokens: Vec<TimedToken>,
+    /// The ids the decoder generated, with the stop it ended on if it stopped, for a backend that
+    /// can score this hypothesis again. Empty when the backend doesn't keep them.
+    pub ids: Vec<u32>,
 }
 
 impl Hypothesis {
@@ -107,6 +110,18 @@ pub trait Asr: Send + Sync {
     /// Uncertainty settings that suit this model's decoding cost and encoder output.
     fn monte_carlo(&self) -> MonteCarloConfig {
         MonteCarloConfig::default()
+    }
+
+    /// Decodes noisy copies of the encoder output that `reference` was decoded from, like
+    /// [`Self::decode`]. A backend may start from the reference to decode them faster.
+    fn decode_noisy(
+        &self,
+        encoders: &[EncoderOutput],
+        bias: &Bias,
+        reference: &Hypothesis,
+    ) -> Result<Vec<Hypothesis>> {
+        let _ = reference;
+        self.decode(encoders, bias)
     }
 
     fn decode_one(&self, encoder: &EncoderOutput, bias: &Bias) -> Result<Hypothesis> {
@@ -301,6 +316,7 @@ impl<M: TransducerModel> Recognizer<M> {
                     log_prob,
                 })
                 .collect(),
+            ids: Vec::new(),
         }
     }
 }
