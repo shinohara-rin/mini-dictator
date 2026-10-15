@@ -19,6 +19,7 @@ use mini_dictator_core::context::{
     ContextProvider, ContextSource, Region, ScreenContext, TextBlock,
 };
 use mini_dictator_core::{Error, Result};
+use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{
     kAXTrustedCheckOptionPrompt, AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted,
     AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
@@ -131,10 +132,19 @@ pub struct FocusedWindow {
 pub fn focused_window() -> Option<FocusedWindow> {
     let system = unsafe { AXUIElement::new_system_wide() };
     unsafe { system.set_messaging_timeout(0.1) };
-    let app = element(&system, "AXFocusedApplication")?;
+    let app = focused_app(&system)?;
     let element = element(&app, "AXFocusedWindow").unwrap_or(app);
     let title = string(&element, "AXTitle").unwrap_or_default();
     Some(FocusedWindow { element, title })
+}
+
+/// The focused application. The system-wide element does not always answer, as on GitHub's macOS
+/// runners while Chrome is in front, so the frontmost app from AppKit stands in.
+fn focused_app(system: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
+    element(system, "AXFocusedApplication").or_else(|| {
+        let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        Some(unsafe { AXUIElement::new_application(app.processIdentifier()) })
+    })
 }
 
 fn attribute(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
@@ -198,8 +208,8 @@ impl ContextProvider for AccessibilityReader {
         let started = Instant::now();
         let system = unsafe { AXUIElement::new_system_wide() };
         unsafe { system.set_messaging_timeout(0.1) };
-        let app = element(&system, "AXFocusedApplication")
-            .ok_or_else(|| Error::Context("no focused application".into()))?;
+        let app =
+            focused_app(&system).ok_or_else(|| Error::Context("no focused application".into()))?;
         // Electron and Chromium build their tree on request. Other apps ignore the attribute.
         set_true(&app, "AXManualAccessibility");
         let names: Vec<CFRetained<CFString>> = NODE_ATTRIBUTES
@@ -209,7 +219,8 @@ impl ContextProvider for AccessibilityReader {
         let names = CFArray::from_retained_objects(&names);
 
         let mut blocks = Vec::new();
-        let focused = element(&system, "AXFocusedUIElement");
+        let focused =
+            element(&system, "AXFocusedUIElement").or_else(|| element(&app, "AXFocusedUIElement"));
         if let Some(text) = focused.as_deref().and_then(text_before_cursor) {
             blocks.push(TextBlock {
                 region: Region::Focused,
@@ -312,6 +323,16 @@ mod tests {
     #[ignore = "needs the page open in Chrome and accessibility permission; run scripts/accessibility-e2e.sh"]
     fn reads_names_from_a_chrome_page() {
         assert!(is_trusted(false), "accessibility permission is not granted");
+        let system = unsafe { AXUIElement::new_system_wide() };
+        let mut value: *const CFType = std::ptr::null();
+        let error = unsafe {
+            system.copy_attribute_value(
+                &CFString::from_str("AXFocusedApplication"),
+                NonNull::from(&mut value),
+            )
+        };
+        drop(NonNull::new(value as *mut CFType).map(|ptr| unsafe { CFRetained::from_raw(ptr) }));
+        println!("system-wide AXFocusedApplication: {error:?}");
         let first = read();
         let second = read();
         let hotwords: Vec<String> = rank_terms(&first, 100)

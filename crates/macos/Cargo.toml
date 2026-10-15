@@ -21,7 +21,7 @@ tray-icon = "0.26"
 cpal = "0.18"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSData", "NSString"] }
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem", "NSSound"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSSound", "NSWorkspace", "libc"] }
 objc2-core-foundation = { version = "0.3", features = ["CFString", "CFArray", "CFDictionary", "CFNumber", "CFCGTypes", "CFMachPort", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", features = ["CGEvent", "CGEventTypes", "CGRemoteOperation", "CGEventSource"] }
 objc2-application-services = { version = "0.3", features = ["HIServices", "AXUIElement", "AXError", "AXValue", "libc"] }
