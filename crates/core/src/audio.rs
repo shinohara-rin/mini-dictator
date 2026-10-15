@@ -15,6 +15,9 @@ pub struct AudioChunk {
     /// When the block's last sample was recorded. The core measures how far behind it is from
     /// this.
     pub captured: Instant,
+    /// The shell was playing a sound of its own while the block was recorded, which the microphone
+    /// may have picked up. Speech cannot start in such a block; speech already going on continues.
+    pub sound_playing: bool,
 }
 
 impl AudioChunk {

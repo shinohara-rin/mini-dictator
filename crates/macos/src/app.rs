@@ -22,7 +22,7 @@ use mini_dictator_core::vad::{EnergyVad, SileroVad};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::config::{debug_log_path, support_dir, Config, APP_NAME};
@@ -33,7 +33,7 @@ use crate::icons::{icon, State};
 use crate::keyboard::{self, Capture, Listener};
 use crate::paste::PasteSink;
 use crate::permissions;
-use crate::sound::{self, Cue};
+use crate::sound::{Cue, Jingle, Level, Sounds};
 use crate::switches::Switchable;
 
 /// A press longer than this is push-to-talk: releasing the key stops the dictation.
@@ -156,7 +156,7 @@ fn performance_cores() -> usize {
 
 struct Dictation {
     /// Dropping it stops the microphone and ends the dictation.
-    stream: Option<cpal::Stream>,
+    stream: Option<crate::audio::Capture>,
     pressed_at: Instant,
 }
 
@@ -168,12 +168,15 @@ struct Ui {
     permissions: MenuItem,
     rewrite: CheckMenuItem,
     screen: CheckMenuItem,
+    echo: CheckMenuItem,
     change_hotkey: MenuItem,
     debug: CheckMenuItem,
+    /// Off, minimal, and verbose, checked like radio buttons.
+    sound_levels: [(Level, CheckMenuItem); 3],
     open_config: MenuItem,
     open_folder: MenuItem,
     quit: MenuItem,
-    beep: bool,
+    sounds: Sounds,
     hotkey: String,
 }
 
@@ -190,8 +193,22 @@ impl Ui {
             None,
         );
         let screen = CheckMenuItem::new("Read Screen for Names", true, config.read_screen, None);
+        let echo = CheckMenuItem::new("Cancel Echo", true, config.echo_cancellation, None);
         let change_hotkey = MenuItem::new(change_label(&config.hotkey), true, None);
         let debug = CheckMenuItem::new("Write Debug Log", true, config.debug, None);
+        let level = config.sound_level();
+        let sound_levels = [
+            (Level::Off, "Off"),
+            (Level::Minimal, "Microphone Only"),
+            (Level::Verbose, "Every Step"),
+        ]
+        .map(|(l, label)| (l, CheckMenuItem::new(label, true, l == level, None)));
+        let sounds_menu = Submenu::with_items(
+            "Sounds",
+            true,
+            &[&sound_levels[0].1, &sound_levels[1].1, &sound_levels[2].1],
+        )
+        .expect("sounds menu");
         let open_config = MenuItem::new("Open Settings Folder…", true, None);
         let open_folder = MenuItem::new("Open Models Folder…", true, None);
         let quit = MenuItem::new(format!("Quit {APP_NAME}"), true, None);
@@ -205,8 +222,10 @@ impl Ui {
             &separator,
             &rewrite,
             &screen,
+            &echo,
             &change_hotkey,
             &debug,
+            &sounds_menu,
             &PredefinedMenuItem::separator(),
             &open_config,
             &open_folder,
@@ -228,12 +247,14 @@ impl Ui {
             permissions,
             rewrite,
             screen,
+            echo,
             change_hotkey,
             debug,
+            sound_levels,
             open_config,
             open_folder,
             quit,
-            beep: config.beep,
+            sounds: Sounds::new(level),
             hotkey: config.hotkey.clone(),
         }
     }
@@ -252,8 +273,23 @@ impl Ui {
     }
 
     fn cue(&self, cue: Cue) {
-        if self.beep {
-            sound::play(cue);
+        self.sounds.cue(cue);
+    }
+
+    fn jingle(&self, jingle: Jingle) {
+        self.sounds.jingle(jingle);
+    }
+
+    /// Checks the chosen level only, and plays a sample of it.
+    fn pick_sounds(&self, level: Level) {
+        for (l, item) in &self.sound_levels {
+            item.set_checked(*l == level);
+        }
+        self.sounds.set_level(level);
+        match level {
+            Level::Off => {}
+            Level::Minimal => self.cue(Cue::Start),
+            Level::Verbose => self.jingle(Jingle::Ready),
         }
     }
 }
@@ -334,6 +370,9 @@ pub fn run() {
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
+    // The last segment already played "hm-hm?" or "pfff", so the typed sparkle, landing right on
+    // top of it, would add nothing.
+    let mut cued_segment = false;
     let mut capture: Option<Capture> = None;
     let mut recording: u64 = 0;
     // Shared with the memory sampler, which pauses while a dictation reads the screen itself.
@@ -381,11 +420,13 @@ pub fn run() {
                         switches = Some(found);
                         ui.toggle.set_enabled(true);
                         ui.show(State::Idle, "Ready");
+                        ui.jingle(Jingle::Ready);
                     }
                     Err(error) => {
                         eprintln!("model: {error}");
                         debug_log::write(&format!("model: {error}"));
                         ui.show(State::Error, &shorten(&format!("Model: {error}"), 60));
+                        ui.jingle(Jingle::Error);
                     }
                 }
             }
@@ -469,6 +510,12 @@ pub fn run() {
                     }
                 } else if event.id == ui.debug.id() {
                     debug_log::set_enabled(ui.debug.is_checked());
+                } else if let Some((level, _)) = ui
+                    .sound_levels
+                    .iter()
+                    .find(|(_, item)| event.id == *item.id())
+                {
+                    ui.pick_sounds(*level);
                 } else if event.id == ui.open_config.id() {
                     open(&support_dir());
                 } else if event.id == ui.open_folder.id() {
@@ -484,11 +531,24 @@ pub fn run() {
                         State::Listening,
                         &format!("Listening ({hotwords} names on screen)"),
                     ),
+                    CoreEvent::Heard { .. } => ui.jingle(Jingle::Heard),
                     CoreEvent::Transcribed {
+                        plain,
                         unclear_spans,
                         behind_seconds,
                         ..
                     } => {
+                        if behind_seconds.is_some() {
+                            ui.jingle(Jingle::CatchingUp);
+                        }
+                        cued_segment = true;
+                        if unclear_spans > 0 {
+                            ui.jingle(Jingle::Unclear);
+                        } else if mini_dictator_core::pipeline::is_nothing(&plain) {
+                            ui.jingle(Jingle::Nothing);
+                        } else {
+                            cued_segment = false;
+                        }
                         let state = if dictation.is_some() {
                             State::Listening
                         } else {
@@ -501,15 +561,20 @@ pub fn run() {
                         ui.show(state, &status);
                     }
                     // The period typed when a dictation ends keeps the preview of its text.
-                    CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => ui
-                        .last
-                        .set_text(format!("Last: {}", shorten(text.trim(), 40))),
+                    CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => {
+                        ui.last
+                            .set_text(format!("Last: {}", shorten(text.trim(), 40)));
+                        if !cued_segment {
+                            ui.jingle(Jingle::Typed);
+                        }
+                    }
                     CoreEvent::Inserted { .. } => {}
                     CoreEvent::Warning(warning) => {
                         eprintln!("warning: {warning}");
                         debug_log::write(&format!("warning: {warning}"));
                         ui.last
                             .set_text(shorten(&format!("Warning: {warning}"), 60));
+                        ui.jingle(Jingle::Warning);
                     }
                     // The worker writes these to the log itself.
                     CoreEvent::Debug(_) | CoreEvent::Finished => {}
@@ -559,6 +624,7 @@ pub fn run() {
                 dictating.store(false, Ordering::Relaxed);
                 let Some(ui) = &ui else { return };
                 // The dictation failed while the microphone was on: stop recording.
+                ui.sounds.set_echo_output(None);
                 if dictation.take().is_some() {
                     ui.toggle.set_text(start_label(&ui.hotkey));
                     ui.cue(Cue::Stop);
@@ -568,6 +634,7 @@ pub fn run() {
                         eprintln!("dictation: {error}");
                         debug_log::write(&format!("dictation failed: {error}"));
                         ui.show(State::Error, &shorten(&format!("Error: {error}"), 60));
+                        ui.jingle(Jingle::Error);
                     }
                     None => ui.show(State::Idle, "Ready"),
                 }
@@ -625,10 +692,21 @@ fn start(
     ui: &Ui,
 ) -> Option<Dictation> {
     let (sender, receiver) = mpsc::channel();
-    let stream = match crate::audio::start(sender) {
-        Ok(stream) => stream,
+    let playback = ui.sounds.playback();
+    let stream = match crate::audio::start(sender, playback.clone(), ui.echo.is_checked()) {
+        Ok((stream, fallback)) => {
+            if let Some(error) = fallback {
+                eprintln!("echo cancellation: {error}");
+                debug_log::write(&format!("echo cancellation off: {error}"));
+                ui.last
+                    .set_text(shorten(&format!("Echo cancellation off: {error}"), 60));
+            }
+            ui.sounds.set_echo_output(stream.echo_output());
+            stream
+        }
         Err(error) => {
             ui.show(State::Error, &shorten(&format!("Microphone: {error}"), 60));
+            ui.jingle(Jingle::Error);
             return None;
         }
     };
@@ -647,7 +725,11 @@ fn start(
             }
         };
         debug_log::write("dictation started");
-        let result = match vad_path.map(|p| SileroVad::load(&p)) {
+        let vad = vad_path.map(|p| SileroVad::load(&p));
+        // The loudness detector takes any of the app's cues for speech, not only the voice-like
+        // ones Silero does.
+        playback.mark_every_cue(!matches!(vad, Some(Ok(_))));
+        let result = match vad {
             Some(Ok(vad)) => run_dictation(&engine, vad, receiver, &mut sink, &mut forward),
             Some(Err(error)) => {
                 forward(CoreEvent::Warning(format!(
@@ -682,6 +764,7 @@ fn start(
 
 fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
     if let Some(mut current) = dictation.take() {
+        ui.sounds.set_echo_output(None);
         current.stream.take();
         ui.cue(Cue::Stop);
         ui.toggle.set_text(start_label(&ui.hotkey));

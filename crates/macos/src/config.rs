@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use mini_dictator_core::join::JoinConfig;
 use serde::{Deserialize, Serialize};
 
+use crate::sound::Level;
+
 pub const APP_NAME: &str = "Mini Dictator";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,13 +25,24 @@ pub struct Config {
     pub hotkey: String,
     /// Read the focused window for hotwords.
     pub read_screen: bool,
+    /// Record through macOS voice processing, which takes the app's own cues out of the
+    /// microphone, so they are not dictated and words spoken over them are kept. It also turns
+    /// down other apps' audio while recording. The menu changes it for the next dictation.
+    pub echo_cancellation: bool,
     /// Remember names seen on screen for about this long (the half-life of their weight), sampling
     /// the focused window every few seconds between dictations. 0 turns the memory off.
     pub screen_memory_seconds: u64,
     /// Send the text before the cursor to the rewrite model.
     pub share_screen_text: bool,
-    /// Play a short sound when the microphone opens and closes.
-    pub beep: bool,
+    /// `"off"`, `"minimal"` (a sound when the microphone opens and closes), or `"verbose"` (also a
+    /// cue for each segment heard, unclear words, nothing heard, catching up, text typed, and
+    /// errors). The menu changes it until the app quits.
+    // A config written before this field keeps its own setting, not the new default.
+    #[serde(default)]
+    pub sounds: Option<Level>,
+    /// The older switch for the microphone sounds, read when `sounds` is not set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beep: Option<bool>,
     /// Write `debug.log` next to this file: the screen text and hotwords, each decode and its
     /// uncertainty check, the rewrite prompt and reply, and timings. The menu turns it on and off
     /// until the app quits.
@@ -74,9 +87,11 @@ impl Default for Config {
             onnxruntime: None,
             hotkey: "Alt+Space".into(),
             read_screen: true,
+            echo_cancellation: true,
             screen_memory_seconds: 60,
             share_screen_text: true,
-            beep: true,
+            sounds: Some(Level::Verbose),
+            beep: None,
             debug: false,
             sentence_pause_seconds: JoinConfig::default().sentence_pause_seconds,
             uncertainty: Uncertainty::default(),
@@ -224,6 +239,15 @@ impl Config {
         path.to_path_buf()
     }
 
+    /// `sounds`, else `beep` from a config written before it, else the minimal sounds that config
+    /// had.
+    pub fn sound_level(&self) -> Level {
+        self.sounds.unwrap_or(match self.beep {
+            Some(false) => Level::Off,
+            _ => Level::Minimal,
+        })
+    }
+
     /// ONNX Runtime: the config, then `ORT_DYLIB_PATH`, then the app bundle's Frameworks folder.
     pub fn onnxruntime_path(&self) -> Option<PathBuf> {
         if let Some(path) = self
@@ -280,7 +304,21 @@ mod tests {
         let config: Config = toml::from_str(&updated).unwrap();
         assert_eq!(config.hotkey, "F5");
         assert_eq!(config.rewrite.model, "x");
-        assert!(!config.beep);
+        assert_eq!(config.sound_level(), Level::Off);
+    }
+
+    #[test]
+    fn sounds_win_over_the_older_beep_switch() {
+        let level = |text| toml::from_str::<Config>(text).unwrap().sound_level();
+        assert_eq!(
+            level("sounds = \"verbose\"\nbeep = false\n"),
+            Level::Verbose
+        );
+        assert_eq!(level("beep = true\n"), Level::Minimal);
+        assert_eq!(level("beep = false\n"), Level::Off);
+        // A config from before either switch had the microphone sounds.
+        assert_eq!(level(""), Level::Minimal);
+        assert_eq!(Config::default().sound_level(), Level::Verbose);
     }
 
     #[test]
