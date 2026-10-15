@@ -366,6 +366,9 @@ pub fn run() {
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
+    // The last segment played "hm-hm?", which already says text is coming: its typed sparkle,
+    // right on top of it, would add nothing.
+    let mut unclear_segment = false;
     let mut capture: Option<Capture> = None;
     let mut recording: u64 = 0;
     // Shared with the memory sampler, which pauses while a dictation reads the screen itself.
@@ -534,7 +537,8 @@ pub fn run() {
                         if behind_seconds.is_some() {
                             ui.jingle(Jingle::CatchingUp);
                         }
-                        if unclear_spans > 0 {
+                        unclear_segment = unclear_spans > 0;
+                        if unclear_segment {
                             ui.jingle(Jingle::Unclear);
                         } else if plain.trim().is_empty() {
                             ui.jingle(Jingle::Nothing);
@@ -554,7 +558,9 @@ pub fn run() {
                     CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => {
                         ui.last
                             .set_text(format!("Last: {}", shorten(text.trim(), 40)));
-                        ui.jingle(Jingle::Typed);
+                        if !unclear_segment {
+                            ui.jingle(Jingle::Typed);
+                        }
                     }
                     CoreEvent::Inserted { .. } => {}
                     CoreEvent::Warning(warning) => {
