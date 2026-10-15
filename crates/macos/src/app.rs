@@ -301,6 +301,13 @@ fn change_label(hotkey: &str) -> String {
     format!("Change Hotkey ({hotkey})…")
 }
 
+/// A transcript with nothing but full stops, which the recognizer gives for a cough or a breath.
+fn heard_nothing(plain: &str) -> bool {
+    plain
+        .chars()
+        .all(|c| c.is_whitespace() || matches!(c, '.' | '。'))
+}
+
 fn shorten(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
@@ -366,9 +373,9 @@ pub fn run() {
     let mut switches: Option<Switches> = None;
     let mut dictation: Option<Dictation> = None;
     let mut busy = false;
-    // The last segment played "hm-hm?", which already says text is coming: its typed sparkle,
-    // right on top of it, would add nothing.
-    let mut unclear_segment = false;
+    // The last segment already played "hm-hm?" or "pfff", so the typed sparkle, landing right on
+    // top of it, would add nothing.
+    let mut cued_segment = false;
     let mut capture: Option<Capture> = None;
     let mut recording: u64 = 0;
     // Shared with the memory sampler, which pauses while a dictation reads the screen itself.
@@ -537,11 +544,13 @@ pub fn run() {
                         if behind_seconds.is_some() {
                             ui.jingle(Jingle::CatchingUp);
                         }
-                        unclear_segment = unclear_spans > 0;
-                        if unclear_segment {
+                        cued_segment = true;
+                        if unclear_spans > 0 {
                             ui.jingle(Jingle::Unclear);
-                        } else if plain.trim().is_empty() {
+                        } else if heard_nothing(&plain) {
                             ui.jingle(Jingle::Nothing);
+                        } else {
+                            cued_segment = false;
                         }
                         let state = if dictation.is_some() {
                             State::Listening
@@ -558,7 +567,7 @@ pub fn run() {
                     CoreEvent::Inserted { text } if text.chars().any(char::is_alphanumeric) => {
                         ui.last
                             .set_text(format!("Last: {}", shorten(text.trim(), 40)));
-                        if !unclear_segment {
+                        if !cued_segment {
                             ui.jingle(Jingle::Typed);
                         }
                     }
@@ -752,5 +761,20 @@ fn stop(dictation: &mut Option<Dictation>, ui: &Ui) {
         ui.cue(Cue::Stop);
         ui.toggle.set_text(start_label(&ui.hotkey));
         ui.show(State::Working, "Finishing…");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::heard_nothing;
+
+    #[test]
+    fn a_lone_full_stop_is_heard_as_nothing() {
+        for plain in ["", " ", ".", "。", " . ", "。。"] {
+            assert!(heard_nothing(plain), "{plain:?}");
+        }
+        for plain in ["Hi.", "はい。", "?", "..a"] {
+            assert!(!heard_nothing(plain), "{plain:?}");
+        }
     }
 }
