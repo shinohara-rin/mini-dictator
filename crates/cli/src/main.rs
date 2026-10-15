@@ -290,8 +290,8 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let pause_seconds = session.joiner.pause_before(segment);
         let mut text = transcript.reference.text();
         let mut rewritten = false;
+        let request = engine.rewrite_request(&transcript, &session, pause_seconds);
         if args.rewrite_url.is_some() {
-            let request = engine.rewrite_request(&transcript, &session, pause_seconds);
             let started = Instant::now();
             match engine.rewriter.rewrite(&request) {
                 Ok(Some(reply)) => {
@@ -304,12 +304,21 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !text.trim().is_empty() {
-            let piece = Piece {
+            let mut piece = Piece {
                 rewritten,
                 text: &text,
                 pause_seconds,
                 names: &session.hotwords,
+                ends_sentence: None,
             };
+            if args.rewrite_url.is_some()
+                && session
+                    .joiner
+                    .would_type_period(&session.inserted, &piece, &engine.config.join)
+            {
+                piece.ends_sentence = engine.ends_sentence(&request, &mut |_| {});
+                println!("  complete sentence before: {:?}", piece.ends_sentence);
+            }
             let joined = session
                 .joiner
                 .join(&session.inserted, &piece, &engine.config.join);

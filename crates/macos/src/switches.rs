@@ -43,4 +43,11 @@ impl Rewriter for Switchable<Option<Box<dyn Rewriter>>> {
             _ => Ok(None),
         }
     }
+
+    fn ends_sentence(&self, text: &str) -> Result<Option<bool>> {
+        match (&self.inner, self.on()) {
+            (Some(rewriter), true) => rewriter.ends_sentence(text),
+            _ => Ok(None),
+        }
+    }
 }

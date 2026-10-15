@@ -36,6 +36,9 @@ pub struct Piece<'a> {
     pub rewritten: bool,
     /// Words whose capitals are kept, such as names from the screen.
     pub names: &'a [String],
+    /// Whether the text before this piece ends a sentence, as a model judged it. `Some(false)`
+    /// keeps a held period from being typed: the piece continues the sentence.
+    pub ends_sentence: Option<bool>,
 }
 
 /// What one dictation has typed, for joining the next piece.
@@ -50,6 +53,20 @@ pub struct Joiner {
 }
 
 impl Joiner {
+    /// Whether a period is held, to be typed if the next piece starts a new sentence.
+    pub fn holds_period(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Whether joining `piece` would type the held period, so a model's judgment of the text
+    /// before could keep it back.
+    pub fn would_type_period(&self, typed: &str, piece: &Piece, config: &JoinConfig) -> bool {
+        let (body, _, _) = split_final_period(piece.text.trim());
+        self.holds_period()
+            && piece.pause_seconds.is_some()
+            && !continues(typed, body, piece, config)
+    }
+
     /// The silence before `segment`'s speech, not counting the audio the segmenter keeps around it.
     pub fn pause_before(&self, segment: &SpeechSegment) -> Option<f32> {
         let start = segment.speech_start();
@@ -66,29 +83,11 @@ impl Joiner {
     /// sentence, a separating space, and the piece without its own final period.
     pub fn join(&mut self, typed: &str, piece: &Piece, config: &JoinConfig) -> String {
         let (body, period, closing) = split_final_period(piece.text.trim());
-        let continues = piece.pause_seconds.is_some_and(|pause| {
-            // An opening quote or bracket says nothing; the letter after it does.
-            let first = skip_lead_in(body).chars().next();
-            if body.chars().next().is_some_and(is_joining_punctuation)
-                || first.is_some_and(char::is_lowercase)
-            {
-                true
-            } else if piece.rewritten
-                && first.is_some_and(char::is_uppercase)
-                && !keeps_capital(first_word(body), piece.names)
-            {
-                // "I", a name, or an acronym keeps its capital mid-sentence, so only the pause
-                // can tell.
-                false
-            } else {
-                // A question or exclamation already ended its sentence.
-                let ended = typed
-                    .trim_end()
-                    .trim_end_matches(is_closing_punctuation)
-                    .ends_with(['?', '!', '？', '！']);
-                !ended && pause < config.sentence_pause_seconds
-            }
-        });
+        let continues = continues(typed, body, piece, config);
+        // The text before is not a sentence yet, whatever the piece's capital says.
+        let unfinished =
+            !continues && piece.pause_seconds.is_some() && piece.ends_sentence == Some(false);
+        let continues = continues || unfinished;
         let mut text = if continues {
             std::mem::take(&mut self.closing)
         } else {
@@ -101,7 +100,7 @@ impl Joiner {
             .strip_suffix('.')
             .and_then(|t| t.rsplit(char::is_whitespace).next())
             .is_some_and(is_title);
-        let body = if continues && !piece.rewritten && !after_title {
+        let body = if continues && (!piece.rewritten || unfinished) && !after_title {
             lowercase_first_word(body, piece.names)
         } else {
             body.to_owned()
@@ -127,6 +126,34 @@ impl Joiner {
         let closing = std::mem::take(&mut self.closing);
         format!("{}{closing}", std::mem::take(&mut self.held))
     }
+}
+
+/// Whether `piece`, whose text without its final period is `body`, goes on with the sentence of
+/// `typed`, by its first letter and the pause. A model's judgment of `typed` is not counted.
+fn continues(typed: &str, body: &str, piece: &Piece, config: &JoinConfig) -> bool {
+    piece.pause_seconds.is_some_and(|pause| {
+        // An opening quote or bracket says nothing; the letter after it does.
+        let first = skip_lead_in(body).chars().next();
+        if body.chars().next().is_some_and(is_joining_punctuation)
+            || first.is_some_and(char::is_lowercase)
+        {
+            true
+        } else if piece.rewritten
+            && first.is_some_and(char::is_uppercase)
+            && !keeps_capital(first_word(body), piece.names)
+        {
+            // "I", a name, or an acronym keeps its capital mid-sentence, so only the pause
+            // can tell.
+            false
+        } else {
+            // A question or exclamation already ended its sentence.
+            let ended = typed
+                .trim_end()
+                .trim_end_matches(is_closing_punctuation)
+                .ends_with(['?', '!', '？', '！']);
+            !ended && pause < config.sentence_pause_seconds
+        }
+    })
 }
 
 /// Splits off a final period, Latin or CJK, with any closing quotes or brackets after it:
@@ -281,6 +308,7 @@ mod tests {
                 pause_seconds: (i > 0).then_some(*pause),
                 rewritten,
                 names: &names,
+                ends_sentence: None,
             };
             let text = joiner.join(&typed, &piece, &JoinConfig::default());
             typed.push_str(&text);
@@ -399,6 +427,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unfinished_sentence_keeps_its_period_back() {
+        let config = JoinConfig::default();
+        let piece = |text, ends_sentence| Piece {
+            text,
+            pause_seconds: Some(2.0),
+            rewritten: true,
+            names: &[],
+            ends_sentence,
+        };
+        let mut joiner = Joiner::default();
+        let first = Piece {
+            pause_seconds: None,
+            ..piece("If we can.", None)
+        };
+        let mut typed = joiner.join("", &first, &config);
+        assert!(joiner.would_type_period(&typed, &piece("Use it.", None), &config));
+        assert!(!joiner.would_type_period(&typed, &piece("and more.", None), &config));
+        // A long pause and a capital would end the sentence; the model says it is not done.
+        typed += &joiner.join(
+            &typed,
+            &piece("Use speculative decoding.", Some(false)),
+            &config,
+        );
+        assert_eq!(typed, "If we can use speculative decoding");
+        typed += &joiner.join(&typed, &piece("It works.", Some(true)), &config);
+        typed += &joiner.finish();
+        assert_eq!(typed, "If we can use speculative decoding. It works.");
+    }
+
+    #[test]
     fn questions_and_ellipses_are_typed_at_once() {
         let mut joiner = Joiner::default();
         let piece = |text| Piece {
@@ -406,6 +464,7 @@ mod tests {
             pause_seconds: None,
             rewritten: false,
             names: &[],
+            ends_sentence: None,
         };
         let config = JoinConfig::default();
         assert_eq!(joiner.join("", &piece("Ready?"), &config), "Ready?");

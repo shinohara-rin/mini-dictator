@@ -316,12 +316,19 @@ impl Engine {
         if text.trim().is_empty() {
             return Ok(None);
         }
-        let piece = Piece {
+        let mut piece = Piece {
             rewritten,
             text: &text,
             pause_seconds,
             names: &session.hotwords,
+            ends_sentence: None,
         };
+        if session
+            .joiner
+            .would_type_period(&session.inserted, &piece, &self.config.join)
+        {
+            piece.ends_sentence = self.ends_sentence(&request, events);
+        }
         let before = session.joiner.clone();
         let text = session
             .joiner
@@ -333,6 +340,31 @@ impl Engine {
             session.joiner = before;
         }
         inserted
+    }
+
+    /// Asks the rewrite model whether the text before the cursor is a complete sentence, before a
+    /// held period is typed. None when no model answers.
+    pub fn ends_sentence(
+        &self,
+        request: &RewriteRequest,
+        events: &mut dyn FnMut(Event),
+    ) -> Option<bool> {
+        let before = tail(
+            &format!("{}{}", request.preceding_text, request.session_text),
+            self.config.preceding_chars,
+        );
+        let started = Instant::now();
+        let answer = self.rewriter.ends_sentence(&before);
+        if self.debug() {
+            events(Event::Debug(format!(
+                "complete sentence in {}: {answer:?} for {before:?}",
+                ms(started.elapsed())
+            )));
+        }
+        answer.unwrap_or_else(|error| {
+            events(Event::Warning(error.to_string()));
+            None
+        })
     }
 
     /// Types the period held back from the last segment. Call it when the dictation ends.
