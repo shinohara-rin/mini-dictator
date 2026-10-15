@@ -3,7 +3,8 @@
 A minimal AI dictation app: a tray icon, a hotkey, and your words in the focused app.
 
 The core does VAD gating, speech recognition biased toward the terms on your screen (Qwen3-ASR 0.6B
-by default, about 30 languages; sherpa-onnx transducers also work), uncertainty estimation by Monte
+by default, about 30 languages, on the GPU through MLX on a Mac and through ONNX Runtime elsewhere;
+sherpa-onnx transducers also work), uncertainty estimation by Monte
 Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](docs/architecture.md).
 
 ## Status
@@ -15,10 +16,15 @@ Carlo over the encoder output, and an LLM rewrite. See [docs/architecture.md](do
 ## macOS
 
 ```sh
-scripts/fetch-models.sh      # Qwen3-ASR 0.6B (about 1 GB) and Silero VAD into ~/Library/Application Support/Mini Dictator/models
-scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime inside
+scripts/fetch-models.sh      # Qwen3-ASR 0.6B for MLX (about 700 MB) and Silero VAD into ~/Library/Application Support/Mini Dictator/models
+scripts/bundle-macos.sh      # builds target/release/Mini Dictator.app with ONNX Runtime and MLX's Metal kernels inside
 open "target/release/Mini Dictator.app"
 ```
+
+Building needs Xcode (MLX compiles its Metal kernels with it; on Xcode 26, run
+`xcodebuild -downloadComponent MetalToolchain` once) and CMake. A config written before MLX points
+`model_dir` at the ONNX export, which still works on the CPU; set
+`model_dir = "models/Qwen3-ASR-0.6B-4bit"` to run on the GPU.
 
 Press ⌥Space to start and again to stop, or hold it while you speak. A soft tick plays when the
 microphone opens and a pop when it closes. With Sounds set to Every Step (`sounds = "verbose"`, the
@@ -60,7 +66,9 @@ cargo run --release -p mini-dictator-cli -- \
   --wav models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/test_wavs/ru1.wav
 ```
 
-The `--model` directory decides the backend. With a transducer such as
+The `--model` directory decides the backend. On a Mac, an MLX checkpoint such as
+`models/Qwen3-ASR-0.6B-4bit` (what `fetch-models.sh` downloads there; `MODEL=sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25`
+fetches the ONNX export instead) runs on the GPU. With a transducer such as
 `sherpa-onnx-zipformer-en-2023-06-26`, `--beam` and `--boost` tune the hotword search.
 
 Add `--rewrite-url https://api.openai.com/v1 --rewrite-model <model>` with `MD_API_KEY` set to run

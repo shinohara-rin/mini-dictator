@@ -56,7 +56,7 @@ sentence starts or the hotkey is released.
 | `audio` | Mono 16 kHz conversion | `AudioChunk`, `Resampler` |
 | `vad` | Speech gating with hysteresis, pre-roll, hangover, max length | `VoiceActivityDetector`, `Segmenter`, `SpeechSegment`, `SileroVad` (v4 and v5), `EnergyVad` |
 | `features` | Kaldi-compatible 80-bin fbank for transducers, Whisper's 128-bin log mel for Qwen3-ASR | `Fbank`, `WhisperMel`, `Features` |
-| `asr` | The recognizer interface and its two backends | `Asr`, `Bias`, `load`; `QwenAsr`, `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer` |
+| `asr` | The recognizer interface and its two backends | `Asr`, `Bias`, `load`; `QwenAsr`, `QwenModel` (`OrtQwen`, `MlxQwen`), `BpeTokenizer`; `TransducerModel`, `Recognizer`, `ContextGraph`, `OnnxTransducer` |
 | `uncertainty` | Monte Carlo over encoder output, span analysis | `MonteCarloConfig`, `estimate`, `analyze`, `format_for_llm` |
 | `context` | Screen text model and hotword ranking | `ContextProvider`, `ScreenContext`, `TextBlock`, `Region`, `FallbackProvider`, `rank_terms` |
 | `rewrite` | LLM post-processing | `Rewriter`, `RewriteRequest`, `OpenAiCompatible`, `PassThrough` |
@@ -64,7 +64,8 @@ sentence starts or the hotkey is released.
 | `pipeline` | One dictation, end to end | `Engine`, `run_dictation`, `TextSink`, `Event` |
 
 Default features need no native code, so `cargo test` runs anywhere. `onnx` adds ONNX Runtime
-(loaded at run time from a bundled shared library). `http` adds the rewrite client.
+(loaded at run time from a bundled shared library). `mlx` adds MLX on macOS, built from source with
+its Metal kernels in one `mlx.metallib` that the app bundles. `http` adds the rewrite client.
 
 ### Two recognizers
 
@@ -72,8 +73,19 @@ The pipeline drives an `Asr`: `encode` once per segment, then `decode` a batch o
 with a `Bias` built from the screen terms. `asr::load` picks the backend from the model directory.
 
 **Qwen3-ASR 0.6B** is the default. It is an audio encoder in front of a Qwen3 LLM and covers about 30
-languages and Chinese dialects, with punctuation and casing. The core runs the sherpa-onnx export
-(`conv_frontend.onnx`, `encoder.int8.onnx`, `decoder.int8.onnx`) itself:
+languages and Chinese dialects, with punctuation and casing. `QwenAsr` holds the prompt, decoding and
+transcript parsing, and a `QwenModel` runs the networks in one of two runtimes:
+
+- On macOS, `MlxQwen` runs the MLX checkpoint `mlx-community/Qwen3-ASR-0.6B-4bit` on the GPU: 4-bit
+  decoder weights, a bfloat16 audio encoder. It follows the native MLX runtime of sglang-omni, which
+  Voxt uses for the same checkpoint (same layers, 100-frame conv chunks, attention within 8-chunk
+  windows), written in Rust on mlx-rs. Picks and their log probabilities come off the GPU, not the
+  logits. Its decoder quantizes weights only, so unlike the int8 export a row's result does not
+  depend on the rest of its batch.
+- Elsewhere, `OrtQwen` runs the sherpa-onnx export (`conv_frontend.onnx`, `encoder.int8.onnx`,
+  `decoder.int8.onnx`) through ONNX Runtime.
+
+Both read the same features and prompt:
 
 - Whisper features (`WhisperMel`, within 3e-5 of Hugging Face's extractor), the 8x conv frontend in
   100-frame chunks, and the encoder with a mask of the valid audio tokens (12.5 per second).
@@ -90,7 +102,7 @@ languages and Chinese dialects, with punctuation and casing. The core runs the s
 - The decoder gives no token times, so a hypothesis is a list of words (CJK characters and
   punctuation on their own), which keeps uncertainty from comparing BPE pieces.
 
-The int8 decoder quantizes activations per call, so a row's result depends slightly on the other rows
+The int8 ONNX decoder quantizes activations per call, so a row's result depends slightly on the other rows
 of its batch. The clean decode therefore runs alone, and noisy decodes batch among themselves.
 
 **Transducers** (sherpa-onnx zipformers) remain as a small, fast fallback for one language.

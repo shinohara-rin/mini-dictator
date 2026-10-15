@@ -12,8 +12,8 @@ pub const APP_NAME: &str = "Mini Dictator";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// A sherpa-onnx Qwen3-ASR export or offline transducer directory. Relative paths start at the
-    /// support directory.
+    /// An MLX checkpoint of Qwen3-ASR (run on the GPU), or a sherpa-onnx Qwen3-ASR export or offline
+    /// transducer directory (run on the CPU). Relative paths start at the support directory.
     pub model_dir: PathBuf,
     /// Silero VAD. Without it, a loudness detector gates the audio.
     pub vad_model: Option<PathBuf>,
@@ -82,7 +82,7 @@ pub struct Rewrite {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_dir: PathBuf::from("models/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25"),
+            model_dir: PathBuf::from("models/Qwen3-ASR-0.6B-4bit"),
             vad_model: Some(PathBuf::from("models/silero_vad.onnx")),
             onnxruntime: None,
             hotkey: "Alt+Space".into(),

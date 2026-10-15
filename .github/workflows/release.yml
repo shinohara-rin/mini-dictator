@@ -14,6 +14,8 @@ on:
 
 env:
   TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  # Where MLX puts its Metal kernels on macOS, for the packaging scripts to copy.
+  MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
 
 permissions:
   contents: read
@@ -70,7 +72,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # MLX compiles Metal kernels; newer Xcodes ship the Metal compiler as a separate download.
+      - if: runner.os == 'macOS'
+        run: xcrun --find metal > /dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
       - run: cargo build --release --locked -p mini-dictator-cli
+      # A cached MLX build from before MLX_RS_METAL_PATH was set has no metallib there.
+      - if: runner.os == 'macOS'
+        run: |
+          [ -f "$MLX_RS_METAL_PATH/mlx.metallib" ] || {
+            cargo clean --release -p mlx-sys
+            cargo build --release --locked -p mini-dictator-cli
+          }
       - run: sh scripts/package-cli.sh ${{ matrix.platform }} "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
@@ -87,6 +99,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # MLX compiles Metal kernels; newer Xcodes ship the Metal compiler as a separate download.
+      - if: runner.os == 'macOS'
+        run: xcrun --find metal > /dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
       - run: sh scripts/bundle-macos.sh "$VERSION"
       # ditto keeps the bundle's symlinks and signature intact, unlike zip.
       - name: Package

@@ -1,10 +1,12 @@
 #!/bin/sh
-# Packages the `md` CLI with ONNX Runtime beside it, so it runs without --ort.
+# Packages the `md` CLI with ONNX Runtime beside it, so it runs without --ort, and on macOS with MLX's
+# Metal kernels (mlx.metallib) beside it too.
 #
 #   scripts/package-cli.sh <linux-x64 | osx-arm64 | win-x64> [version]
 #
 # Writes target/dist/md-<version>-<platform>.tar.gz (a .zip on Windows). Run it after
-# `cargo build --release -p mini-dictator-cli`.
+# `cargo build --release -p mini-dictator-cli`; on macOS, build with MLX_RS_METAL_PATH set to
+# target/mlx-metal (or set it the same for both), so the metallib lands where this script finds it.
 set -eu
 
 ORT_VERSION=1.31.0
@@ -44,6 +46,7 @@ case $PLATFORM in
   osx-*)
     cp "$ROOT/target/release/md" "$STAGE/"
     cp "$CACHE/lib/libonnxruntime.$ORT_VERSION.dylib" "$STAGE/libonnxruntime.dylib"
+    cp "${MLX_RS_METAL_PATH:-$ROOT/target/mlx-metal}/mlx.metallib" "$STAGE/"
     ;;
   *)
     cp "$ROOT/target/release/md" "$STAGE/"
