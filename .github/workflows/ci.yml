@@ -23,12 +23,18 @@ jobs:
       - run: cargo test --workspace --all-features
 
   # Plays LibriSpeech clips through a mock microphone into the real pipeline (Silero VAD, Qwen3-ASR,
-  # the uncertainty check) and checks the typed text against the transcripts.
+  # the uncertainty check) and checks the typed text against the transcripts. It then packages the
+  # `md` CLI, and on macOS the app, from the same release build and uploads them as the run's
+  # artifacts, so every pull request can be tried without publishing a release.
   e2e:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: macos-latest
+            platform: osx-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +47,26 @@ jobs:
           path: ~/e2e
           key: e2e-${{ runner.os }}-${{ hashFiles('scripts/e2e.sh', 'scripts/fetch-models.sh') }}
       - run: sh scripts/e2e.sh ~/e2e
+      # Packaged even when the e2e test fails, so a failing build can still be tried by hand.
+      - name: Package the CLI
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build --release --locked -p mini-dictator-cli
+          sh scripts/package-cli.sh ${{ matrix.platform }}
+      # ditto keeps the bundle's symlinks and signature intact, unlike zip.
+      - name: Package the app
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: |
+          sh scripts/bundle-macos.sh
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/macos/Cargo.toml)
+          ditto -c -k --keepParent "target/release/Mini Dictator.app" \
+            "target/dist/Mini-Dictator-$version-macos-arm64.zip"
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.platform }}
+          path: target/dist/*
+          if-no-files-found: error
 
   # Times the recognizer on the e2e clips, for this commit and the pull request's base on the same
   # runner. Shared runners are noisy, so it only hints at large changes; it never fails the build.
