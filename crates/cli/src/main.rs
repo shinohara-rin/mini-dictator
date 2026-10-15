@@ -140,6 +140,7 @@ fn read_wav(path: &PathBuf) -> Result<AudioChunk, String> {
         sample_rate: spec.sample_rate,
         channels: spec.channels,
         captured: Instant::now(),
+        sound_playing: false,
     })
 }
 
@@ -191,6 +192,7 @@ fn live<V: VoiceActivityDetector>(
                 sample_rate: 16_000,
                 channels: 1,
                 captured: Instant::now(),
+                sound_playing: false,
             };
             if sender.send(chunk).is_err() {
                 return;

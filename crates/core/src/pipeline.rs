@@ -43,6 +43,10 @@ pub enum Event {
     Listening {
         hotwords: usize,
     },
+    /// The detector closed a segment of this many seconds, and the recognizer starts on it.
+    Heard {
+        seconds: f32,
+    },
     /// A segment was decoded. `marked` carries the uncertainty markers.
     Transcribed {
         plain: String,
@@ -194,6 +198,7 @@ impl Engine {
             events(Event::Debug(describe_context(
                 &screen,
                 &hotwords,
+                &bias,
                 read,
                 started.elapsed() - read,
             )));
@@ -292,6 +297,9 @@ impl Engine {
         events: &mut dyn FnMut(Event),
     ) -> Result<Option<String>> {
         let behind_seconds = (lag_seconds > self.config.max_lag_seconds).then_some(lag_seconds);
+        events(Event::Heard {
+            seconds: segment.duration_seconds(),
+        });
         let streamed = prepared.encoded.is_some();
         let early = prepared.transcript.is_some();
         let transcript = match prepared.transcript {
@@ -322,7 +330,7 @@ impl Engine {
             unclear_spans: transcript.uncertainty.analysis.spans.len(),
             behind_seconds,
         });
-        if plain.is_empty() && transcript.uncertainty.analysis.spans.is_empty() {
+        if is_nothing(&plain) && transcript.uncertainty.analysis.spans.is_empty() {
             return Ok(None);
         }
         let pause_seconds = session.joiner.pause_before(segment);
@@ -403,6 +411,13 @@ impl Engine {
 /// How long ago a segment's last sample was recorded: the age of the latest block plus the audio
 /// after the segment. Timing each block keeps this right when the worker starts after the
 /// microphone, or capture starts late.
+/// A transcript with nothing but full stops, which the recognizer gives for a cough or a breath.
+pub fn is_nothing(plain: &str) -> bool {
+    plain
+        .chars()
+        .all(|c| c.is_whitespace() || matches!(c, '.' | '。'))
+}
+
 fn lag(segment: &SpeechSegment, (heard, captured): (u64, Instant)) -> f32 {
     let end = segment.start_sample + segment.samples.len() as u64;
     captured.elapsed().as_secs_f32() + heard.saturating_sub(end) as f32 / SAMPLE_RATE as f32
@@ -429,6 +444,7 @@ fn indent(text: &str, prefix: &str) -> String {
 fn describe_context(
     screen: &ScreenContext,
     hotwords: &[String],
+    bias: &Bias,
     read: Duration,
     ranked: Duration,
 ) -> String {
@@ -449,6 +465,14 @@ fn describe_context(
         "\n  hotwords ({}): {}",
         hotwords.len(),
         hotwords.join(", ")
+    );
+    // A backend can keep fewer: Qwen3-ASR keeps what fits its prompt budget, and a transducer
+    // keeps what its tokenizer can spell.
+    let _ = write!(
+        text,
+        "\n  sent to the recognizer ({}): {}",
+        bias.phrases.len(),
+        bias.phrases.join(", ")
     );
     text
 }
@@ -710,6 +734,7 @@ pub fn run_dictation<V: VoiceActivityDetector>(
         for chunk in audio {
             let samples = chunk.to_model_input(&mut resampler);
             clock = (clock.0 + samples.len() as u64, chunk.captured);
+            segmenter.set_sound_playing(chunk.sound_playing);
             feed(&mut stream, |s| s.accept(&samples), events);
             waiting.extend(segmenter.push(&samples));
             drain(
@@ -829,8 +854,13 @@ mod tests {
     }
 
     fn engine() -> Engine {
+        engine_hearing("▁HELLO")
+    }
+
+    /// An engine whose recognizer hears `token` in each utterance.
+    fn engine_hearing(token: &str) -> Engine {
         let symbols =
-            SymbolTable::from_lines(["<blk> 0", "▁HELLO 1", "▁KITTY 2"].map(String::from));
+            SymbolTable::from_lines(["<blk> 0".into(), format!("{token} 1"), "▁KITTY 2".into()]);
         Engine {
             asr: Box::new(Recognizer::new(
                 LoudnessModel,
@@ -864,6 +894,8 @@ mod tests {
         );
         let session = engine.prepare(&mut |_| {});
         assert_eq!(session.hotwords, vec!["Kitty", "Airicraft"]);
+        // The test vocabulary cannot spell Airicraft, so the hotword graph leaves it out.
+        assert_eq!(session.bias.phrases, vec!["Kitty"]);
     }
 
     fn tone(seconds: f32) -> Vec<f32> {
@@ -888,10 +920,82 @@ mod tests {
                     sample_rate: 48_000,
                     channels: 1,
                     captured,
+                    sound_playing: false,
                 })
                 .unwrap();
         }
         receiver
+    }
+
+    #[test]
+    fn a_lone_full_stop_is_not_typed() {
+        for token in [".", "。"] {
+            let engine = engine_hearing(token);
+            let mut sink = Collect(Vec::new());
+            let mut events = Vec::new();
+            run_dictation(
+                &engine,
+                crate::vad::EnergyVad::default(),
+                speech(Instant::now()),
+                &mut sink,
+                &mut |e| events.push(e),
+            )
+            .unwrap();
+            assert!(sink.0.is_empty(), "{token}: {:?}", sink.0);
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::Transcribed { plain, .. } if plain == token)),
+                "{token}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_stops_alone_are_nothing() {
+        for plain in ["", " ", ".", "。", " . ", "。。"] {
+            assert!(is_nothing(plain), "{plain:?}");
+        }
+        for plain in ["Hi.", "はい。", "?", "..a"] {
+            assert!(!is_nothing(plain), "{plain:?}");
+        }
+    }
+
+    #[test]
+    fn a_sound_the_shell_played_is_not_dictated() {
+        let engine = engine();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for (samples, sound_playing) in [
+            (vec![0.0; 24_000], false),
+            (tone(1.0), true),
+            (vec![0.0; 48_000], false),
+        ] {
+            sender
+                .send(AudioChunk {
+                    samples,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    captured: Instant::now(),
+                    sound_playing,
+                })
+                .unwrap();
+        }
+        drop(sender);
+        let mut sink = Collect(Vec::new());
+        let mut events = Vec::new();
+        run_dictation(
+            &engine,
+            crate::vad::EnergyVad::default(),
+            receiver,
+            &mut sink,
+            &mut |e| events.push(e),
+        )
+        .unwrap();
+        assert!(sink.0.is_empty());
+        assert!(
+            events.iter().all(|e| !matches!(e, Event::Heard { .. })),
+            "{events:?}"
+        );
     }
 
     #[test]
@@ -911,6 +1015,20 @@ mod tests {
         assert_eq!(text, "HELLO HELLO");
         assert!(
             matches!(events[0], Event::Listening { hotwords: 1 }),
+            "{events:?}"
+        );
+        // Each segment is announced before its transcript.
+        let order: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Heard { seconds } if *seconds > 0.0 => Some("heard"),
+                Event::Transcribed { .. } => Some("transcribed"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            ["heard", "transcribed", "heard", "transcribed"],
             "{events:?}"
         );
         // Debug logging is off.
@@ -1102,6 +1220,7 @@ mod tests {
                         sample_rate: 48_000,
                         channels: 1,
                         captured: Instant::now() + Duration::from_secs(600),
+                        sound_playing: false,
                     })
                     .unwrap();
             }
@@ -1246,6 +1365,11 @@ mod tests {
         assert!(debug[0].contains("app \"Notes\""), "{}", debug[0]);
         assert!(debug[0].contains("Focused: \"Meeting with Hello Kitty\""));
         assert!(debug[0].contains("hotwords (1): Kitty"), "{}", debug[0]);
+        assert!(
+            debug[0].contains("sent to the recognizer (1): Kitty"),
+            "{}",
+            debug[0]
+        );
         assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
         assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
         assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
@@ -1286,6 +1410,7 @@ mod tests {
                 sample_rate: 48_000,
                 channels: 1,
                 captured: Instant::now(),
+                sound_playing: false,
             }
             .to_model_input(&mut Resampler::default()),
             start_sample: 0,
