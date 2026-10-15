@@ -157,6 +157,7 @@ impl Engine {
             events(Event::Debug(describe_context(
                 &screen,
                 &hotwords,
+                &bias,
                 read,
                 started.elapsed() - read,
             )));
@@ -370,6 +371,7 @@ fn indent(text: &str, prefix: &str) -> String {
 fn describe_context(
     screen: &ScreenContext,
     hotwords: &[String],
+    bias: &Bias,
     read: Duration,
     ranked: Duration,
 ) -> String {
@@ -390,6 +392,14 @@ fn describe_context(
         "\n  hotwords ({}): {}",
         hotwords.len(),
         hotwords.join(", ")
+    );
+    // A backend can keep fewer: Qwen3-ASR keeps what fits its prompt budget, and a transducer
+    // keeps what its tokenizer can spell.
+    let _ = write!(
+        text,
+        "\n  sent to the recognizer ({}): {}",
+        bias.phrases.len(),
+        bias.phrases.join(", ")
     );
     text
 }
@@ -588,6 +598,8 @@ mod tests {
         );
         let session = engine.prepare(&mut |_| {});
         assert_eq!(session.hotwords, vec!["Kitty", "Airicraft"]);
+        // The test vocabulary cannot spell Airicraft, so the hotword graph leaves it out.
+        assert_eq!(session.bias.phrases, vec!["Kitty"]);
     }
 
     fn tone(seconds: f32) -> Vec<f32> {
@@ -698,6 +710,11 @@ mod tests {
         assert!(debug[0].contains("app \"Notes\""), "{}", debug[0]);
         assert!(debug[0].contains("Focused: \"Meeting with Hello Kitty\""));
         assert!(debug[0].contains("hotwords (1): Kitty"), "{}", debug[0]);
+        assert!(
+            debug[0].contains("sent to the recognizer (1): Kitty"),
+            "{}",
+            debug[0]
+        );
         assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
         assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
         assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
