@@ -157,6 +157,7 @@ impl Engine {
             events(Event::Debug(describe_context(
                 &screen,
                 &hotwords,
+                &bias,
                 read,
                 started.elapsed() - read,
             )));
@@ -370,6 +371,7 @@ fn indent(text: &str, prefix: &str) -> String {
 fn describe_context(
     screen: &ScreenContext,
     hotwords: &[String],
+    bias: &Bias,
     read: Duration,
     ranked: Duration,
 ) -> String {
@@ -390,6 +392,18 @@ fn describe_context(
         "\n  hotwords ({}): {}",
         hotwords.len(),
         hotwords.join(", ")
+    );
+    // A backend can keep fewer: Qwen3-ASR keeps what fits its prompt budget.
+    let _ = write!(
+        text,
+        "\n  sent to the recognizer ({}{}): {}",
+        bias.phrases.len(),
+        if bias.graph.is_some() {
+            ", as a hotword graph"
+        } else {
+            ", in its prompt"
+        },
+        bias.phrases.join(", ")
     );
     text
 }
@@ -698,6 +712,11 @@ mod tests {
         assert!(debug[0].contains("app \"Notes\""), "{}", debug[0]);
         assert!(debug[0].contains("Focused: \"Meeting with Hello Kitty\""));
         assert!(debug[0].contains("hotwords (1): Kitty"), "{}", debug[0]);
+        assert!(
+            debug[0].contains("sent to the recognizer (1, as a hotword graph): Kitty"),
+            "{}",
+            debug[0]
+        );
         assert!(debug[1].contains("plain:  \"HELLO\""), "{}", debug[1]);
         assert!(debug[1].contains("noisy decodes"), "{}", debug[1]);
         assert!(debug[2].contains("<transcript>"), "{}", debug[2]);
